@@ -114,7 +114,7 @@ If you have a **third-party router behind the main OpenWrt router** (double NAT)
 
 **Broken /128 WAN address (IA_NA)**
 
-The ISP assigns a `/128` WAN address via IA_NA alongside the delegated `/56` prefix. OpenWrt prefers the `/128` as the source address for all outbound traffic. PLDT silently drops every packet originating from it. Removing the `/128` immediately restores connectivity.
+The ISP assigns a `/128` WAN address via IA_NA alongside the delegated `/56` prefix. OpenWrt prefers the `/128` as the source address for all outbound traffic. PLDT silently drops packets using it as the source address. Removing the `/128` immediately restores connectivity.
 
 This is the dominant failure. Everything else amplifies or destabilizes it.
 
@@ -122,13 +122,13 @@ This is the dominant failure. Everything else amplifies or destabilizes it.
 
 ### Secondary issues
 
-**2. Multiple RA gateways, wrong one selected** - The ISP advertises two gateways via Router Advertisement. OpenWrt selects the first, which is dead. Neighbor table shows `INCOMPLETE` state.
+**2. Multiple RA gateways, wrong one selected.** The ISP advertises two gateways via Router Advertisement. OpenWrt selects the first, which is dead. Neighbor table shows `INCOMPLETE` state.
 
-**3. wan6 startup race condition** - `wan6` starts before the link-local address is ready on `eth1`, causing DHCPv6 to fail inconsistently after reboots.
+**3. `wan6` startup race condition.** `wan6` starts before the link-local address is ready on `eth1`, causing DHCPv6 to fail inconsistently after reboots.
 
-**4. RA runtime override** - Even after fixing the route at boot, the dead gateway returns via a later RA and silently breaks connectivity again.
+**4. RA runtime override.** Even after fixing the route at boot, the dead gateway returns via a later RA and silently breaks connectivity again.
 
-**5. Incorrect RA tuning** - Using `accept_ra='2'` with `defaultroute='0'` removes the fallback behavior `wan6` needs during initialization, causing complete IPv6 failure on every boot.
+**5. Incorrect RA tuning.** Using `accept_ra='2'` with `defaultroute='0'` removes the fallback behavior `wan6` needs during initialization, causing complete IPv6 failure on every boot.
 
 > **Warning:** Do not use `accept_ra='2'` with `defaultroute='0'`. This breaks `wan6` initialization and removes fallback routing, causing complete IPv6 failure on boot.
 
@@ -663,7 +663,3 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 This guide is provided as-is based on real-world testing on a specific setup. Results may vary depending on your ISP configuration, firmware version, or hardware.
 
 Always back up your router configuration before making changes.
-
----
-
-*Tested: April 2026*
