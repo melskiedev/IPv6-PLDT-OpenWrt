@@ -20,7 +20,7 @@
   <!-- Title -->
   <text x="450" y="28" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="11" font-weight="600" letter-spacing="2">IPv6 FAILURE POINTS — ROOT CAUSE MAP</text>
 
-  <!-- ── TOP RAIL ── -->
+  <!-- TOP RAIL -->
   <!-- ISP -->
   <rect x="30" y="50" width="110" height="56" rx="6" fill="#0d1f36" stroke="#1f4068" stroke-width="1.5"/>
   <text x="85" y="74" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="12" font-weight="700">PLDT ISP</text>
@@ -40,7 +40,7 @@
   <text x="505" y="74" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="12" font-weight="700">Internet</text>
   <text x="505" y="92" text-anchor="middle" fill="#39d0c8" font-family="monospace" font-size="9">IPv6 global</text>
 
-  <!-- ── FAILURE 1: /128 (primary) ── drops between router and internet -->
+  <!-- FAILURE 1: /128 (primary) -->
   <line x1="400" y1="78" x2="400" y2="118" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr-red)"/>
   <rect x="280" y="120" width="240" height="68" rx="6" fill="#2a0d0d" stroke="#6e1a1a" stroke-width="1.5"/>
   <rect x="280" y="120" width="240" height="20" rx="6" fill="#6e1a1a"/>
@@ -49,7 +49,7 @@
   <text x="400" y="154" text-anchor="middle" fill="#e07070" font-family="monospace" font-size="10">Router uses /128 as source address</text>
   <text x="400" y="170" text-anchor="middle" fill="#956060" font-family="monospace" font-size="9">PLDT silently drops ALL outbound traffic</text>
 
-  <!-- ── FAILURE 2: dead gateway ── -->
+  <!-- FAILURE 2: dead gateway -->
   <line x1="142" y1="78" x2="142" y2="118" stroke="#d29922" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr-amber)"/>
   <rect x="30" y="120" width="222" height="68" rx="6" fill="#2a1f0d" stroke="#5a3e0a" stroke-width="1.5"/>
   <rect x="30" y="120" width="222" height="20" rx="6" fill="#5a3e0a"/>
@@ -58,11 +58,11 @@
   <text x="141" y="154" text-anchor="middle" fill="#b89040" font-family="monospace" font-size="10">ISP sends 2 gateways via RA</text>
   <text x="141" y="170" text-anchor="middle" fill="#917030" font-family="monospace" font-size="9">OpenWrt picks first — it's dead</text>
 
-  <!-- ── DIVIDER ── -->
+  <!-- DIVIDER -->
   <line x1="30" y1="215" x2="870" y2="215" stroke="#21262d" stroke-width="1"/>
   <text x="450" y="228" text-anchor="middle" fill="#30363d" font-family="monospace" font-size="9" letter-spacing="3">RUNTIME / STARTUP ISSUES</text>
 
-  <!-- ── FAILURE 3: race condition ── -->
+  <!-- FAILURE 3: race condition -->
   <rect x="30" y="238" width="222" height="68" rx="6" fill="#2a1f0d" stroke="#5a3e0a" stroke-width="1.5"/>
   <rect x="30" y="238" width="222" height="20" rx="6" fill="#5a3e0a"/>
   <rect x="30" y="248" width="222" height="10" fill="#5a3e0a"/>
@@ -70,7 +70,7 @@
   <text x="141" y="272" text-anchor="middle" fill="#b89040" font-family="monospace" font-size="10">wan6 starts before link-local ready</text>
   <text x="141" y="288" text-anchor="middle" fill="#917030" font-family="monospace" font-size="9">DHCPv6 fails — no default route</text>
 
-  <!-- ── FAILURE 4: RA runtime override ── -->
+  <!-- FAILURE 4: RA runtime override -->
   <rect x="272" y="238" width="222" height="68" rx="6" fill="#2a1f0d" stroke="#5a3e0a" stroke-width="1.5"/>
   <rect x="272" y="238" width="222" height="20" rx="6" fill="#5a3e0a"/>
   <rect x="272" y="248" width="222" height="10" fill="#5a3e0a"/>
@@ -78,7 +78,7 @@
   <text x="383" y="272" text-anchor="middle" fill="#b89040" font-family="monospace" font-size="10">New RA reinstalls dead gateway</text>
   <text x="383" y="288" text-anchor="middle" fill="#917030" font-family="monospace" font-size="9">Works at boot, breaks silently later</text>
 
-  <!-- ── FAILURE 5: accept_ra=2 ── -->
+  <!-- FAILURE 5: accept_ra=2 -->
   <rect x="514" y="238" width="222" height="68" rx="6" fill="#2a0d0d" stroke="#6e1a1a" stroke-width="1.5"/>
   <rect x="514" y="238" width="222" height="20" rx="6" fill="#6e1a1a"/>
   <rect x="514" y="248" width="222" height="10" fill="#6e1a1a"/>
@@ -86,7 +86,7 @@
   <text x="625" y="272" text-anchor="middle" fill="#e07070" font-family="monospace" font-size="10">Removes RA fallback from wan6</text>
   <text x="625" y="288" text-anchor="middle" fill="#956060" font-family="monospace" font-size="9">Complete IPv6 failure on every boot</text>
 
-  <!-- ── FIXES RAIL ── -->
+  <!-- FIXES RAIL -->
   <line x1="30" y1="332" x2="870" y2="332" stroke="#1a4428" stroke-width="1"/>
   <text x="450" y="345" text-anchor="middle" fill="#1a4428" font-family="monospace" font-size="9" letter-spacing="3">FIXES APPLIED</text>
 
@@ -96,13 +96,13 @@
 
   <rect x="220" y="354" width="175" height="34" rx="5" fill="#0d2a16" stroke="#238636" stroke-width="1"/>
   <text x="307" y="368" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10" font-weight="700">99-ipv6-setup</text>
-  <text x="307" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">probes + selects best GW</text>
+  <text x="307" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">best GW + MAC pin + /128 remove</text>
 
   <rect x="410" y="354" width="175" height="34" rx="5" fill="#0d2a16" stroke="#238636" stroke-width="1"/>
   <text x="497" y="368" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10" font-weight="700">98-wan6-delay</text>
-  <text x="497" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">5s delay fixes race condition</text>
+  <text x="497" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">5s delay + duplicate guard</text>
 
   <rect x="600" y="354" width="175" height="34" rx="5" fill="#0d2a16" stroke="#238636" stroke-width="1"/>
   <text x="687" y="368" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10" font-weight="700">ipv6-watchdog</text>
-  <text x="687" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">re-fixes GW every 5 min</text>
+  <text x="687" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">re-fixes GW + escalates failures</text>
 </svg>
