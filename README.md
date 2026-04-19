@@ -259,7 +259,7 @@ Watchdog (every 5 min) -> check connectivity -> fix route -> escalate if needed 
 |---|---|---|
 | A - UCI config | `network` UCI | Disables `/128`, stabilizes RA, delegates prefix |
 | B - Delay script | `98-wan6-delay` | Fixes link-local race condition at boot |
-| C - Route engine | `99-ipv6-setup` | Selects working gateway at startup |
+| C - Route engine | `99-ipv6-setup` | Selects working gateway, pins MAC, removes /128 |
 | D - Watchdog | `ipv6-watchdog` | Self-heals runtime failures every 5 min |
 | E - Bootstrap recovery | `ipv6-watchdog` | Recovers DHCPv6 prefix failures automatically |
 | F - Notifications | `ipv6-discord-logger` | Optional Discord alerts and log forwarding |
@@ -304,6 +304,8 @@ What each setting does:
 
 Waits for WAN to be fully ready before starting `wan6`, eliminating the link-local race condition.
 
+Also guards against duplicate `ifup wan6` on WAN flap. Without this guard, a brief ONT link drop and reconnect fires another `ifup wan6` even if `wan6` is already up and healthy. That resets an active DHCPv6 session mid-acquisition, which is one of the conditions that triggers a spurious `NoPrefixAvail` from PLDT's server.
+
 ```sh
 #!/bin/sh
 [ "$ACTION" = "ifup" ] || exit 0
@@ -327,7 +329,17 @@ chmod +x /etc/hotplug.d/iface/98-wan6-delay
 
 **File:** `/etc/hotplug.d/iface/99-ipv6-setup`
 
-Runs whenever `wan6` comes up. Detects the working gateway via NDP, enforces the correct default route, and removes any stale `/128` addresses after confirming connectivity.
+Runs whenever `wan6` comes up. This is the authoritative startup fix. It does more than select a gateway.
+
+**Dual gateway sourcing.** Combines the neighbor table (`ip -6 neigh`) and existing default routes (`ip -6 route`) to build the candidate list. The neighbor table alone can miss gateways if NDP discovery was incomplete. Combining both sources ensures no reachable gateway is overlooked.
+
+**MAC pinning via `ip -6 neigh replace ... nud stale`.** After selecting the working gateway, the script pins its MAC address in the neighbor table. Without this, the kernel treats the neighbor entry as transient and may evict it under memory pressure or after the NDP lifetime expires. When the entry is evicted, the kernel re-runs NDP discovery and PLDT's dead gateway can be reintroduced at that point. Pinning with `nud stale` keeps the correct entry stable while still allowing the kernel to revalidate it naturally.
+
+**LLA failure exit.** If no link-local address appears on the WAN interface after 20 seconds, the script exits immediately with a logged error rather than proceeding with an incomplete interface state.
+
+**Dual-target connectivity check.** Pings both Google (`2001:4860:4860::8888`) and Cloudflare (`2606:4700:4700::1111`) before removing the `/128`. Either succeeding is enough. This matches the watchdog's `ipv6_ok` function for consistent behavior across both startup and runtime paths.
+
+**Defers to watchdog on missing prefix.** If no prefix is assigned after 45 seconds, the script logs a warning and exits clean. The watchdog handles prefix recovery via the escalation ladder.
 
 ```sh
 #!/bin/sh
@@ -337,71 +349,131 @@ Runs whenever `wan6` comes up. Detects the working gateway via NDP, enforces the
 LOGTAG="ipv6-setup"
 log() { logger -t "$LOGTAG" "$1"; }
 
+# ===== GET WAN DEVICE =====
 WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
-    | jsonfilter -e '@["l3_device"]')
+    | jsonfilter -e '@["l3_device"]' 2>/dev/null)
+[ -z "$WAN_DEV" ] && { log "ERROR: cannot determine WAN device"; exit 1; }
+log "WAN device: $WAN_DEV"
 
-[ -z "$WAN_DEV" ] && { log "ERROR: no WAN device"; exit 1; }
-
-# Wait for link-local
+# ===== WAIT FOR LINK-LOCAL =====
 for i in $(seq 1 10); do
     lla=$(ip -6 addr show dev "$WAN_DEV" | awk '/fe80.*scope link/{print $2}')
-    [ -n "$lla" ] && break
+    [ -n "$lla" ] && { log "LLA ready: $lla"; break; }
+    [ "$i" -eq 10 ] && { log "ERROR: LLA never appeared on $WAN_DEV"; exit 1; }
     sleep 2
 done
 
-# Wait for prefix
+# ===== WAIT FOR PREFIX DELEGATION =====
+log "Waiting for prefix delegation..."
 PREFIX=""
 for i in $(seq 1 15); do
     PREFIX=$(ubus call network.interface.wan6 status 2>/dev/null \
-        | jsonfilter -e '@["ipv6-prefix"][0].address')
-    [ -n "$PREFIX" ] && break
+        | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null)
+    [ -n "$PREFIX" ] && { log "Prefix received: $PREFIX"; break; }
     sleep 3
 done
+[ -z "$PREFIX" ] && log "WARNING: no PD received after 45s -- continuing anyway"
 
-if [ -z "$PREFIX" ]; then
-    log "No prefix after 45s, watchdog will handle recovery"
-    exit 0
-fi
-
-# Trigger NDP discovery
+# ===== TRIGGER NDP DISCOVERY =====
+# Ping all-routers multicast to solicit RAs from every router on the link.
+# This discovers ALL gateways, not just the one already in the default route.
+log "Triggering NDP discovery via all-routers multicast..."
 ping6 -c 3 -W 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
 sleep 3
 
-BEST_GW=""
+# Also probe existing default route gateways to refresh their neighbor entries.
+ip -6 route show default dev "$WAN_DEV" | awk '{print $3}' \
+| while read -r gw; do
+    [ -n "$gw" ] && ping6 -c 1 -W 1 -I "$WAN_DEV" "$gw" >/dev/null 2>&1
+done
+sleep 3
 
-for gw in $(ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}' | sort -u); do
-    ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1 || continue
+# ===== DISCOVER WORKING GATEWAY =====
+# Combine neighbor table and existing routes for the candidate list.
+# The neighbor table alone can miss gateways if NDP was incomplete at startup.
+log "Scanning gateways on $WAN_DEV..."
+BEST_GW=""
+BEST_MAC=""
+
+for gw in $(
+    { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
+      ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
+    } | sort -u | grep -v '^$'
+); do
+    state=$(ip -6 neigh show dev "$WAN_DEV" | awk -v g="$gw" '$1==g{print $NF}')
+    mac=$(ip -6 neigh show dev "$WAN_DEV" | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
+    log "  Gateway $gw -- state: ${state:-unknown} mac: ${mac:-unknown}"
+
+    ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1 || {
+        log "  Gateway $gw -- probe FAILED"
+        continue
+    }
+    log "  Gateway $gw -- probe OK"
+
+    if [ -z "$mac" ]; then
+        sleep 2
+        mac=$(ip -6 neigh show dev "$WAN_DEV" \
+            | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
+    fi
+
+    [ -z "$mac" ] && { log "  Gateway $gw -- MAC not resolved, skipping"; continue; }
+
     BEST_GW="$gw"
+    BEST_MAC="$mac"
+    log "  Gateway $gw -- selected (mac $BEST_MAC)"
     break
 done
 
-[ -z "$BEST_GW" ] && {
-    log "No gateway found, restarting WAN"
-    ifdown wan6; ifdown wan
+# ===== NO GATEWAY FOUND -- RECOVER =====
+if [ -z "$BEST_GW" ]; then
+    log "ERROR: no working gateway found -- restarting WAN"
+    ifdown wan6
+    ifdown wan
     sleep 20
-    ifup wan; sleep 40; ifup wan6
+    ifup wan
+    sleep 40
+    ifup wan6
     exit 0
-}
+fi
 
-# Replace dead routes with working one
+# ===== PIN GATEWAY =====
+# Pin the MAC in the neighbor table using nud stale.
+# This prevents the kernel from evicting the entry and re-running NDP,
+# which would allow PLDT's dead gateway to be reintroduced via RA.
+# nud stale keeps the entry stable while still allowing natural revalidation.
+log "Pinning gateway $BEST_GW ($BEST_MAC) as reachable"
+ip -6 neigh replace "$BEST_GW" lladdr "$BEST_MAC" dev "$WAN_DEV" nud stale
+
+# ===== INSTALL DEFAULT ROUTE =====
+log "Installing default route via $BEST_GW"
 ip -6 route show default dev "$WAN_DEV" | awk '{print $3}' \
-| while read -r old; do
-    [ "$old" = "$BEST_GW" ] || ip -6 route del default via "$old" dev "$WAN_DEV"
+| while read -r old_gw; do
+    [ "$old_gw" = "$BEST_GW" ] && continue
+    ip -6 route del default via "$old_gw" dev "$WAN_DEV" 2>/dev/null
+    log "Removed old default via $old_gw"
 done
-
 ip -6 route replace default via "$BEST_GW" dev "$WAN_DEV" metric 512
 
-# Verify connectivity and remove /128 if successful
+# ===== VERIFY AND CLEAN UP /128 =====
+# Check both Google and Cloudflare IPv6 resolvers before removing /128.
+# This matches the watchdog's ipv6_ok() function for consistent behavior.
 sleep 3
-if ping6 -c 2 2001:4860:4860::8888 >/dev/null 2>&1; then
+if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
+   ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+    log "SUCCESS: IPv6 internet reachable via $BEST_GW"
     ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
     | while read -r addr; do
-        ip -6 addr del "$addr" dev "$WAN_DEV"
-        log "Removed /128: $addr"
+        ip -6 addr del "$addr" dev "$WAN_DEV" 2>/dev/null
+        log "Removed /128 $addr after confirmed connectivity"
     done
 else
-    log "Connectivity check failed, /128 kept pending watchdog"
+    log "WARNING: gateway pinned but internet unreachable"
+    v128=$(ip -6 addr show dev "$WAN_DEV" \
+        | awk '/\/128 scope global/{print $2}' | head -1)
+    [ -n "$v128" ] && log "Keeping /128 $v128 as fallback"
 fi
+
+log "=== setup complete ==="
 ```
 
 ```sh
@@ -504,8 +576,18 @@ fix_gateway() {
 
     for gw in $(ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'); do
         ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1 || continue
+
+        mac=$(ip -6 neigh show dev "$WAN_DEV" \
+            | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
+
         ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512
-        log "Gateway replaced with $gw"
+
+        # Pin the MAC to keep the neighbor entry stable and prevent the kernel
+        # from re-running NDP, which could reintroduce the dead gateway via RA.
+        [ -n "$mac" ] && ip -6 neigh replace "$gw" lladdr "$mac" \
+            dev "$WAN_DEV" nud stale
+
+        log "Gateway replaced with $gw${mac:+ (mac $mac pinned)}"
         return 0
     done
     return 1
@@ -540,20 +622,34 @@ notify_ont_powercycle() {
 
     [ -z "$DISCORD_WEBHOOK" ] && return 0
 
+    # Read router identity dynamically so this works on any device.
     local payload
+    MODEL=$(cat /tmp/sysinfo/model 2>/dev/null)
+    FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
+    HOST=$(uci get system.@system[0].hostname 2>/dev/null)
+
+    MODEL=${MODEL:-Unknown}
+    FW=${FW:-OpenWrt}
+    HOST=${HOST:-N/A}
+
+    MODEL_ESC=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
     payload=$(cat <<EOF
 {
   "embeds": [{
     "title": "IPv6 Alert: ONT Power Cycle Required",
     "color": 15158332,
     "fields": [
-      { "name": "Router", "value": "GL-MT6000 (Flint 2)", "inline": true },
+      { "name": "Router", "value": "$MODEL_ESC", "inline": true },
+      { "name": "Hostname", "value": "$HOST_ESC", "inline": true },
       { "name": "WAN restarts", "value": "$restarts", "inline": true },
       { "name": "Time", "value": "$timestamp", "inline": false },
       { "name": "Likely cause", "value": "NoPrefixAvail: stale DHCPv6 lease on ISP side", "inline": false },
       { "name": "Action required", "value": "Power off ONT. Wait 15-30 minutes. Power on.", "inline": false }
     ],
-    "footer": { "text": "ipv6-watchdog on OpenWrt 25.12.2" }
+    "footer": { "text": "ipv6-watchdog on $FW_ESC" }
   }]
 }
 EOF
