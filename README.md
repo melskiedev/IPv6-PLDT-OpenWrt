@@ -430,19 +430,32 @@ notify_ont_powercycle() {
     [ -z "$DISCORD_WEBHOOK" ] && return 0
 
     local payload
+    MODEL=$(cat /tmp/sysinfo/model 2>/dev/null)
+    FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
+    HOST=$(uci get system.@system[0].hostname 2>/dev/null)
+
+    MODEL=${MODEL:-Unknown}
+    FW=${FW:-OpenWrt}
+    HOST=${HOST:-N/A}
+
+    MODEL_ESC=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
     payload=$(cat <<EOF
 {
   "embeds": [{
     "title": "IPv6 Alert: ONT Power Cycle Required",
     "color": 15158332,
     "fields": [
-      { "name": "Router", "value": "GL-MT6000 (Flint 2)", "inline": true },
+      { "name": "Router", "value": "$MODEL_ESC", "inline": true },
+      { "name": "Hostname", "value": "$HOST_ESC", "inline": true },
       { "name": "WAN restarts", "value": "$restarts", "inline": true },
       { "name": "Time", "value": "$timestamp", "inline": false },
       { "name": "Likely cause", "value": "NoPrefixAvail: stale DHCPv6 lease on ISP side", "inline": false },
       { "name": "Action required", "value": "Power off ONT. Wait 15-30 minutes. Power on.", "inline": false }
     ],
-    "footer": { "text": "ipv6-watchdog on OpenWrt 25.12.2" }
+    "footer": { "text": "ipv6-watchdog on $FW_ESC" }
   }]
 }
 EOF
