@@ -11,8 +11,109 @@ Includes root-cause analysis, startup fixes, runtime recovery, escalating failur
 
 ---
 
+## TL;DR
+
+If you are on PLDT Fiber in bridge mode and IPv6 is broken:
+
+1. Apply UCI config
+2. Add hotplug scripts
+3. Add watchdog
+4. Reboot
+5. Verify with `ping6 2001:4860:4860::8888`
+
+Full instructions below.
+
+---
+
+## Read Before Applying
+
+> **This is not a generic IPv6 guide.** It targets a specific failure pattern observed on PLDT Fiber in bridge mode. Applying it to a different setup may break working IPv6.
+
+Use this guide only if:
+
+- You are on PLDT Fiber (or an ISP with similar IA_NA + RA behavior)
+- Your ONT is in bridge mode and OpenWrt is the first-hop edge router
+- You observe broken `/128` WAN address behavior, incorrect RA gateway selection, or intermittent IPv6 loss after boot
+
+**Assumptions:**
+
+- WAN interface is `eth1` (verify with `ip link` before applying)
+- Default `fw4` firewall configuration, no custom ICMPv6 rules
+- DHCPv6 with prefix delegation, not PPPoE
+- Single-router setup, no cascaded routers or double NAT
+
+**This guide is not designed for:**
+
+- PPPoE WAN
+- VLAN-tagged WAN interfaces
+- Double NAT setups where OpenWrt is not the edge device
+- Non-standard interface naming
+
+All timing values (`sleep`, retry intervals, cooldown durations) are field-tuned for PLDT behavior. Other ISPs may require adjustments.
+
+---
+
+## Post-Deploy Verification
+
+Run these checks after reboot to confirm the fix is working correctly.
+
+**1. No global /128 on WAN**
+
+```sh
+ip -6 addr show dev eth1
+```
+
+Good: no `scope global` address with `/128`
+
+**2. Prefix assigned**
+
+```sh
+ubus call network.interface.wan6 status | jsonfilter -e '@["ipv6-prefix"][0].address'
+```
+
+Good: returns a global prefix
+
+**3. Default route correct**
+
+```sh
+ip -6 route show default
+```
+
+Good: single route via `fe80::...` on `eth1`
+
+**4. Gateway reachable**
+
+```sh
+ip -6 neigh show dev eth1 | grep router
+```
+
+Good: state is `REACHABLE` or `STALE`, not `INCOMPLETE`
+
+**5. Connectivity works**
+
+```sh
+ping6 -c 4 2001:4860:4860::8888
+ping6 -c 4 2606:4700:4700::1111
+```
+
+**6. LAN clients have IPv6**
+
+Clients should receive global IPv6 addresses, not just `fe80::` link-local addresses.
+
+**7. Logs are clean**
+
+```sh
+logread | grep ipv6-setup
+logread | grep ipv6-watchdog
+```
+
+---
+
 ## Table of Contents
 
+- [TL;DR](#tldr)
+- [Read Before Applying](#read-before-applying)
+- [Post-Deploy Verification](#post-deploy-verification)
 - [Quick Deploy](#quick-deploy)
 - [Compatibility](#compatibility)
 - [Caution: Bridge Mode and Third-Party Router Setups](#caution-bridge-mode-and-third-party-router-setups)
@@ -208,6 +309,10 @@ Waits for WAN to be fully ready before starting `wan6`, eliminating the link-loc
 [ "$ACTION" = "ifup" ] || exit 0
 [ "$INTERFACE" = "wan" ] || exit 0
 
+# Skip if wan6 is already up to avoid duplicate ifup on WAN flap.
+ubus call network.interface.wan6 status 2>/dev/null \
+    | jsonfilter -e '@["up"]' | grep -q true && exit 0
+
 sleep 5
 ifup wan6
 ```
@@ -345,6 +450,12 @@ mkdir -p "$STATE_DIR"
 
 log() { logger -t "$LOGTAG" "$1"; }
 
+# Prevent overlapping executions. If a previous run is still active
+# (e.g. during bootstrap or WAN restart), exit immediately.
+LOCK="$STATE_DIR/watchdog.lock"
+exec 9>"$LOCK"
+flock -n 9 || { log "Already running, skipping this tick"; exit 0; }
+
 [ -f "$CONF" ] && . "$CONF"
 
 # How long to wait after a full WAN restart before trying again (20 minutes).
@@ -430,32 +541,19 @@ notify_ont_powercycle() {
     [ -z "$DISCORD_WEBHOOK" ] && return 0
 
     local payload
-    MODEL=$(cat /tmp/sysinfo/model 2>/dev/null)
-    FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
-    HOST=$(uci get system.@system[0].hostname 2>/dev/null)
-
-    MODEL=${MODEL:-Unknown}
-    FW=${FW:-OpenWrt}
-    HOST=${HOST:-N/A}
-
-    MODEL_ESC=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
-
     payload=$(cat <<EOF
 {
   "embeds": [{
     "title": "IPv6 Alert: ONT Power Cycle Required",
     "color": 15158332,
     "fields": [
-      { "name": "Router", "value": "$MODEL_ESC", "inline": true },
-      { "name": "Hostname", "value": "$HOST_ESC", "inline": true },
+      { "name": "Router", "value": "GL-MT6000 (Flint 2)", "inline": true },
       { "name": "WAN restarts", "value": "$restarts", "inline": true },
       { "name": "Time", "value": "$timestamp", "inline": false },
       { "name": "Likely cause", "value": "NoPrefixAvail: stale DHCPv6 lease on ISP side", "inline": false },
       { "name": "Action required", "value": "Power off ONT. Wait 15-30 minutes. Power on.", "inline": false }
     ],
-    "footer": { "text": "ipv6-watchdog on $FW_ESC" }
+    "footer": { "text": "ipv6-watchdog on OpenWrt 25.12.2" }
   }]
 }
 EOF
@@ -879,7 +977,7 @@ Confirmed during real-world testing:
 | Dead gateway returns via RA at runtime | Watchdog + cron every 5 min | Fixed |
 | Race condition on boot | `98-wan6-delay` script | Fixed |
 | Prefix delegation failure (NoPrefixAvail) | Escalating recovery ladder with backoff | Fixed |
-| Persistent ISP-side lease failure | ONT powercycle notification after 3 WAN restarts | Manual ONT powercycle required |
+| Persistent ISP-side lease failure | ONT powercycle notification after 3 WAN restarts | Escalated to human |
 
 ---
 
