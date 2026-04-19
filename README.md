@@ -13,15 +13,7 @@ Includes root-cause analysis, startup fixes, runtime recovery, escalating failur
 
 ## TL;DR
 
-If you are on PLDT Fiber in bridge mode and IPv6 is broken:
-
-1. Apply UCI config
-2. Add hotplug scripts
-3. Add watchdog
-4. Reboot
-5. Verify with `ping6 2001:4860:4860::8888`
-
-Full instructions below.
+PLDT Fiber, bridge mode, IPv6 broken: apply UCI config, add the three scripts, reboot, verify with `ping6 2001:4860:4860::8888`. Full instructions below.
 
 ---
 
@@ -140,9 +132,9 @@ logread | grep ipv6-watchdog
 Apply in this order, then reboot:
 
 1. Apply UCI config
-2. Create `/etc/hotplug.d/iface/98-wan6-delay`
-3. Create `/etc/hotplug.d/iface/99-ipv6-setup`
-4. Create `/usr/bin/ipv6-watchdog`
+2. Create **`/etc/hotplug.d/iface/98-wan6-delay`**
+3. Create **`/etc/hotplug.d/iface/99-ipv6-setup`**
+4. Create **`/usr/bin/ipv6-watchdog`**
 5. Add cron job and restart cron
 6. Reboot
 
@@ -174,6 +166,8 @@ Tested on:
 
 May work on:
 - Other ISPs with similar IA_NA + RA gateway issues (common with CGNAT providers)
+
+> **If your ISP does not exhibit the exact failure modes listed in the Root Causes section, do not apply this guide directly. Adapt the logic to your environment instead.**
 
 Not designed for:
 - Double NAT setups where OpenWrt is not the first hop
@@ -302,9 +296,7 @@ What each setting does:
 
 **File:** `/etc/hotplug.d/iface/98-wan6-delay`
 
-Waits for WAN to be fully ready before starting `wan6`, eliminating the link-local race condition.
-
-Also guards against duplicate `ifup wan6` on WAN flap. Without this guard, a brief ONT link drop and reconnect fires another `ifup wan6` even if `wan6` is already up and healthy. That resets an active DHCPv6 session mid-acquisition, which is one of the conditions that triggers a spurious `NoPrefixAvail` from PLDT's server.
+Waits for WAN to be fully ready before starting `wan6`, eliminating the link-local race condition. Also guards against duplicate `ifup wan6` on WAN flap, which would otherwise reset an active DHCPv6 session mid-acquisition.
 
 ```sh
 #!/bin/sh
@@ -329,7 +321,7 @@ chmod +x /etc/hotplug.d/iface/98-wan6-delay
 
 **File:** `/etc/hotplug.d/iface/99-ipv6-setup`
 
-Runs whenever `wan6` comes up. This is the authoritative startup fix. It does more than select a gateway.
+Runs whenever `wan6` comes up. This is the authoritative startup fix. It ensures a working gateway is selected, its MAC address is pinned to prevent re-introduction of the dead gateway, and the `/128` is removed once connectivity is confirmed.
 
 **Dual gateway sourcing.** Combines the neighbor table (`ip -6 neigh`) and existing default routes (`ip -6 route`) to build the candidate list. The neighbor table alone can miss gateways if NDP discovery was incomplete. Combining both sources ensures no reachable gateway is overlooked.
 
@@ -486,7 +478,7 @@ chmod +x /etc/hotplug.d/iface/99-ipv6-setup
 
 **File:** `/usr/bin/ipv6-watchdog`
 
-Runs every 5 minutes via cron. Checks connectivity against Google and Cloudflare IPv6 resolvers. On failure, separates two distinct failure domains and handles each with an escalating recovery ladder.
+Runs every 5 minutes via cron. It checks connectivity, fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix itself is missing. A single instance is enforced via `flock` to prevent concurrent executions during long recovery operations.
 
 **Failure domains:**
 
@@ -1287,3 +1279,7 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 This guide is provided as-is based on real-world testing on a specific setup. Results may vary depending on your ISP configuration, firmware version, or hardware.
 
 Always back up your router configuration before making changes.
+
+---
+
+*Tested: April 2026*
