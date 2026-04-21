@@ -99,6 +99,14 @@ logread | grep ipv6-setup
 logread | grep ipv6-watchdog
 ```
 
+**8. Watchdog has DHCPv6 renew tier**
+
+```sh
+grep -n "dhcpv6_renew" /usr/bin/ipv6-watchdog
+```
+
+Good: returns at least one line confirming the renew tier is present.
+
 ---
 
 ## Table of Contents
@@ -213,7 +221,7 @@ If you have a **third-party router behind the main OpenWrt router** (double NAT)
 
 **Broken /128 WAN address (IA_NA)**
 
-The ISP assigns a `/128` WAN address via IA_NA alongside the delegated `/56` prefix. OpenWrt prefers the `/128` as the source address for all outbound traffic. PLDT silently drops every packet originating from it. Removing the `/128` immediately restores connectivity.
+The ISP assigns a `/128` WAN address via IA_NA alongside the delegated `/56` prefix. Linux source address selection prefers the `/128` global address for all outbound traffic. PLDT silently drops every packet originating from it. Removing the `/128` immediately restores connectivity.
 
 This is the dominant failure. Everything else amplifies or destabilizes it.
 
@@ -478,7 +486,7 @@ chmod +x /etc/hotplug.d/iface/99-ipv6-setup
 
 **File:** `/usr/bin/ipv6-watchdog`
 
-Runs every 5 minutes via cron. It checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix itself is missing. A single instance is enforced via `flock` to prevent concurrent executions during long recovery operations.
+Runs every 5 minutes via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check.
 
 **Failure domains:**
 
@@ -657,7 +665,7 @@ notify_ont_powercycle() {
 
     # Read router identity dynamically so this works on any device.
     local payload
-    MODEL=$(cat /tmp/sysinfo/model 2>/dev/null)
+    MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || grep -m1 'machine' /proc/cpuinfo | cut -d: -f2)
     FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
     HOST=$(uci get system.@system[0].hostname 2>/dev/null)
 
@@ -1099,6 +1107,7 @@ Confirmed during real-world testing:
 - Layered `ipv6_ok` validation classifies failures by type in logs for faster debugging
 - Backoff prevents DHCPv6 hammering during NoPrefixAvail conditions
 - ONT powercycle notification fires once per incident and resets cleanly on recovery
+- Router identity in Discord alerts reads dynamically from system, no hardcoded values
 
 ---
 
@@ -1324,15 +1333,15 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 ## Changelog
 
 ### v2.0 (April 2026)
-- Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence, replacing single ping check. Logs specific failure reason for faster debugging.
+- Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence. Logs specific failure reason for faster debugging.
 - Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state. Verifies prefix restored within same cron run.
 - Escalation ladder expanded from three to four tiers: wan6 restart, DHCPv6 renew, `/128` bootstrap, full WAN restart.
 - Added `flock` to watchdog to prevent overlapping cron executions during bootstrap or WAN restart.
 - Added wan6 already-up guard to `98-wan6-delay` to prevent duplicate `ifup` on WAN flap.
 - MAC pinning via `ip -6 neigh replace ... nud stale` added to both `99-ipv6-setup` and watchdog `fix_gateway` for consistent neighbor stability across startup and runtime paths.
 - `99-ipv6-setup` upgraded with dual gateway sourcing, detailed logging, and dual-target connectivity check.
-- `notify_ont_powercycle` now reads router model, hostname, and firmware dynamically.
-- Added optional Discord notification system: `ipv6-discord-logger` daemon forwards tagged syslog lines in real time, `ipv6-watchdog.conf` holds webhook URLs.
+- `notify_ont_powercycle` now reads router model, hostname, and firmware dynamically with `/proc/cpuinfo` fallback. Portable across devices.
+- Added optional Discord notification system: `ipv6-discord-logger` daemon forwards tagged syslog lines in real time.
 - Added ONT powercycle notification with notify-once flag to prevent Discord spam.
 - Added post-restart cooldown (20 min) and per-step exponential backoff to avoid DHCPv6 hammering.
 
