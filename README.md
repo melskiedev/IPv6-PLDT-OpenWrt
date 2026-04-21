@@ -478,23 +478,24 @@ chmod +x /etc/hotplug.d/iface/99-ipv6-setup
 
 **File:** `/usr/bin/ipv6-watchdog`
 
-Runs every 5 minutes via cron. It checks connectivity, fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix itself is missing. A single instance is enforced via `flock` to prevent concurrent executions during long recovery operations.
+Runs every 5 minutes via cron. It checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix itself is missing. A single instance is enforced via `flock` to prevent concurrent executions during long recovery operations.
 
 **Failure domains:**
 
 | Condition | Recovery path |
 |---|---|
-| Dead RA gateway (prefix present, connectivity broken) | Gateway fix, then WAN restart after 3 consecutive failures |
-| Missing prefix (DHCPv6 failure) | Escalating ladder: wan6 restart, /128 bootstrap, full WAN restart |
+| Dead RA gateway (prefix present, connectivity broken) | Gateway fix with MAC pin, then WAN restart after 3 consecutive failures |
+| Missing prefix (DHCPv6 failure) | Escalating ladder: wan6 restart, DHCPv6 renew, /128 bootstrap, full WAN restart |
 | Persistent prefix failure after 3 WAN restarts | Stop retrying, notify once, wait for manual ONT powercycle |
 
 **Escalation timeline for persistent NoPrefixAvail:**
 
 ```
 Tick 1  (0 min)   No prefix. Restart wan6. Backoff 10 min.
-Tick 3  (10 min)  Still no prefix. /128 bootstrap. Backoff 20 min.
-Tick 7  (30 min)  Still no prefix. Full WAN restart. Cooldown 20 min.
-Tick 11 (50 min)  Out of cooldown. Ladder resets. Tries again.
+Tick 3  (10 min)  Still no prefix. DHCPv6 renew. Backoff 20 min.
+Tick 7  (30 min)  Still no prefix. /128 bootstrap. Backoff 30 min.
+Tick 13 (60 min)  Still no prefix. Full WAN restart. Cooldown 20 min.
+Tick 17 (80 min)  Out of cooldown. Ladder resets. Tries again.
 ...
 After 3 full WAN restarts with no recovery: stop, notify once via log and Discord (if configured).
 ```
@@ -551,15 +552,55 @@ WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
     | jsonfilter -e '@["l3_device"]')
 [ -z "$WAN_DEV" ] && { log "ERROR: WAN_DEV not found, wan6 may be down"; exit 1; }
 
+# Layered validation: prefix, route, then reachability.
+# Checking in order gives specific failure classification in logs,
+# not just a binary pass/fail from ping alone.
 ipv6_ok() {
+    # Layer 1: prefix must exist
+    if ! ubus call network.interface.wan6 status 2>/dev/null \
+            | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .; then
+        log "Validation failed: no prefix assigned"
+        return 1
+    fi
+
+    # Layer 2: default route must exist
+    if ! ip -6 route show default dev "$WAN_DEV" | grep -q default; then
+        log "Validation failed: no default IPv6 route"
+        return 1
+    fi
+
+    # Layer 3: external reachability
     ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
     ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+
+    log "Validation failed: prefix and route exist but internet unreachable"
     return 1
 }
 
 has_prefix() {
     ubus call network.interface.wan6 status 2>/dev/null \
         | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .
+}
+
+# Attempt a DHCPv6 renew before resorting to full interface restart.
+# This is less disruptive and sufficient when the ISP just needs a re-request.
+# Waits 10 seconds after renew to verify the prefix was restored in the same run.
+dhcpv6_renew() {
+    log "Attempting DHCPv6 renew"
+    ubus call network.interface.wan6 renew 2>/dev/null || {
+        log "DHCPv6 renew failed or not supported"
+        return 1
+    }
+
+    sleep 10
+
+    if has_prefix; then
+        log "DHCPv6 renew succeeded, prefix restored"
+        return 0
+    fi
+
+    log "DHCPv6 renew completed but no prefix yet, will escalate next cycle"
+    return 1
 }
 
 fix_gateway() {
@@ -756,6 +797,10 @@ if ! has_prefix; then
         ifdown wan6; sleep 10; ifup wan6
 
     elif [ "$PREFIX_FAILS" -eq 2 ]; then
+        log "No prefix (attempt $PREFIX_FAILS), attempting DHCPv6 renew, backoff ${BACKOFF_SECS}s"
+        dhcpv6_renew
+
+    elif [ "$PREFIX_FAILS" -eq 3 ]; then
         log "No prefix (attempt $PREFIX_FAILS), trying /128 bootstrap, backoff ${BACKOFF_SECS}s"
         try_128_bootstrap
 
@@ -1050,6 +1095,8 @@ Confirmed during real-world testing:
 - Manual `ip -6 route replace` restores IPv6 instantly, confirming the issue is route selection, not prefix delegation
 - `accept_ra='2'` + `defaultroute='0'` is confirmed unstable for this ISP
 - Watchdog escalation ladder fires correctly across prefix failure scenarios
+- DHCPv6 renew recovers prefix in same cron cycle when ISP just needs a re-request
+- Layered `ipv6_ok` validation classifies failures by type in logs for faster debugging
 - Backoff prevents DHCPv6 hammering during NoPrefixAvail conditions
 - ONT powercycle notification fires once per incident and resets cleanly on recovery
 
@@ -1111,7 +1158,7 @@ Symptoms:
 - `wan6` shows `up: false` or stuck state
 - No IPv6 prefix assigned
 
-**Automatic handling:** The watchdog escalation ladder covers this. On the first failure it restarts `wan6`. On the second failure it performs the `/128` bootstrap automatically. No manual intervention is needed unless the watchdog itself has reached the restart limit.
+**Automatic handling:** The watchdog escalation ladder covers this. On the first failure it restarts `wan6`. On the second failure it attempts a DHCPv6 renew. On the third failure it performs the `/128` bootstrap. No manual intervention is needed unless the watchdog has reached the restart limit.
 
 **Manual recovery if needed:**
 
@@ -1215,7 +1262,7 @@ Cause: ISP DHCPv6 server refused to assign a prefix. Common reasons:
 
 **This is not a router misconfiguration. This is an ISP-side issue.**
 
-**Automatic handling:** The watchdog escalation ladder handles this fully. It will restart `wan6`, attempt the `/128` bootstrap, and escalate to full WAN restarts with exponential backoff between attempts to avoid worsening the stale lease condition. After 3 full WAN restarts with no recovery it stops retrying and notifies you to power cycle the ONT.
+**Automatic handling:** The watchdog escalation ladder handles this fully. It will restart `wan6`, attempt a DHCPv6 renew, try the `/128` bootstrap, and escalate to full WAN restarts with exponential backoff between attempts to avoid worsening the stale lease condition. After 3 full WAN restarts with no recovery it stops retrying and notifies you to power cycle the ONT.
 
 If you receive the ONT powercycle notification:
 
@@ -1274,12 +1321,29 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 
 ---
 
+## Changelog
+
+### v2.0 (April 2026)
+- Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence, replacing single ping check. Logs specific failure reason for faster debugging.
+- Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state. Verifies prefix restored within same cron run.
+- Escalation ladder expanded from three to four tiers: wan6 restart, DHCPv6 renew, `/128` bootstrap, full WAN restart.
+- Added `flock` to watchdog to prevent overlapping cron executions during bootstrap or WAN restart.
+- Added wan6 already-up guard to `98-wan6-delay` to prevent duplicate `ifup` on WAN flap.
+- MAC pinning via `ip -6 neigh replace ... nud stale` added to both `99-ipv6-setup` and watchdog `fix_gateway` for consistent neighbor stability across startup and runtime paths.
+- `99-ipv6-setup` upgraded with dual gateway sourcing, detailed logging, and dual-target connectivity check.
+- `notify_ont_powercycle` now reads router model, hostname, and firmware dynamically.
+- Added optional Discord notification system: `ipv6-discord-logger` daemon forwards tagged syslog lines in real time, `ipv6-watchdog.conf` holds webhook URLs.
+- Added ONT powercycle notification with notify-once flag to prevent Discord spam.
+- Added post-restart cooldown (20 min) and per-step exponential backoff to avoid DHCPv6 hammering.
+
+### v1.0 (April 2026)
+- Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
+- Fixes PLDT `/128` IA_NA drop, dead RA gateway selection, wan6 startup race condition, and RA runtime override.
+
+---
+
 ## Disclaimer
 
 This guide is provided as-is based on real-world testing on a specific setup. Results may vary depending on your ISP configuration, firmware version, or hardware.
 
 Always back up your router configuration before making changes.
-
----
-
-*Tested: April 2026*
