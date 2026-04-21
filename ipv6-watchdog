@@ -1,0 +1,318 @@
+#!/bin/sh
+# /usr/bin/ipv6-watchdog
+# IPv6 watchdog with escalating recovery, backoff, cooldown, ONT notification.
+# Runs every 5 minutes via cron.
+
+LOGTAG="ipv6-watchdog"
+STATE_DIR="/tmp/ipv6-watchdog"
+CONF="/etc/ipv6-watchdog.conf"
+mkdir -p "$STATE_DIR"
+
+log() { logger -t "$LOGTAG" "$1"; }
+
+# Prevent overlapping executions. If a previous run is still active
+# (e.g. during bootstrap or WAN restart), exit immediately.
+LOCK="$STATE_DIR/watchdog.lock"
+exec 9>"$LOCK"
+flock -n 9 || { log "Already running, skipping this tick"; exit 0; }
+
+[ -f "$CONF" ] && . "$CONF"
+
+WAN_RESTART_COOLDOWN=1200
+WAN_RESTART_LIMIT=3
+
+FAIL_FILE="$STATE_DIR/fail_count"
+PREFIX_FAIL_FILE="$STATE_DIR/prefix_fail_count"
+WAN_RESTART_FILE="$STATE_DIR/wan_restart_count"
+LAST_WAN_RESTART_FILE="$STATE_DIR/last_wan_restart"
+PREFIX_BACKOFF_FILE="$STATE_DIR/prefix_next_attempt"
+ONT_FLAG="$STATE_DIR/ont_notified"
+
+FAILS=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+PREFIX_FAILS=$(cat "$PREFIX_FAIL_FILE" 2>/dev/null || echo 0)
+WAN_RESTARTS=$(cat "$WAN_RESTART_FILE" 2>/dev/null || echo 0)
+LAST_RESTART=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null || echo 0)
+PREFIX_NEXT=$(cat "$PREFIX_BACKOFF_FILE" 2>/dev/null || echo 0)
+NOW=$(date +%s)
+
+sleep $((RANDOM % 5 + 5))
+
+WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
+    | jsonfilter -e '@["l3_device"]')
+[ -z "$WAN_DEV" ] && { log "ERROR: WAN_DEV not found, wan6 may be down"; exit 1; }
+
+# --- Functions ---
+
+# Layered validation: prefix, route, then reachability.
+# Checking in order gives specific failure classification in logs,
+# not just a binary pass/fail from ping alone.
+ipv6_ok() {
+    # Layer 1: prefix must exist
+    if ! ubus call network.interface.wan6 status 2>/dev/null \
+            | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .; then
+        log "Validation failed: no prefix assigned"
+        return 1
+    fi
+
+    # Layer 2: default route must exist
+    if ! ip -6 route show default dev "$WAN_DEV" | grep -q default; then
+        log "Validation failed: no default IPv6 route"
+        return 1
+    fi
+
+    # Layer 3: external reachability
+    ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+    ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+
+    log "Validation failed: prefix and route exist but internet unreachable"
+    return 1
+}
+
+has_prefix() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .
+}
+
+# Attempt a DHCPv6 renew before resorting to full interface restart.
+dhcpv6_renew() {
+    log "Attempting DHCPv6 renew"
+    ubus call network.interface.wan6 renew 2>/dev/null || {
+        log "DHCPv6 renew failed or not supported"
+        return 1
+    }
+
+    sleep 10
+
+    if has_prefix; then
+        log "DHCPv6 renew succeeded, prefix restored"
+        return 0
+    fi
+
+    log "DHCPv6 renew completed but no prefix yet, will escalate next cycle"
+    return 1
+}
+
+fix_gateway() {
+    current=$(ip -6 route show default dev "$WAN_DEV" | awk 'NR==1{print $3}')
+    ping6 -c 2 -W 2 -I "$WAN_DEV" "$current" >/dev/null 2>&1 && return 1
+
+    for gw in $(ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'); do
+        ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1 || continue
+
+        mac=$(ip -6 neigh show dev "$WAN_DEV" \
+            | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
+
+        ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512
+
+        # Pin the MAC to keep the neighbor entry stable and prevent the kernel
+        # from re-running NDP, which could reintroduce the dead gateway via RA.
+        [ -n "$mac" ] && ip -6 neigh replace "$gw" lladdr "$mac" \
+            dev "$WAN_DEV" nud stale
+
+        log "Gateway replaced with $gw${mac:+ (mac $mac pinned)}"
+        return 0
+    done
+    return 1
+}
+
+in_cooldown() {
+    ELAPSED=$((NOW - LAST_RESTART))
+    [ "$LAST_RESTART" -gt 0 ] && [ "$ELAPSED" -lt "$WAN_RESTART_COOLDOWN" ]
+}
+
+do_wan_restart() {
+    WAN_RESTARTS=$((WAN_RESTARTS + 1))
+    echo "$WAN_RESTARTS" > "$WAN_RESTART_FILE"
+    echo "$NOW" > "$LAST_WAN_RESTART_FILE"
+    echo 0 > "$PREFIX_FAIL_FILE"
+    echo 0 > "$FAIL_FILE"
+
+    log "Full WAN restart #$WAN_RESTARTS of $WAN_RESTART_LIMIT"
+    ifdown wan6; ifdown wan
+    sleep 30
+    ifup wan; sleep 20; ifup wan6
+}
+
+notify_ont_powercycle() {
+    local restarts="$1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    log "ACTION REQUIRED: IPv6 prefix not recovered after $restarts WAN restarts."
+    log "ACTION REQUIRED: Power off ONT, wait 15-30 minutes, then power on."
+    log "ACTION REQUIRED: Likely cause: stale DHCPv6 lease (NoPrefixAvail) on PLDT side."
+
+    [ -z "$DISCORD_WEBHOOK" ] && return 0
+
+    local payload
+    MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || grep -m1 'machine' /proc/cpuinfo | cut -d: -f2)
+    FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
+    HOST=$(uci get system.@system[0].hostname 2>/dev/null)
+
+    MODEL=${MODEL:-Unknown}
+    FW=${FW:-OpenWrt}
+    HOST=${HOST:-N/A}
+
+    MODEL_ESC=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    payload=$(cat <<PAYLOAD
+{
+  "embeds": [{
+    "title": "IPv6 Alert: ONT Power Cycle Required",
+    "color": 15158332,
+    "fields": [
+      { "name": "Router", "value": "$MODEL_ESC", "inline": true },
+      { "name": "Hostname", "value": "$HOST_ESC", "inline": true },
+      { "name": "WAN restarts", "value": "$restarts", "inline": true },
+      { "name": "Time", "value": "$timestamp", "inline": false },
+      { "name": "Likely cause", "value": "NoPrefixAvail: stale DHCPv6 lease on ISP side", "inline": false },
+      { "name": "Action required", "value": "Power off ONT. Wait 15-30 minutes. Power on.", "inline": false }
+    ],
+    "footer": { "text": "ipv6-watchdog on $FW_ESC" }
+  }]
+}
+PAYLOAD
+)
+
+    curl -s \
+        -H "Content-Type: application/json" \
+        -X POST \
+        -d "$payload" \
+        "$DISCORD_WEBHOOK" >/dev/null 2>&1 \
+    && log "Discord alert sent" \
+    || log "Discord alert failed (curl error)"
+}
+
+try_128_bootstrap() {
+    log "Attempting /128 bootstrap to recover prefix delegation"
+
+    uci set network.wan6.reqaddress='try'
+    ubus call network reload >/dev/null 2>&1
+    ifdown wan6; sleep 5; ifup wan6
+
+    sleep 30
+
+    uci set network.wan6.reqaddress='none'
+    ubus call network reload >/dev/null 2>&1
+    ifdown wan6; sleep 5; ifup wan6
+
+    local i prefix
+    for i in $(seq 1 10); do
+        prefix=$(ubus call network.interface.wan6 status 2>/dev/null \
+            | jsonfilter -e '@["ipv6-prefix"][0].address')
+        [ -n "$prefix" ] && break
+        sleep 3
+    done
+
+    if [ -n "$prefix" ]; then
+        log "Prefix acquired via bootstrap: $prefix, verifying connectivity"
+        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1; then
+            ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
+            | while read -r addr; do
+                ip -6 addr del "$addr" dev "$WAN_DEV"
+                log "Removed /128: $addr"
+            done
+            return 0
+        else
+            log "Prefix present but connectivity failed, keeping /128 for next cycle"
+            return 1
+        fi
+    else
+        log "Bootstrap failed, no prefix acquired after restore"
+        return 1
+    fi
+}
+
+# --- Main logic ---
+
+# Happy path: reset all state.
+if ipv6_ok; then
+    if [ -f "$ONT_FLAG" ] && [ -n "$DISCORD_WEBHOOK" ]; then
+        RECOVERY_PAYLOAD='{"embeds":[{"title":"IPv6 Recovered","color":3066993,"description":"IPv6 connectivity restored. All counters reset.","footer":{"text":"ipv6-watchdog"}}]}'
+        curl -s -H "Content-Type: application/json" -X POST \
+            -d "$RECOVERY_PAYLOAD" "$DISCORD_WEBHOOK" >/dev/null 2>&1
+        log "IPv6 recovered after critical failure, Discord recovery notice sent"
+    fi
+
+    echo 0 > "$FAIL_FILE"
+    echo 0 > "$PREFIX_FAIL_FILE"
+    echo 0 > "$WAN_RESTART_FILE"
+    echo 0 > "$LAST_WAN_RESTART_FILE"
+    rm -f "$ONT_FLAG"
+    rm -f "$PREFIX_BACKOFF_FILE"
+    exit 0
+fi
+
+# No prefix: escalating recovery path.
+if ! has_prefix; then
+
+    if [ "$WAN_RESTARTS" -ge "$WAN_RESTART_LIMIT" ]; then
+        if [ ! -f "$ONT_FLAG" ]; then
+            notify_ont_powercycle "$WAN_RESTARTS"
+            touch "$ONT_FLAG"
+        else
+            log "Awaiting manual ONT powercycle (restart limit reached), no action taken"
+        fi
+        exit 0
+    fi
+
+    if in_cooldown; then
+        ELAPSED=$((NOW - LAST_RESTART))
+        REMAINING=$((WAN_RESTART_COOLDOWN - ELAPSED))
+        log "In post-restart cooldown, ${REMAINING}s remaining, skipping"
+        exit 0
+    fi
+
+    if [ "$NOW" -lt "$PREFIX_NEXT" ]; then
+        REMAINING=$((PREFIX_NEXT - NOW))
+        log "Prefix backoff active, ${REMAINING}s remaining, skipping"
+        exit 0
+    fi
+
+    PREFIX_FAILS=$((PREFIX_FAILS + 1))
+    echo "$PREFIX_FAILS" > "$PREFIX_FAIL_FILE"
+
+    BACKOFF_SECS=$(( 600 * (1 << (PREFIX_FAILS - 1)) ))
+    [ "$BACKOFF_SECS" -gt 1800 ] && BACKOFF_SECS=1800
+    echo $((NOW + BACKOFF_SECS)) > "$PREFIX_BACKOFF_FILE"
+
+    if [ "$PREFIX_FAILS" -eq 1 ]; then
+        log "No prefix (attempt $PREFIX_FAILS), restarting wan6, backoff ${BACKOFF_SECS}s"
+        ifdown wan6; sleep 10; ifup wan6
+
+    elif [ "$PREFIX_FAILS" -eq 2 ]; then
+        log "No prefix (attempt $PREFIX_FAILS), attempting DHCPv6 renew, backoff ${BACKOFF_SECS}s"
+        dhcpv6_renew
+
+    elif [ "$PREFIX_FAILS" -eq 3 ]; then
+        log "No prefix (attempt $PREFIX_FAILS), trying /128 bootstrap, backoff ${BACKOFF_SECS}s"
+        try_128_bootstrap
+
+    else
+        log "No prefix (attempt $PREFIX_FAILS), escalating to full WAN restart"
+        do_wan_restart
+    fi
+
+    exit 0
+fi
+
+# Has prefix but connectivity is broken: try gateway fix first.
+if fix_gateway; then
+    sleep 5
+    if ipv6_ok; then
+        echo 0 > "$FAIL_FILE"
+        echo 0 > "$PREFIX_FAIL_FILE"
+        exit 0
+    fi
+fi
+
+FAILS=$((FAILS + 1))
+echo "$FAILS" > "$FAIL_FILE"
+log "Connectivity failure $FAILS (prefix present, gateway broken or route dead)"
+
+if [ "$FAILS" -ge 3 ]; then
+    log "3 consecutive connectivity failures, escalating to full WAN restart"
+    do_wan_restart
+fi
