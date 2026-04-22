@@ -92,6 +92,14 @@ ping6 -c 4 2606:4700:4700::1111
 
 Clients should receive global IPv6 addresses, not just `fe80::` link-local addresses.
 
+Verify odhcpd is advertising on LAN:
+
+```sh
+logread | grep odhcpd
+```
+
+Good: RA activity logged. If clients only show `fe80::`, confirm the `dhcp` UCI block from Step 1 was applied and `odhcpd` was restarted.
+
 **7. Logs are clean**
 
 ```sh
@@ -288,6 +296,17 @@ uci set network.lan.ip6class='wan6'
 uci commit network
 ```
 
+Then enable LAN IPv6 advertisement so clients receive global addresses:
+
+```sh
+uci set dhcp.lan.ra='server'
+uci set dhcp.lan.ra_slaac='1'
+uci set dhcp.lan.dhcpv6='server'
+uci set dhcp.lan.ra_default='1'
+uci commit dhcp
+/etc/init.d/odhcpd restart
+```
+
 What each setting does:
 
 | Setting | Value | Why |
@@ -297,6 +316,12 @@ What each setting does:
 | `accept_ra` | `1` | Keeps RA processing on so `wan6` initializes correctly |
 | `ip6assign` | `64` | LAN gets a `/64` from the delegated prefix |
 | `ip6class` | `wan6` | Binds LAN prefix delegation to the `wan6` interface |
+| `ra` | `server` | Enables Router Advertisement server on LAN |
+| `ra_slaac` | `1` | Allows clients to generate their own IPv6 via SLAAC |
+| `dhcpv6` | `server` | Enables DHCPv6 server for additional config (DNS, etc.) |
+| `ra_default` | `1` | Advertises the default route to LAN clients |
+
+> **Note:** Without the `dhcp` block, the router will have working IPv6 but LAN clients will only see `fe80::` link-local addresses. They will not receive global IPv6 addresses and browser IPv6 tests will fail even though the router itself is fully connected.
 
 ---
 
@@ -1108,6 +1133,7 @@ Confirmed during real-world testing:
 - Backoff prevents DHCPv6 hammering during NoPrefixAvail conditions
 - ONT powercycle notification fires once per incident and resets cleanly on recovery
 - Router identity in Discord alerts reads dynamically from system, no hardcoded values
+- LAN clients confirmed receiving global IPv6 via SLAAC after enabling `ra`, `ra_slaac`, `dhcpv6`, and `ra_default` on the LAN interface and restarting odhcpd
 
 ---
 
@@ -1122,6 +1148,7 @@ Confirmed during real-world testing:
 | Race condition on boot | `98-wan6-delay` script | Fixed |
 | Prefix delegation failure (NoPrefixAvail) | Escalating recovery ladder with backoff | Fixed |
 | Persistent ISP-side lease failure | ONT powercycle notification after 3 WAN restarts | Escalated to human |
+| LAN clients not receiving IPv6 | `ra`, `ra_slaac`, `dhcpv6`, `ra_default` on LAN + odhcpd restart | Fixed |
 
 ---
 
@@ -1331,6 +1358,11 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 ---
 
 ## Changelog
+
+### v2.1 (April 2026)
+- Added LAN IPv6 advertisement config to Step 1: `ra`, `ra_slaac`, `dhcpv6`, `ra_default` on LAN interface, with odhcpd restart. Without this, clients only receive `fe80::` link-local addresses and have no usable IPv6 even when the router is fully connected.
+- Updated Post-Deploy Verification item 6 with odhcpd log check and troubleshooting note.
+- Updated Final Result table and Validated Behavior to reflect confirmed client-side IPv6 delivery.
 
 ### v2.0 (April 2026)
 - Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence. Logs specific failure reason for faster debugging.
