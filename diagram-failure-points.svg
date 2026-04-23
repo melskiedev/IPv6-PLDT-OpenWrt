@@ -81,7 +81,7 @@
   <text x="107" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">blocks /128 IA_NA</text>
   <rect x="198" y="354" width="175" height="34" rx="5" fill="#0d2a16" stroke="#238636" stroke-width="1"/>
   <text x="285" y="368" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10" font-weight="700">99-ipv6-setup</text>
-  <text x="285" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">best GW + MAC pin + /128</text>
+  <text x="285" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">best GW + MAC pin + LAN RA</text>
   <rect x="386" y="354" width="165" height="34" rx="5" fill="#0d2a16" stroke="#238636" stroke-width="1"/>
   <text x="468" y="368" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10" font-weight="700">98-wan6-delay</text>
   <text x="468" y="381" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">5s delay + flap guard</text>
