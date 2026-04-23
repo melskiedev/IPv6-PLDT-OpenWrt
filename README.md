@@ -366,6 +366,8 @@ Runs whenever `wan6` comes up. This is the authoritative startup fix. It ensures
 
 **Defers to watchdog on missing prefix.** If no prefix is assigned after 45 seconds, the script logs a warning and exits clean. The watchdog handles prefix recovery via the escalation ladder.
 
+**LAN RA config enforcement.** After confirming WAN connectivity, the script checks that `dhcp.lan` is correctly configured for RA advertisement (`ra`, `ra_slaac`, `dhcpv6`, `ra_default`). If any value is missing or wrong, it corrects it and restarts `odhcpd`. Without this, clients only receive `fe80::` link-local addresses even when the router itself has full IPv6.
+
 ```sh
 #!/bin/sh
 [ "$ACTION" = "ifup" ] || exit 0
@@ -499,6 +501,38 @@ else
 fi
 
 log "=== setup complete ==="
+
+# ===== VERIFY LAN RA CONFIG =====
+# Checks that odhcpd is configured to advertise IPv6 to LAN clients.
+# Without this, the router has working IPv6 but clients only see fe80:: link-local.
+# Self-healing: fixes and restarts odhcpd if any value is wrong.
+ra_ok=1
+for key in ra ra_slaac dhcpv6 ra_default; do
+    val=$(uci get dhcp.lan.$key 2>/dev/null)
+    case "$key" in
+        ra)        expected="server" ;;
+        ra_slaac)  expected="1" ;;
+        dhcpv6)    expected="server" ;;
+        ra_default) expected="1" ;;
+    esac
+    if [ "$val" != "$expected" ]; then
+        log "WARNING: dhcp.lan.$key is '${val:-unset}', expected '$expected' -- fixing"
+        uci set dhcp.lan.$key="$expected"
+        ra_ok=0
+    fi
+done
+
+if [ "$ra_ok" -eq 0 ]; then
+    uci commit dhcp
+    if /etc/init.d/odhcpd running 2>/dev/null; then
+        /etc/init.d/odhcpd restart
+    else
+        /etc/init.d/odhcpd start
+    fi
+    log "LAN RA config corrected and odhcpd restarted"
+else
+    log "LAN RA config OK"
+fi
 ```
 
 ```sh
@@ -1361,6 +1395,7 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 
 ### v2.1 (April 2026)
 - Added LAN IPv6 advertisement config to Step 1: `ra`, `ra_slaac`, `dhcpv6`, `ra_default` on LAN interface, with odhcpd restart. Without this, clients only receive `fe80::` link-local addresses and have no usable IPv6 even when the router is fully connected.
+- Added self-healing LAN RA config check to `99-ipv6-setup`. Runs on every `wan6` ifup. Detects and corrects missing or wrong `dhcp.lan` RA values, then restarts odhcpd if a fix was applied. Logs clean if config is already correct.
 - Updated Post-Deploy Verification item 6 with odhcpd log check and troubleshooting note.
 - Updated Final Result table and Validated Behavior to reflect confirmed client-side IPv6 delivery.
 
