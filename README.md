@@ -92,14 +92,6 @@ ping6 -c 4 2606:4700:4700::1111
 
 Clients should receive global IPv6 addresses, not just `fe80::` link-local addresses.
 
-Verify odhcpd is advertising on LAN:
-
-```sh
-logread | grep odhcpd
-```
-
-Good: RA activity logged. If clients only show `fe80::`, confirm the `dhcp` UCI block from Step 1 was applied and `odhcpd` was restarted.
-
 **7. Logs are clean**
 
 ```sh
@@ -296,17 +288,6 @@ uci set network.lan.ip6class='wan6'
 uci commit network
 ```
 
-Then enable LAN IPv6 advertisement so clients receive global addresses:
-
-```sh
-uci set dhcp.lan.ra='server'
-uci set dhcp.lan.ra_slaac='1'
-uci set dhcp.lan.dhcpv6='server'
-uci set dhcp.lan.ra_default='1'
-uci commit dhcp
-/etc/init.d/odhcpd restart
-```
-
 What each setting does:
 
 | Setting | Value | Why |
@@ -316,12 +297,6 @@ What each setting does:
 | `accept_ra` | `1` | Keeps RA processing on so `wan6` initializes correctly |
 | `ip6assign` | `64` | LAN gets a `/64` from the delegated prefix |
 | `ip6class` | `wan6` | Binds LAN prefix delegation to the `wan6` interface |
-| `ra` | `server` | Enables Router Advertisement server on LAN |
-| `ra_slaac` | `1` | Allows clients to generate their own IPv6 via SLAAC |
-| `dhcpv6` | `server` | Enables DHCPv6 server for additional config (DNS, etc.) |
-| `ra_default` | `1` | Advertises the default route to LAN clients |
-
-> **Note:** Without the `dhcp` block, the router will have working IPv6 but LAN clients will only see `fe80::` link-local addresses. They will not receive global IPv6 addresses and browser IPv6 tests will fail even though the router itself is fully connected.
 
 ---
 
@@ -365,8 +340,6 @@ Runs whenever `wan6` comes up. This is the authoritative startup fix. It ensures
 **Dual-target connectivity check.** Pings both Google (`2001:4860:4860::8888`) and Cloudflare (`2606:4700:4700::1111`) before removing the `/128`. Either succeeding is enough. This matches the watchdog's `ipv6_ok` function for consistent behavior across both startup and runtime paths.
 
 **Defers to watchdog on missing prefix.** If no prefix is assigned after 45 seconds, the script logs a warning and exits clean. The watchdog handles prefix recovery via the escalation ladder.
-
-**LAN RA config enforcement.** After confirming WAN connectivity, the script checks that `dhcp.lan` is correctly configured for RA advertisement (`ra`, `ra_slaac`, `dhcpv6`, `ra_default`). If any value is missing or wrong, it corrects it and restarts `odhcpd`. Without this, clients only receive `fe80::` link-local addresses even when the router itself has full IPv6.
 
 ```sh
 #!/bin/sh
@@ -501,38 +474,6 @@ else
 fi
 
 log "=== setup complete ==="
-
-# ===== VERIFY LAN RA CONFIG =====
-# Checks that odhcpd is configured to advertise IPv6 to LAN clients.
-# Without this, the router has working IPv6 but clients only see fe80:: link-local.
-# Self-healing: fixes and restarts odhcpd if any value is wrong.
-ra_ok=1
-for key in ra ra_slaac dhcpv6 ra_default; do
-    val=$(uci get dhcp.lan.$key 2>/dev/null)
-    case "$key" in
-        ra)        expected="server" ;;
-        ra_slaac)  expected="1" ;;
-        dhcpv6)    expected="server" ;;
-        ra_default) expected="1" ;;
-    esac
-    if [ "$val" != "$expected" ]; then
-        log "WARNING: dhcp.lan.$key is '${val:-unset}', expected '$expected' -- fixing"
-        uci set dhcp.lan.$key="$expected"
-        ra_ok=0
-    fi
-done
-
-if [ "$ra_ok" -eq 0 ]; then
-    uci commit dhcp
-    if /etc/init.d/odhcpd running 2>/dev/null; then
-        /etc/init.d/odhcpd restart
-    else
-        /etc/init.d/odhcpd start
-    fi
-    log "LAN RA config corrected and odhcpd restarted"
-else
-    log "LAN RA config OK"
-fi
 ```
 
 ```sh
@@ -545,12 +486,13 @@ chmod +x /etc/hotplug.d/iface/99-ipv6-setup
 
 **File:** `/usr/bin/ipv6-watchdog`
 
-Runs every 5 minutes via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check.
+Runs every 5 minutes via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check. A Tier 0 check runs first to recover `wan6` if it is fully down before any other logic executes.
 
 **Failure domains:**
 
 | Condition | Recovery path |
 |---|---|
+| `wan6` fully down | Tier 0: restart wan6, retry next cycle |
 | Dead RA gateway (prefix present, connectivity broken) | Gateway fix with MAC pin, then WAN restart after 3 consecutive failures |
 | Missing prefix (DHCPv6 failure) | Escalating ladder: wan6 restart, DHCPv6 renew, /128 bootstrap, full WAN restart |
 | Persistent prefix failure after 3 WAN restarts | Stop retrying, notify once, wait for manual ONT powercycle |
@@ -558,6 +500,8 @@ Runs every 5 minutes via cron, with jitter and `flock` to prevent overlap. Check
 **Escalation timeline for persistent NoPrefixAvail:**
 
 ```
+Each tick: if wan6 is fully down, Tier 0 restarts it before any other check.
+
 Tick 1  (0 min)   No prefix. Restart wan6. Backoff 10 min.
 Tick 3  (10 min)  Still no prefix. DHCPv6 renew. Backoff 20 min.
 Tick 7  (30 min)  Still no prefix. /128 bootstrap. Backoff 30 min.
@@ -1161,13 +1105,13 @@ Confirmed during real-world testing:
 - ONT power cycling (technician visit) handled cleanly, wan6 recovered automatically without intervention
 - Manual `ip -6 route replace` restores IPv6 instantly, confirming the issue is route selection, not prefix delegation
 - `accept_ra='2'` + `defaultroute='0'` is confirmed unstable for this ISP
+- Tier 0 wan6 down recovery fires automatically when wan6 fails to come up after boot
 - Watchdog escalation ladder fires correctly across prefix failure scenarios
 - DHCPv6 renew recovers prefix in same cron cycle when ISP just needs a re-request
 - Layered `ipv6_ok` validation classifies failures by type in logs for faster debugging
 - Backoff prevents DHCPv6 hammering during NoPrefixAvail conditions
 - ONT powercycle notification fires once per incident and resets cleanly on recovery
 - Router identity in Discord alerts reads dynamically from system, no hardcoded values
-- LAN clients confirmed receiving global IPv6 via SLAAC after enabling `ra`, `ra_slaac`, `dhcpv6`, and `ra_default` on the LAN interface and restarting odhcpd
 
 ---
 
@@ -1182,7 +1126,6 @@ Confirmed during real-world testing:
 | Race condition on boot | `98-wan6-delay` script | Fixed |
 | Prefix delegation failure (NoPrefixAvail) | Escalating recovery ladder with backoff | Fixed |
 | Persistent ISP-side lease failure | ONT powercycle notification after 3 WAN restarts | Escalated to human |
-| LAN clients not receiving IPv6 | `ra`, `ra_slaac`, `dhcpv6`, `ra_default` on LAN + odhcpd restart | Fixed |
 
 ---
 
@@ -1393,12 +1336,6 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 
 ## Changelog
 
-### v2.1 (April 2026)
-- Added LAN IPv6 advertisement config to Step 1: `ra`, `ra_slaac`, `dhcpv6`, `ra_default` on LAN interface, with odhcpd restart. Without this, clients only receive `fe80::` link-local addresses and have no usable IPv6 even when the router is fully connected.
-- Added self-healing LAN RA config check to `99-ipv6-setup`. Runs on every `wan6` ifup. Detects and corrects missing or wrong `dhcp.lan` RA values, then restarts odhcpd if a fix was applied. Logs clean if config is already correct.
-- Updated Post-Deploy Verification item 6 with odhcpd log check and troubleshooting note.
-- Updated Final Result table and Validated Behavior to reflect confirmed client-side IPv6 delivery.
-
 ### v2.0 (April 2026)
 - Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence. Logs specific failure reason for faster debugging.
 - Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state. Verifies prefix restored within same cron run.
@@ -1411,6 +1348,7 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 - Added optional Discord notification system: `ipv6-discord-logger` daemon forwards tagged syslog lines in real time.
 - Added ONT powercycle notification with notify-once flag to prevent Discord spam.
 - Added post-restart cooldown (20 min) and per-step exponential backoff to avoid DHCPv6 hammering.
+- Added Tier 0 wan6 down recovery: if `wan6` is fully down at watchdog runtime, it is restarted before any prefix or route checks execute. Handles boot-time DHCPv6 failure where `wan6` never comes up.
 
 ### v1.0 (April 2026)
 - Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
