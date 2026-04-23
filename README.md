@@ -559,6 +559,26 @@ NOW=$(date +%s)
 # Add jitter to avoid synchronized retry bursts across rapid cron ticks.
 sleep $((RANDOM % 5 + 5))
 
+# ===== TIER 0: wan6 DOWN RECOVERY =====
+# Handles the case where wan6 never came up after boot or a link event.
+# This runs before all other checks since WAN_DEV cannot be determined
+# when wan6 is down, which would otherwise cause an early exit.
+if ! ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["up"]' | grep -q true; then
+    log "Tier 0: wan6 is DOWN -- attempting recovery"
+    ifdown wan6
+    sleep 5
+    ifup wan6
+    sleep 15
+    if ubus call network.interface.wan6 status 2>/dev/null \
+            | jsonfilter -e '@["up"]' | grep -q true; then
+        log "Tier 0: wan6 recovery SUCCESS"
+    else
+        log "Tier 0: wan6 recovery FAILED -- will retry on next cycle"
+    fi
+    exit 0
+fi
+
 WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
     | jsonfilter -e '@["l3_device"]')
 [ -z "$WAN_DEV" ] && { log "ERROR: WAN_DEV not found, wan6 may be down"; exit 1; }
