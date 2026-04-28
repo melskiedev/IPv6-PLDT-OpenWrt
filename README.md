@@ -960,9 +960,10 @@ color_for() {
 
 logger -t "$LOGTAG" "Log forwarder started, watching: $WATCH_TAGS"
 
-logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | while read -r line; do
+logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r line; do
     COLOR=$(color_for "$line")
     TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
 
     # Escape backslashes and double quotes for JSON safety.
     SAFE=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -972,7 +973,7 @@ logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | while read -r line; do
   "embeds": [{
     "description": "\`\`\`$SAFE\`\`\`",
     "color": $COLOR,
-    "footer": { "text": "OpenWrt $TIMESTAMP" }
+    "footer": { "text": "$HOST $TIMESTAMP" }
   }]
 }
 EOF
