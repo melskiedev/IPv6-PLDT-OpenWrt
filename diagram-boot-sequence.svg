@@ -1,6 +1,6 @@
 <svg width="900" height="352" viewBox="0 0 900 352" xmlns="http://www.w3.org/2000/svg" role="img">
   <title>Boot Sequence — Layered IPv6 Fix</title>
-  <desc>Step by step boot sequence showing how the fix layers activate in order to establish stable IPv6, with watchdog providing layered validation, DHCPv6 renew, and escalating recovery</desc>
+  <desc>Step by step boot sequence showing the updated wan6 clean-start flow: WAN up, reset wan6, delay 15 seconds, start wan6, acquire prefix, select and pin the working gateway, verify IPv6, then hand off to watchdog runtime recovery.</desc>
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M2 1L8 5L2 9" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -9,57 +9,77 @@
       <path d="M2 1L8 5L2 9" fill="none" stroke="#1f4068" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
     </marker>
   </defs>
+
   <rect width="900" height="352" fill="#0d1117" rx="12"/>
   <text x="450" y="28" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="11" font-weight="600" letter-spacing="2">BOOT SEQUENCE — LAYERED FIX</text>
-  <rect x="30" y="60" width="120" height="70" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
-  <text x="90" y="84" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="9">STEP 1</text>
-  <text x="90" y="102" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="13" font-weight="700">WAN up</text>
-  <text x="90" y="120" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="9">eth1 online</text>
-  <line x1="152" y1="95" x2="178" y2="95" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
-  <rect x="180" y="60" width="130" height="70" rx="8" fill="#2a1f0d" stroke="#5a3e0a" stroke-width="1.5"/>
+
+  <rect x="30" y="60" width="115" height="70" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="87" y="84" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="9">STEP 1</text>
+  <text x="87" y="102" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="13" font-weight="700">WAN up</text>
+  <text x="87" y="120" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="9">eth1 online</text>
+
+  <line x1="147" y1="95" x2="168" y2="95" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="170" y="60" width="150" height="70" rx="8" fill="#2a1f0d" stroke="#5a3e0a" stroke-width="1.5"/>
   <text x="245" y="78" text-anchor="middle" fill="#917030" font-family="monospace" font-size="8">STEP 2 — FIX B</text>
-  <text x="245" y="95" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="12" font-weight="700">5s delay</text>
-  <text x="245" y="110" text-anchor="middle" fill="#917030" font-family="monospace" font-size="9">98-wan6-delay</text>
-  <text x="245" y="122" text-anchor="middle" fill="#5a3e0a" font-family="monospace" font-size="8">guard: skip if wan6 up</text>
-  <line x1="312" y1="95" x2="338" y2="95" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
-  <rect x="340" y="60" width="130" height="70" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
-  <text x="405" y="78" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="9">STEP 3</text>
-  <text x="405" y="96" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="11" font-weight="700">wan6 / DHCPv6</text>
-  <text x="405" y="112" text-anchor="middle" fill="#39d0c8" font-family="monospace" font-size="9">/56 prefix acquired</text>
-  <text x="405" y="124" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="8">no /128 requested</text>
-  <line x1="472" y1="95" x2="498" y2="95" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
-  <rect x="500" y="60" width="140" height="82" rx="8" fill="#0d2a16" stroke="#238636" stroke-width="1.5"/>
-  <text x="570" y="78" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">STEP 4 — FIX C</text>
-  <text x="570" y="95" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="12" font-weight="700">route engine</text>
-  <text x="570" y="110" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">best GW selected</text>
-  <text x="570" y="122" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">MAC pinned + /128 removed</text>
-  <text x="570" y="134" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">LAN RA enforced</text>
-  <line x1="642" y1="101" x2="668" y2="101" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
-  <rect x="670" y="60" width="200" height="82" rx="8" fill="#0d2a16" stroke="#3fb950" stroke-width="2"/>
-  <text x="770" y="80" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="9">RESULT</text>
-  <text x="770" y="98" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="13" font-weight="700">IPv6 online</text>
-  <text x="770" y="114" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">/128 removed, GW pinned</text>
-  <text x="770" y="126" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">LAN RA enforced</text>
-  <text x="770" y="136" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">flock + jitter active</text>
-  <text x="90" y="160" text-anchor="middle" fill="#30363d" font-family="monospace" font-size="9">boot event</text>
-  <text x="245" y="160" text-anchor="middle" fill="#5a3e0a" font-family="monospace" font-size="9">race fix + flap guard</text>
-  <text x="405" y="160" text-anchor="middle" fill="#30363d" font-family="monospace" font-size="9">prefix delegation</text>
-  <text x="570" y="160" text-anchor="middle" fill="#1a4428" font-family="monospace" font-size="9">GW select + MAC pin + LAN RA</text>
-  <text x="770" y="160" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="9">stable IPv6 end-to-end</text>
-  <path d="M770 204 Q770 247 450 247 Q130 247 90 204" fill="none" stroke="#1f4068" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-loop)"/>
+  <text x="245" y="95" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="12" font-weight="700">reset wan6</text>
+  <text x="245" y="110" text-anchor="middle" fill="#b89040" font-family="monospace" font-size="9">ifdown if early</text>
+  <text x="245" y="122" text-anchor="middle" fill="#5a3e0a" font-family="monospace" font-size="8">clears pending session</text>
+
+  <line x1="322" y1="95" x2="343" y2="95" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="345" y="60" width="140" height="70" rx="8" fill="#2a1f0d" stroke="#d29922" stroke-width="1.5"/>
+  <text x="415" y="78" text-anchor="middle" fill="#917030" font-family="monospace" font-size="8">STEP 3 — FIX B</text>
+  <text x="415" y="95" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="12" font-weight="700">15s delay</text>
+  <text x="415" y="110" text-anchor="middle" fill="#b89040" font-family="monospace" font-size="9">WAN + ISP ready</text>
+  <text x="415" y="122" text-anchor="middle" fill="#5a3e0a" font-family="monospace" font-size="8">98-wan6-delay</text>
+
+  <line x1="487" y1="95" x2="508" y2="95" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="510" y="60" width="130" height="70" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="575" y="78" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="9">STEP 4</text>
+  <text x="575" y="96" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="11" font-weight="700">wan6 starts</text>
+  <text x="575" y="112" text-anchor="middle" fill="#39d0c8" font-family="monospace" font-size="9">clean DHCPv6</text>
+  <text x="575" y="124" text-anchor="middle" fill="#444c56" font-family="monospace" font-size="8">/56 prefix acquired</text>
+
+  <line x1="642" y1="95" x2="663" y2="95" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="665" y="60" width="205" height="82" rx="8" fill="#0d2a16" stroke="#238636" stroke-width="1.5"/>
+  <text x="767" y="78" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">STEP 5 — FIX C</text>
+  <text x="767" y="95" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="12" font-weight="700">route engine</text>
+  <text x="767" y="110" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">best GW selected + pinned</text>
+  <text x="767" y="122" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">default route installed</text>
+  <text x="767" y="134" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">/128 removed after check</text>
+
+  <text x="87" y="160" text-anchor="middle" fill="#30363d" font-family="monospace" font-size="9">boot event</text>
+  <text x="245" y="160" text-anchor="middle" fill="#5a3e0a" font-family="monospace" font-size="9">state correction</text>
+  <text x="415" y="160" text-anchor="middle" fill="#5a3e0a" font-family="monospace" font-size="9">timing control</text>
+  <text x="575" y="160" text-anchor="middle" fill="#30363d" font-family="monospace" font-size="9">prefix delegation</text>
+  <text x="767" y="160" text-anchor="middle" fill="#1a4428" font-family="monospace" font-size="9">GW select + MAC pin</text>
+
+  <rect x="300" y="182" width="300" height="36" rx="8" fill="#0d2a16" stroke="#3fb950" stroke-width="2"/>
+  <text x="450" y="198" text-anchor="middle" fill="#1a5c30" font-family="monospace" font-size="8">RESULT</text>
+  <text x="450" y="212" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="12" font-weight="700">IPv6 online, steady state</text>
+
+  <path d="M450 218 Q450 247 450 247 Q130 247 90 204" fill="none" stroke="#1f4068" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-loop)"/>
   <rect x="270" y="227" width="360" height="28" rx="6" fill="#0d1f36" stroke="#1f4068" stroke-width="1"/>
-  <text x="450" y="245" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="11">watchdog — every 5 min — flock + jitter</text>
+  <text x="450" y="245" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="11">watchdog — runtime monitoring — flock + jitter</text>
+
   <line x1="30" y1="277" x2="870" y2="277" stroke="#21262d" stroke-width="1"/>
   <text x="450" y="290" text-anchor="middle" fill="#30363d" font-family="monospace" font-size="9" letter-spacing="2">RUNTIME RECOVERY LADDER (no prefix)</text>
+
   <rect x="30" y="299" width="180" height="34" rx="5" fill="#0d2a16" stroke="#238636" stroke-width="1"/>
   <text x="120" y="313" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10" font-weight="700">1. restart wan6</text>
   <text x="120" y="326" text-anchor="middle" fill="#4ec95a" font-family="monospace" font-size="9">backoff 10 min</text>
+
   <rect x="225" y="299" width="185" height="34" rx="5" fill="#2a1f0d" stroke="#d29922" stroke-width="1"/>
   <text x="317" y="313" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10" font-weight="700">2. DHCPv6 renew</text>
   <text x="317" y="326" text-anchor="middle" fill="#b89040" font-family="monospace" font-size="9">verify + backoff 20 min</text>
+
   <rect x="425" y="299" width="175" height="34" rx="5" fill="#2a1f0d" stroke="#d29922" stroke-width="1"/>
   <text x="512" y="313" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10" font-weight="700">3. /128 bootstrap</text>
   <text x="512" y="326" text-anchor="middle" fill="#b89040" font-family="monospace" font-size="9">backoff 30 min</text>
+
   <rect x="615" y="299" width="255" height="34" rx="5" fill="#2a0d0d" stroke="#f85149" stroke-width="1"/>
   <text x="742" y="313" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="10" font-weight="700">4. WAN restart → ONT alert</text>
   <text x="742" y="326" text-anchor="middle" fill="#956060" font-family="monospace" font-size="9">cooldown 20 min, limit 3, then notify</text>
