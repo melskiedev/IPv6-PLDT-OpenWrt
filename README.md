@@ -246,7 +246,7 @@ This is the dominant failure. Everything else amplifies or destabilizes it.
 **Startup flow:**
 
 ```
-WAN up -> delay (5s) -> wan6 starts -> prefix acquired -> route fix engine runs
+WAN up -> delay (15s, clean start) -> wan6 starts -> prefix acquired -> route fix engine runs
 ```
 
 **Runtime flow:**
@@ -300,22 +300,26 @@ What each setting does:
 
 ---
 
-## Step 2 - wan6 Startup Delay
+## Step 2 — wan6 Startup Delay
 
 **File:** `/etc/hotplug.d/iface/98-wan6-delay`
 
-Waits for WAN to be fully ready before starting `wan6`, eliminating the link-local race condition. Also guards against duplicate `ifup wan6` on WAN flap, which would otherwise reset an active DHCPv6 session mid-acquisition.
+Waits for WAN to be fully ready before starting `wan6`, eliminating early DHCPv6 startup failures that can leave the interface stuck in a `pending` state. Ensures a clean start by resetting any prematurely started session and delaying until the ISP is ready.
 
 ```sh
 #!/bin/sh
 [ "$ACTION" = "ifup" ] || exit 0
 [ "$INTERFACE" = "wan" ] || exit 0
 
-# Skip if wan6 is already up to avoid duplicate ifup on WAN flap.
-ubus call network.interface.wan6 status 2>/dev/null \
-    | jsonfilter -e '@["up"]' | grep -q true && exit 0
+logger -t wan6-delay "WAN up detected, preparing wan6..."
 
-sleep 5
+# Force reset in case wan6 started too early
+ifdown wan6 2>/dev/null
+
+# Wait for WAN + ISP DHCPv6 readiness
+sleep 15
+
+logger -t wan6-delay "Starting wan6 after delay"
 ifup wan6
 ```
 
@@ -1362,7 +1366,6 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 - Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state. Verifies prefix restored within same cron run.
 - Escalation ladder expanded from three to four tiers: wan6 restart, DHCPv6 renew, `/128` bootstrap, full WAN restart.
 - Added `flock` to watchdog to prevent overlapping cron executions during bootstrap or WAN restart.
-- Added wan6 already-up guard to `98-wan6-delay` to prevent duplicate `ifup` on WAN flap.
 - MAC pinning via `ip -6 neigh replace ... nud stale` added to both `99-ipv6-setup` and watchdog `fix_gateway` for consistent neighbor stability across startup and runtime paths.
 - `99-ipv6-setup` upgraded with dual gateway sourcing, detailed logging, and dual-target connectivity check.
 - `notify_ont_powercycle` now reads router model, hostname, and firmware dynamically with `/proc/cpuinfo` fallback. Portable across devices.
@@ -1370,6 +1373,7 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 - Added ONT powercycle notification with notify-once flag to prevent Discord spam.
 - Added post-restart cooldown (20 min) and per-step exponential backoff to avoid DHCPv6 hammering.
 - Added Tier 0 wan6 down recovery: if `wan6` is fully down at watchdog runtime, it is restarted before any prefix or route checks execute. Handles boot-time DHCPv6 failure where `wan6` never comes up.
+- Replaced wan6 already-up guard with forced reset and extended delay to prevent DHCPv6 pending state at boot.
 
 ### v1.0 (April 2026)
 - Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
