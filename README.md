@@ -966,11 +966,14 @@ logger -t "$LOGTAG" "Log forwarder started, watching: $WATCH_TAGS"
 
 logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r line; do
     COLOR=$(color_for "$line")
-    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-    HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
+    TIMESTAMP=$(date '+%b %d %Y %I:%M:%S %p')
+
+    # Strip syslog prefix, keep only the message content.
+    MSG=$(echo "$line" | cut -d' ' -f8-)
 
     # Escape backslashes and double quotes for JSON safety.
-    SAFE=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    SAFE=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
 
     PAYLOAD=$(cat <<EOF
 {
@@ -1374,6 +1377,7 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 - Added post-restart cooldown (20 min) and per-step exponential backoff to avoid DHCPv6 hammering.
 - Added Tier 0 wan6 down recovery: if `wan6` is fully down at watchdog runtime, it is restarted before any prefix or route checks execute. Handles boot-time DHCPv6 failure where `wan6` never comes up.
 - Replaced wan6 already-up guard with forced reset and extended delay to prevent DHCPv6 pending state at boot.
+- Updated `ipv6-discord-logger`: timestamp changed to 12-hour AM/PM format, syslog prefix stripped from embed using field 8 cut, hostname moved after message for cleaner output.
 
 ### v1.0 (April 2026)
 - Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
