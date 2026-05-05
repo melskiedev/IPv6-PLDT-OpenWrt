@@ -144,7 +144,8 @@ Apply in this order, then reboot:
 3. Create **`/etc/hotplug.d/iface/99-ipv6-setup`**
 4. Create **`/usr/bin/ipv6-watchdog`**
 5. Add cron job and restart cron
-6. Reboot
+6. Create **`/etc/hotplug.d/iface/97-garp`** (gratuitous ARP for router swap recovery)
+7. Reboot
 
 Optional: set up Discord notifications (see [Optional: Discord Notifications](#optional-discord-notifications)).
 
@@ -1364,6 +1365,15 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 
 ## Changelog
 
+### v3.0 (May 2026)
+- Added 120-second boot grace period to `ipv6-watchdog`. Prevents Tier 0 from racing with `98-wan6-delay` and `99-ipv6-setup` during boot initialization.
+- `fix_gateway()` now unconditionally removes dead PLDT prefix-specific routes (`default from /56`) at the start of every run, before checking the generic default gateway. Previously this cleanup was gated behind an early return that was never reached when the generic default was healthy.
+- Fixed `fix_gateway()` return signaling for prefix-only cleanup case. Uses temp file (`$STATE_DIR/prefix_fixed`) to signal across ash subshell boundary. Returns success when prefix cleanup alone restores connectivity, preventing false `Connectivity failure` counter increments.
+- `99-ipv6-setup` upgraded with explicit per-gateway ping probing during boot. Each candidate gateway is tested before selection. Dead gateways are logged and skipped. No-gateway-found condition triggers full WAN restart.
+- `99-ipv6-setup` now validates and auto-corrects LAN RA config (`ra`, `ra_slaac`, `dhcpv6`, `ra_default`) after setup completes.
+- Added `97-garp` hotplug script. Sends gratuitous ARP on `br-lan` ifup to force LAN clients to update ARP cache after router swap. Reads LAN IP dynamically via UCI, no hardcoded addresses.
+
+
 ### v2.0 (April 2026)
 - Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence. Logs specific failure reason for faster debugging.
 - Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state. Verifies prefix restored within same cron run.
@@ -1384,6 +1394,70 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 - Fixes PLDT `/128` IA_NA drop, dead RA gateway selection, wan6 startup race condition, and RA runtime override.
 
 ---
+
+### 7. Watchdog boot race with wan6-delay
+
+Symptom: On boot, `ipv6-watchdog` cron fires within seconds and sees `wan6` as down while it is still initializing. Tier 0 pulls `wan6` back down, creating a restart loop. `99-ipv6-setup` never fires.
+
+Cause: cron starts immediately after boot. `wan6` initialization via `98-wan6-delay` takes 15-30 seconds. The watchdog interferes before initialization completes.
+
+Fix: The watchdog includes a 120-second boot grace period. If system uptime is below 120 seconds, the watchdog exits immediately without taking any action.
+
+---
+
+### 8. PLDT prefix-specific route (default from /56) overrides working default gateway
+
+Symptom: Router has a healthy default gateway and `ping6` succeeds from SSH, but LAN clients have no IPv6.
+
+Cause: PLDT installs two routes on RA. The `default from <prefix>/56` source-based route takes priority over the generic default for LAN client traffic sourced from the delegated prefix. If this route points to a dead gateway, all LAN client IPv6 traffic is blackholed even though the generic default is healthy.
+
+Fix: `fix_gateway()` unconditionally scans and removes dead `default from` prefix-specific routes at the start of every run, before the early return that checks the generic default.
+
+---
+
+### 9. Stale ARP after router swap causes LAN clients to lose internet
+
+Symptom: After swapping routers on the same ONT with the same LAN IP but different MAC, LAN clients have valid IP and gateway but no internet. Restarting the LAN interface fixes it immediately.
+
+Cause: LAN clients cache ARP entries mapping the gateway IP to the previous router MAC. When a new router with the same IP but different MAC takes over, clients send traffic to the wrong MAC. All watchdogs operate at Layer 3 and cannot detect or fix this Layer 2 issue.
+
+Fix: Deploy `/etc/hotplug.d/iface/97-garp`. This fires on `br-lan` ifup and sends a gratuitous ARP broadcast, forcing all LAN clients to update their ARP cache immediately.
+
+First verify `arping` is available (included in standard OpenWrt builds but confirm first):
+
+```sh
+which arping
+```
+
+If not found, install it:
+
+```sh
+apk add iputils-arping
+```
+
+Then deploy the script:
+
+```sh
+cat > /etc/hotplug.d/iface/97-garp << 'SCRIPT'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$DEVICE" = "br-lan" ] || exit 0
+sleep 3
+LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
+[ -n "$LAN_IP" ] && arping -A -I br-lan -c 3 "$LAN_IP"
+SCRIPT
+chmod +x /etc/hotplug.d/iface/97-garp
+echo '/etc/hotplug.d/iface/97-garp' >> /etc/sysupgrade.conf
+```
+
+---
+
+### 10. PLDT gateway behavior varies by area
+
+A gateway that is dead on one PLDT node or area may be live and functional on a different PLDT node or area. Do not hardcode gateway rejection by MAC or link-local address. The `99-ipv6-setup` script probes each candidate gateway via `ping6` and selects the first reachable one, handling both scenarios correctly without any hardcoded addresses.
+
+---
+
 
 ## Disclaimer
 
