@@ -144,8 +144,7 @@ Apply in this order, then reboot:
 3. Create **`/etc/hotplug.d/iface/99-ipv6-setup`**
 4. Create **`/usr/bin/ipv6-watchdog`**
 5. Add cron job and restart cron
-6. Create **`/etc/hotplug.d/iface/97-garp`** (gratuitous ARP for router swap recovery)
-7. Reboot
+6. Reboot
 
 Optional: set up Discord notifications (see [Optional: Discord Notifications](#optional-discord-notifications)).
 
@@ -641,24 +640,45 @@ dhcpv6_renew() {
 
 fix_gateway() {
     current=$(ip -6 route show default dev "$WAN_DEV" | awk 'NR==1{print $3}')
-    ping6 -c 2 -W 2 -I "$WAN_DEV" "$current" >/dev/null 2>&1 && return 1
 
-    for gw in $(ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'); do
-        ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1 || continue
+    # Current gateway is only considered good if internet reachability works.
+    # Do not trust link-local gateway ping alone on PLDT -- the dead gateway
+    # responds to direct ping6 intermittently but does not forward internet
+    # traffic reliably.
+    if [ -n "$current" ]; then
+        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
+           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+            log "Current gateway $current has internet reachability, no fix needed"
+            return 1
+        fi
+        log "Current gateway $current has no internet reachability, scanning alternatives"
+    fi
 
+    for gw in $(ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}' | sort -u); do
         mac=$(ip -6 neigh show dev "$WAN_DEV" \
-            | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
+            | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
 
+        [ -z "$mac" ] && {
+            log "Gateway $gw has no MAC, skipping"
+            continue
+        }
+
+        # Install candidate temporarily and test internet reachability.
+        # Do not accept a candidate just because it replies to local ping.
+        ip -6 neigh replace "$gw" lladdr "$mac" dev "$WAN_DEV" nud stale
         ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512
+        sleep 2
 
-        # Pin the MAC to keep the neighbor entry stable and prevent the kernel
-        # from re-running NDP, which could reintroduce the dead gateway via RA.
-        [ -n "$mac" ] && ip -6 neigh replace "$gw" lladdr "$mac" \
-            dev "$WAN_DEV" nud stale
+        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
+           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+            log "Gateway replaced with $gw (mac $mac pinned, internet verified)"
+            return 0
+        fi
 
-        log "Gateway replaced with $gw${mac:+ (mac $mac pinned)}"
-        return 0
+        log "Gateway $gw responds locally but has no internet reachability, rejecting"
     done
+
+    log "No gateway candidate passed internet reachability test"
     return 1
 }
 
@@ -967,14 +987,11 @@ logger -t "$LOGTAG" "Log forwarder started, watching: $WATCH_TAGS"
 
 logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r line; do
     COLOR=$(color_for "$line")
-    TIMESTAMP=$(date '+%b %d %Y %I:%M:%S %p')
-
-    # Strip syslog prefix, keep only the message content.
-    MSG=$(echo "$line" | cut -d' ' -f8-)
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
 
     # Escape backslashes and double quotes for JSON safety.
-    SAFE=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
+    SAFE=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
     PAYLOAD=$(cat <<EOF
 {
@@ -1366,13 +1383,13 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 ## Changelog
 
 ### v3.0 (May 2026)
-- Added 120-second boot grace period to `ipv6-watchdog`. Prevents Tier 0 from racing with `98-wan6-delay` and `99-ipv6-setup` during boot initialization.
-- `fix_gateway()` now unconditionally removes dead PLDT prefix-specific routes (`default from /56`) at the start of every run, before checking the generic default gateway. Previously this cleanup was gated behind an early return that was never reached when the generic default was healthy.
-- Fixed `fix_gateway()` return signaling for prefix-only cleanup case. Uses temp file (`$STATE_DIR/prefix_fixed`) to signal across ash subshell boundary. Returns success when prefix cleanup alone restores connectivity, preventing false `Connectivity failure` counter increments.
-- `99-ipv6-setup` upgraded with explicit per-gateway ping probing during boot. Each candidate gateway is tested before selection. Dead gateways are logged and skipped. No-gateway-found condition triggers full WAN restart.
-- `99-ipv6-setup` now validates and auto-corrects LAN RA config (`ra`, `ra_slaac`, `dhcpv6`, `ra_default`) after setup completes.
-- Added `97-garp` hotplug script. Sends gratuitous ARP on `br-lan` ifup to force LAN clients to update ARP cache after router swap. Reads LAN IP dynamically via UCI, no hardcoded addresses.
-
+- Rewrote `fix_gateway()` to validate internet reachability per candidate gateway instead of trusting local link-local ping. PLDT gateways respond locally but intermittently fail to forward internet traffic. Each candidate is now temporarily installed and accepted only if `ping6` to Google or Cloudflare IPv6 succeeds through it.
+- Added 120-second boot grace period to `ipv6-watchdog` to prevent Tier 0 from racing with `98-wan6-delay` and `99-ipv6-setup` during boot initialization.
+- `fix_gateway()` unconditionally removes dead PLDT prefix-specific routes (`default from /56`) before checking the generic default gateway.
+- `99-ipv6-setup` upgraded with explicit per-gateway internet reachability testing during boot.
+- Added `97-garp` hotplug script: sends gratuitous ARP on `br-lan` ifup to force LAN clients to update ARP cache after router swap.
+- Updated `ipv6-discord-logger`: timestamp changed to 12-hour AM/PM format, syslog prefix stripped from embed using field 8 cut, hostname shown in footer.
+- Improved wan6 startup delay: replaced 5s fixed delay with 15s and added forced `ifdown wan6` reset before delay to prevent DHCPv6 pending state at boot.
 
 ### v2.0 (April 2026)
 - Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence. Logs specific failure reason for faster debugging.
@@ -1387,77 +1404,12 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 - Added post-restart cooldown (20 min) and per-step exponential backoff to avoid DHCPv6 hammering.
 - Added Tier 0 wan6 down recovery: if `wan6` is fully down at watchdog runtime, it is restarted before any prefix or route checks execute. Handles boot-time DHCPv6 failure where `wan6` never comes up.
 - Replaced wan6 already-up guard with forced reset and extended delay to prevent DHCPv6 pending state at boot.
-- Updated `ipv6-discord-logger`: timestamp changed to 12-hour AM/PM format, syslog prefix stripped from embed using field 8 cut, hostname moved after message for cleaner output.
 
 ### v1.0 (April 2026)
 - Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
 - Fixes PLDT `/128` IA_NA drop, dead RA gateway selection, wan6 startup race condition, and RA runtime override.
 
 ---
-
-### 7. Watchdog boot race with wan6-delay
-
-Symptom: On boot, `ipv6-watchdog` cron fires within seconds and sees `wan6` as down while it is still initializing. Tier 0 pulls `wan6` back down, creating a restart loop. `99-ipv6-setup` never fires.
-
-Cause: cron starts immediately after boot. `wan6` initialization via `98-wan6-delay` takes 15-30 seconds. The watchdog interferes before initialization completes.
-
-Fix: The watchdog includes a 120-second boot grace period. If system uptime is below 120 seconds, the watchdog exits immediately without taking any action.
-
----
-
-### 8. PLDT prefix-specific route (default from /56) overrides working default gateway
-
-Symptom: Router has a healthy default gateway and `ping6` succeeds from SSH, but LAN clients have no IPv6.
-
-Cause: PLDT installs two routes on RA. The `default from <prefix>/56` source-based route takes priority over the generic default for LAN client traffic sourced from the delegated prefix. If this route points to a dead gateway, all LAN client IPv6 traffic is blackholed even though the generic default is healthy.
-
-Fix: `fix_gateway()` unconditionally scans and removes dead `default from` prefix-specific routes at the start of every run, before the early return that checks the generic default.
-
----
-
-### 9. Stale ARP after router swap causes LAN clients to lose internet
-
-Symptom: After swapping routers on the same ONT with the same LAN IP but different MAC, LAN clients have valid IP and gateway but no internet. Restarting the LAN interface fixes it immediately.
-
-Cause: LAN clients cache ARP entries mapping the gateway IP to the previous router MAC. When a new router with the same IP but different MAC takes over, clients send traffic to the wrong MAC. All watchdogs operate at Layer 3 and cannot detect or fix this Layer 2 issue.
-
-Fix: Deploy `/etc/hotplug.d/iface/97-garp`. This fires on `br-lan` ifup and sends a gratuitous ARP broadcast, forcing all LAN clients to update their ARP cache immediately.
-
-First verify `arping` is available (included in standard OpenWrt builds but confirm first):
-
-```sh
-which arping
-```
-
-If not found, install it:
-
-```sh
-apk add iputils-arping
-```
-
-Then deploy the script:
-
-```sh
-cat > /etc/hotplug.d/iface/97-garp << 'SCRIPT'
-#!/bin/sh
-[ "$ACTION" = "ifup" ] || exit 0
-[ "$DEVICE" = "br-lan" ] || exit 0
-sleep 3
-LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
-[ -n "$LAN_IP" ] && arping -A -I br-lan -c 3 "$LAN_IP"
-SCRIPT
-chmod +x /etc/hotplug.d/iface/97-garp
-echo '/etc/hotplug.d/iface/97-garp' >> /etc/sysupgrade.conf
-```
-
----
-
-### 10. PLDT gateway behavior varies by area
-
-A gateway that is dead on one PLDT node or area may be live and functional on a different PLDT node or area. Do not hardcode gateway rejection by MAC or link-local address. The `99-ipv6-setup` script probes each candidate gateway via `ping6` and selects the first reachable one, handling both scenarios correctly without any hardcoded addresses.
-
----
-
 
 ## Disclaimer
 
