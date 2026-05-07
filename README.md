@@ -606,6 +606,17 @@ NOW=$(date +%s)
 # Add jitter to avoid synchronized retry bursts across rapid cron ticks.
 sleep $((RANDOM % 5 + 5))
 
+# ===== BOOT GRACE PERIOD =====
+# If the system just booted, exit immediately and let 98-wan6-delay and
+# 99-ipv6-setup complete before this watchdog takes any action.
+# Without this, cron fires within seconds of boot and Tier 0 can pull
+# wan6 back down while it is still initializing, creating a restart loop.
+UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999)
+if [ "$UPTIME_SECS" -lt 120 ]; then
+    log "Boot grace period active (uptime ${UPTIME_SECS}s < 120s), exiting"
+    exit 0
+fi
+
 # ===== TIER 0: wan6 DOWN RECOVERY =====
 # Handles the case where wan6 never came up after boot or a link event.
 # This runs before all other checks since WAN_DEV cannot be determined
@@ -682,6 +693,23 @@ dhcpv6_renew() {
 }
 
 fix_gateway() {
+    # ===== STEP 1: Remove dead prefix-specific routes =====
+    # PLDT installs a source-based route: 'default from <prefix>/56 via <gateway>'
+    # This takes priority over the generic default for LAN client traffic.
+    # If it points at the dead gateway, LAN clients have no IPv6 even when
+    # the generic default route is healthy. Remove it unconditionally first.
+    ip -6 route show default dev "$WAN_DEV" | grep 'from' | while read -r route; do
+        gw=$(echo "$route" | awk '{print $5}')
+        src=$(echo "$route" | awk '{print $3}')
+        if [ -n "$gw" ] && [ -n "$src" ]; then
+            if ! ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && \
+               ! ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+                ip -6 route del default from "$src" via "$gw" dev "$WAN_DEV" 2>/dev/null && \
+                    log "Removed dead prefix-specific route: default from $src via $gw"
+            fi
+        fi
+    done
+
     current=$(ip -6 route show default dev "$WAN_DEV" | awk 'NR==1{print $3}')
 
     # Current gateway is only considered good if internet reachability works.
@@ -1078,11 +1106,13 @@ logger -t "$LOGTAG" "Log forwarder started, watching: $WATCH_TAGS"
 
 logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r line; do
     COLOR=$(color_for "$line")
-    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    TIMESTAMP=$(date '+%b %d %Y %I:%M:%S %p')
+    # Strip syslog prefix, forward only the actual log message.
+    MSG=$(echo "$line" | cut -d' ' -f8-)
     HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
 
     # Escape backslashes and double quotes for JSON safety.
-    SAFE=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    SAFE=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
     PAYLOAD=$(cat <<EOF
 {
