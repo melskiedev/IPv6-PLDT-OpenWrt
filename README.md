@@ -124,6 +124,7 @@ Good: returns at least one line confirming the renew tier is present.
 - [Step 3 - IPv6 Route Fix Engine](#step-3---ipv6-route-fix-engine)
 - [Step 4 - IPv6 Watchdog](#step-4---ipv6-watchdog)
 - [Step 5 - Cron Setup](#step-5---cron-setup)
+- [Step 6 - Gratuitous ARP (Router Swap Recovery)](#step-6---gratuitous-arp-router-swap-recovery)
 - [Optional: Discord Notifications](#optional-discord-notifications)
 - [Troubleshooting and Debug Commands](#troubleshooting-and-debug-commands)
 - [Validated Behavior](#validated-behavior)
@@ -144,7 +145,8 @@ Apply in this order, then reboot:
 3. Create **`/etc/hotplug.d/iface/99-ipv6-setup`**
 4. Create **`/usr/bin/ipv6-watchdog`**
 5. Add cron job and restart cron
-6. Reboot
+6. Create **`/etc/hotplug.d/iface/97-garp`** (gratuitous ARP for router swap recovery)
+7. Reboot
 
 Optional: set up Discord notifications (see [Optional: Discord Notifications](#optional-discord-notifications)).
 
@@ -252,7 +254,7 @@ WAN up -> delay (15s, clean start) -> wan6 starts -> prefix acquired -> route fi
 **Runtime flow:**
 
 ```
-Watchdog (every 5 min) -> check connectivity -> fix route -> escalate if needed -> notify if unrecoverable
+Watchdog (every 1 min) -> check connectivity -> fix route -> escalate if needed -> notify if unrecoverable
 ```
 
 **Layers:**
@@ -262,7 +264,7 @@ Watchdog (every 5 min) -> check connectivity -> fix route -> escalate if needed 
 | A - UCI config | `network` UCI | Disables `/128`, stabilizes RA, delegates prefix |
 | B - Delay script | `98-wan6-delay` | Fixes link-local race condition at boot |
 | C - Route engine | `99-ipv6-setup` | Selects working gateway, pins MAC, removes /128 |
-| D - Watchdog | `ipv6-watchdog` | Self-heals runtime failures every 5 min |
+| D - Watchdog | `ipv6-watchdog` | Self-heals runtime failures every 1 min |
 | E - Bootstrap recovery | `ipv6-watchdog` | Recovers DHCPv6 prefix failures automatically |
 | F - Notifications | `ipv6-discord-logger` | Optional Discord alerts and log forwarding |
 
@@ -275,17 +277,37 @@ Watchdog (every 5 min) -> check connectivity -> fix route -> escalate if needed 
 Apply this first. Everything else depends on it.
 
 ```sh
+# wan6
 uci set network.wan6.reqaddress='none'
 uci set network.wan6.reqprefix='56'
 uci delete network.wan6.norelease
 uci delete network.wan6.ip6assign
-uci set network.wan6.device='eth1'
+uci set network.wan6.device='@wan'
 uci set network.wan6.accept_ra='1'
+uci set network.wan6.force_link='1'
+uci set network.wan6.multipath='off'
+uci set network.wan6.sourcefilter='0'
 
+# LAN prefix delegation
 uci set network.lan.ip6assign='64'
 uci set network.lan.ip6class='wan6'
 
+# globals
+uci set network.globals.rpfilter='0'
+uci set network.globals.ipv6_sourcefilter='1'
+
 uci commit network
+
+# LAN DHCPv6 and RA
+uci set dhcp.lan.dhcpv6='server'
+uci set dhcp.lan.ra='server'
+uci set dhcp.lan.ra_slaac='1'
+uci set dhcp.lan.ra_default='1'
+uci set dhcp.lan.ra_preference='medium'
+uci set dhcp.lan.force='1'
+uci set dhcp.lan.ndp='relay'
+
+uci commit dhcp
 ```
 
 What each setting does:
@@ -295,8 +317,29 @@ What each setting does:
 | `reqaddress` | `none` | Prevents ISP from assigning a broken `/128` WAN address |
 | `reqprefix` | `56` | Explicitly requests the delegated `/56` block |
 | `accept_ra` | `1` | Keeps RA processing on so `wan6` initializes correctly |
+| `device` | `@wan` | Ties `wan6` to the `wan` interface lifecycle, not a hardcoded device name |
+| `force_link` | `1` | Keeps `wan6` up even when link-local state is temporarily absent |
+| `multipath` | `off` | Prevents multipath routing from interfering with gateway selection |
+| `sourcefilter` | `0` | Allows DHCPv6 PD on asymmetric routes; required for PLDT bridge mode |
 | `ip6assign` | `64` | LAN gets a `/64` from the delegated prefix |
 | `ip6class` | `wan6` | Binds LAN prefix delegation to the `wan6` interface |
+| `rpfilter` | `0` | Disables reverse-path filtering; required for DHCPv6 PD on PLDT |
+| `ipv6_sourcefilter` | `1` | Enables IPv6 source address selection per interface |
+| `dhcpv6` | `server` | Enables stateful DHCPv6 server on LAN |
+| `ra` | `server` | Enables Router Advertisement on LAN so clients get IPv6 default gateway |
+| `ra_slaac` | `1` | Enables SLAAC so clients auto-configure their own global IPv6 address |
+| `ra_default` | `1` | Includes default route in RA so clients know how to reach IPv6 internet |
+| `ra_preference` | `medium` | Sets RA preference level; prevents lower-priority RAs from overriding |
+| `force` | `1` | Forces DHCPv6 server to run even when no clients are present yet |
+| `ndp` | `relay` | Relays Neighbor Discovery Protocol between WAN and LAN; required for IPv6 NDP to reach LAN clients |
+
+> **Important:** Never restart the LAN interface (`ifdown lan` / `ifup lan` or `/etc/init.d/network restart`) while `wan6` is up and odhcpd has an active delegated prefix. This causes odhcpd to mark the prefix as stale and set `ra_lifetime=0`, withdrawing IPv6 from all LAN clients. To apply LAN config changes without disrupting IPv6, use:
+>
+> ```sh
+> ubus call network reload
+> sleep 10
+> /etc/init.d/odhcpd restart
+> ```
 
 ---
 
@@ -490,7 +533,7 @@ chmod +x /etc/hotplug.d/iface/99-ipv6-setup
 
 **File:** `/usr/bin/ipv6-watchdog`
 
-Runs every 5 minutes via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check. A Tier 0 check runs first to recover `wan6` if it is fully down before any other logic executes.
+Runs every 1 minute via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check. A Tier 0 check runs first to recover `wan6` if it is fully down before any other logic executes.
 
 **Failure domains:**
 
@@ -521,7 +564,7 @@ After 3 full WAN restarts with no recovery: stop, notify once via log and Discor
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
-# Runs every 5 minutes via cron.
+# Runs every 1 minute via cron.
 
 LOGTAG="ipv6-watchdog"
 STATE_DIR="/tmp/ipv6-watchdog"
@@ -901,10 +944,58 @@ chmod +x /usr/bin/ipv6-watchdog
 Add the watchdog (idempotent, safe to run multiple times):
 
 ```sh
-grep -qxF '*/5 * * * * /usr/bin/ipv6-watchdog' /etc/crontabs/root || \
-echo '*/5 * * * * /usr/bin/ipv6-watchdog' >> /etc/crontabs/root
+grep -qxF '*/1 * * * * /usr/bin/ipv6-watchdog' /etc/crontabs/root || \
+echo '*/1 * * * * /usr/bin/ipv6-watchdog' >> /etc/crontabs/root
 
 /etc/init.d/cron restart
+```
+
+---
+
+## Step 6 - Gratuitous ARP (Router Swap Recovery)
+
+**File:** `/etc/hotplug.d/iface/97-garp`
+
+Fires on `br-lan` ifup and sends a gratuitous ARP broadcast, forcing all LAN clients to update their ARP cache with the router's current MAC address. Without this, swapping routers on the same ONT with the same LAN IP but a different MAC leaves LAN clients sending traffic to the old MAC — resulting in internet loss at Layer 2 that no watchdog can detect.
+
+Reads LAN IP dynamically via UCI. No hardcoded addresses. Portable across all routers.
+
+First verify `arping` is available (included in standard OpenWrt builds):
+
+```sh
+which arping
+```
+
+If not found:
+
+```sh
+apk add iputils-arping
+```
+
+Then deploy:
+
+```sh
+cat > /etc/hotplug.d/iface/97-garp << 'SCRIPT'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$DEVICE" = "br-lan" ] || exit 0
+sleep 3
+LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
+[ -n "$LAN_IP" ] && arping -A -I br-lan -c 3 "$LAN_IP"
+SCRIPT
+chmod +x /etc/hotplug.d/iface/97-garp
+```
+
+Add to sysupgrade preserve list:
+
+```sh
+echo '/etc/hotplug.d/iface/97-garp' >> /etc/sysupgrade.conf
+```
+
+Test manually:
+
+```sh
+ACTION=ifup DEVICE=br-lan /etc/hotplug.d/iface/97-garp
 ```
 
 ---
@@ -1120,6 +1211,14 @@ ip -6 neigh show dev eth1 | grep router
 ping6 -c 3 -I eth1 <gateway-address>
 ```
 
+Force NDP discovery (if neighbor table is empty and fix_gateway has no candidates):
+
+```sh
+ping6 -c 1 -I eth1 ff02::2%eth1
+sleep 2
+ip -6 neigh show dev eth1 | grep router
+```
+
 Force route fix without rebooting:
 
 ```sh
@@ -1140,6 +1239,14 @@ Run watchdog manually:
 /usr/bin/ipv6-watchdog
 ```
 
+Safe LAN config reload (use instead of restarting LAN interface):
+
+```sh
+ubus call network reload
+sleep 10
+/etc/init.d/odhcpd restart
+```
+
 ---
 
 ## Validated Behavior
@@ -1147,7 +1254,7 @@ Run watchdog manually:
 Confirmed during real-world testing:
 
 - Hotplug correctly selects the working gateway on each boot
-- Dead gateway occasionally returns via RA, watchdog catches and replaces it within 5 minutes
+- Dead gateway occasionally returns via RA, watchdog catches and replaces it within 1 minute
 - ONT power cycling (technician visit) handled cleanly, wan6 recovered automatically without intervention
 - Manual `ip -6 route replace` restores IPv6 instantly, confirming the issue is route selection, not prefix delegation
 - `accept_ra='2'` + `defaultroute='0'` is confirmed unstable for this ISP
@@ -1158,6 +1265,7 @@ Confirmed during real-world testing:
 - Backoff prevents DHCPv6 hammering during NoPrefixAvail conditions
 - ONT powercycle notification fires once per incident and resets cleanly on recovery
 - Router identity in Discord alerts reads dynamically from system, no hardcoded values
+- `fix_gateway()` correctly rejects gateways that respond locally but fail internet reachability
 
 ---
 
@@ -1168,10 +1276,11 @@ Confirmed during real-world testing:
 | Broken `/128` WAN address used as source | `reqaddress='none'` | Fixed |
 | Dead gateway selected at startup | Route fix engine via hotplug | Fixed |
 | Stable prefix delegation | `reqprefix='56'` + RA enabled | Fixed |
-| Dead gateway returns via RA at runtime | Watchdog + cron every 5 min | Fixed |
+| Dead gateway returns via RA at runtime | Watchdog + cron every 1 min | Fixed |
 | Race condition on boot | `98-wan6-delay` script | Fixed |
 | Prefix delegation failure (NoPrefixAvail) | Escalating recovery ladder with backoff | Fixed |
 | Persistent ISP-side lease failure | ONT powercycle notification after 3 WAN restarts | Escalated to human |
+| LAN clients not receiving IPv6 | `dhcp.lan` DHCPv6 + RA + NDP relay config | Fixed |
 
 ---
 
@@ -1258,7 +1367,7 @@ Symptoms:
 
 Cause: ISP Router Advertisement reintroduces a dead default gateway at runtime.
 
-Resolution: Automatically handled by `ipv6-watchdog` every 5 minutes. Manual fix:
+Resolution: Automatically handled by `ipv6-watchdog` every 1 minute. Manual fix:
 
 ```sh
 ip -6 route replace default via <working-gateway> dev eth1 metric 512
@@ -1382,30 +1491,41 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 
 ## Changelog
 
-### v3.0 (May 2026)
-- Rewrote `fix_gateway()` to validate internet reachability per candidate gateway instead of trusting local link-local ping. PLDT gateways respond locally but intermittently fail to forward internet traffic. Each candidate is now temporarily installed and accepted only if `ping6` to Google or Cloudflare IPv6 succeeds through it.
+### v3.1
+- Updated Step 1 UCI config: `device='eth1'` changed to `device='@wan'` to tie `wan6` to the `wan` interface lifecycle rather than a hardcoded device name.
+- Added `force_link='1'`, `multipath='off'`, and `sourcefilter='0'` to `network.wan6`. These were confirmed required during multi-unit replication testing.
+- Added `network.globals` settings: `rpfilter='0'` and `ipv6_sourcefilter='1'`.
+- Added full `dhcp.lan` IPv6 block to Step 1: `dhcpv6`, `ra`, `ra_slaac`, `ra_default`, `ra_preference`, `force`, `ndp`.
+- Added safe LAN reload note: never restart LAN interface while odhcpd holds an active delegated prefix; use `ubus call network reload` and `odhcpd restart` instead.
+- Added Force NDP discovery command to Troubleshooting section.
+- Added Safe LAN config reload command to Troubleshooting section.
+- Added `fix_gateway()` internet reachability validation note to Validated Behavior.
+- Added LAN clients IPv6 row to Final Result table.
+
+### v3.0
+- Rewrote `fix_gateway()` to validate internet reachability per candidate gateway instead of trusting local link-local ping. PLDT gateways may respond locally but fail to forward internet traffic, so each candidate is temporarily installed and accepted only if external IPv6 reachability succeeds.
 - Added 120-second boot grace period to `ipv6-watchdog` to prevent Tier 0 from racing with `98-wan6-delay` and `99-ipv6-setup` during boot initialization.
-- `fix_gateway()` unconditionally removes dead PLDT prefix-specific routes (`default from /56`) before checking the generic default gateway.
+- `fix_gateway()` now removes dead PLDT prefix-specific routes before checking the generic default gateway.
 - `99-ipv6-setup` upgraded with explicit per-gateway internet reachability testing during boot.
-- Added `97-garp` hotplug script: sends gratuitous ARP on `br-lan` ifup to force LAN clients to update ARP cache after router swap.
-- Updated `ipv6-discord-logger`: timestamp changed to 12-hour AM/PM format, syslog prefix stripped from embed using field 8 cut, hostname shown in footer.
+- Added `97-garp` hotplug script to send gratuitous ARP on `br-lan` ifup, forcing LAN clients to update ARP cache after router swap.
+- Updated `ipv6-discord-logger`: timestamp changed to 12-hour AM/PM format, syslog prefix stripped from embed, hostname shown in footer.
 - Improved wan6 startup delay: replaced 5s fixed delay with 15s and added forced `ifdown wan6` reset before delay to prevent DHCPv6 pending state at boot.
 
-### v2.0 (April 2026)
+### v2.0
 - Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence. Logs specific failure reason for faster debugging.
-- Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state. Verifies prefix restored within same cron run.
+- Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state.
 - Escalation ladder expanded from three to four tiers: wan6 restart, DHCPv6 renew, `/128` bootstrap, full WAN restart.
 - Added `flock` to watchdog to prevent overlapping cron executions during bootstrap or WAN restart.
-- MAC pinning via `ip -6 neigh replace ... nud stale` added to both `99-ipv6-setup` and watchdog `fix_gateway` for consistent neighbor stability across startup and runtime paths.
+- MAC pinning via `ip -6 neigh replace ... nud stale` added to both `99-ipv6-setup` and watchdog `fix_gateway`.
 - `99-ipv6-setup` upgraded with dual gateway sourcing, detailed logging, and dual-target connectivity check.
-- `notify_ont_powercycle` now reads router model, hostname, and firmware dynamically with `/proc/cpuinfo` fallback. Portable across devices.
-- Added optional Discord notification system: `ipv6-discord-logger` daemon forwards tagged syslog lines in real time.
+- `notify_ont_powercycle` now reads router model, hostname, and firmware dynamically with `/proc/cpuinfo` fallback.
+- Added optional Discord notification system through `ipv6-discord-logger`.
 - Added ONT powercycle notification with notify-once flag to prevent Discord spam.
-- Added post-restart cooldown (20 min) and per-step exponential backoff to avoid DHCPv6 hammering.
-- Added Tier 0 wan6 down recovery: if `wan6` is fully down at watchdog runtime, it is restarted before any prefix or route checks execute. Handles boot-time DHCPv6 failure where `wan6` never comes up.
+- Added post-restart cooldown and per-step exponential backoff to avoid DHCPv6 hammering.
+- Added Tier 0 wan6 down recovery before prefix or route checks execute.
 - Replaced wan6 already-up guard with forced reset and extended delay to prevent DHCPv6 pending state at boot.
 
-### v1.0 (April 2026)
+### v1.0
 - Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
 - Fixes PLDT `/128` IA_NA drop, dead RA gateway selection, wan6 startup race condition, and RA runtime override.
 
