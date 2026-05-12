@@ -164,7 +164,25 @@ fix_gateway() {
         log "Current gateway $current has no internet reachability, scanning alternatives"
     fi
 
-    for gw in $(ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}' | sort -u); do
+    # Trigger an all-routers multicast probe before scanning candidates.
+    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address,
+    # prompting routers to respond and refreshing NDP/MAC state in the
+    # neighbor table. Without this, gateways may be present in the table
+    # but have no MAC yet (INCOMPLETE state), causing the loop to skip all
+    # candidates and fall through to no-fix. Mirrors 99-ipv6-setup behavior.
+    log "Triggering NDP all-routers probe before gateway scan"
+    ping6 -c 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
+    sleep 2
+
+    # Combine neighbor table and existing route table for the candidate list.
+    # The neighbor table alone can miss gateways if NDP was incomplete at the
+    # time of the scan. Using both sources matches 99-ipv6-setup behavior and
+    # ensures no known gateway is overlooked.
+    for gw in $(
+        { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
+          ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
+        } | sort -u | grep -v '^$'
+    ); do
         mac=$(ip -6 neigh show dev "$WAN_DEV" \
             | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
 
