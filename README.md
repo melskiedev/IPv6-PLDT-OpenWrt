@@ -422,7 +422,7 @@ done
 [ -z "$PREFIX" ] && log "WARNING: no PD received after 45s -- continuing anyway"
 
 # ===== TRIGGER NDP DISCOVERY =====
-# Ping all-routers multicast to solicit RAs from every router on the link.
+# Ping all-routers multicast to trigger router responses and refresh NDP state for routers on the link.
 # This discovers ALL gateways, not just the one already in the default route.
 log "Triggering NDP discovery via all-routers multicast..."
 ping6 -c 3 -W 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
@@ -725,7 +725,25 @@ fix_gateway() {
         log "Current gateway $current has no internet reachability, scanning alternatives"
     fi
 
-    for gw in $(ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}' | sort -u); do
+    # Trigger an all-routers multicast probe before scanning candidates.
+    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address,
+    # prompting routers to respond and refreshing NDP/MAC state in the
+    # neighbor table. Without this, gateways may be present in the table
+    # but have no MAC yet (INCOMPLETE state), causing the loop to skip all
+    # candidates and fall through to no-fix. Mirrors 99-ipv6-setup behavior.
+    log "Triggering NDP all-routers probe before gateway scan"
+    ping6 -c 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
+    sleep 2
+
+    # Combine neighbor table and existing route table for the candidate list.
+    # The neighbor table alone can miss gateways if NDP was incomplete at the
+    # time of the scan. Using both sources matches 99-ipv6-setup behavior and
+    # ensures no known gateway is overlooked.
+    for gw in $(
+        { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
+          ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
+        } | sort -u | grep -v '^$'
+    ); do
         mac=$(ip -6 neigh show dev "$WAN_DEV" \
             | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
 
@@ -1520,6 +1538,10 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 ---
 
 ## Changelog
+
+### v3.2
+- Added all-routers multicast probe (`ping6 ff02::2`) inside `fix_gateway()` before the candidate scan, refreshing NDP/MAC state to reduce false "no MAC" skip results after PLDT RA/NDP flaps.
+- Expanded `fix_gateway()` candidate loop to combine neighbor table (`router` flag entries) and existing route table gateways, matching the dual-source approach already used in `99-ipv6-setup`. Prevents overlooking a gateway that exists in the route table but is not currently flagged `router` in the neighbor table.
 
 ### v3.1
 - Updated Step 1 UCI config: `device='eth1'` changed to `device='@wan'` to tie `wan6` to the `wan` interface lifecycle rather than a hardcoded device name.
