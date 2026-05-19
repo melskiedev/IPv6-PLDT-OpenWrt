@@ -720,30 +720,49 @@ fix_gateway() {
         if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
            ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
             log "Current gateway $current has internet reachability, no fix needed"
-            return 1
+            echo 0 > "$FAIL_FILE"
+            return 0
         fi
         log "Current gateway $current has no internet reachability, scanning alternatives"
     fi
 
-    # Trigger an all-routers multicast probe before scanning candidates.
-    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address,
-    # prompting routers to respond and refreshing NDP/MAC state in the
-    # neighbor table. Without this, gateways may be present in the table
-    # but have no MAC yet (INCOMPLETE state), causing the loop to skip all
-    # candidates and fall through to no-fix. Mirrors 99-ipv6-setup behavior.
+    # Trigger an all-routers multicast probe before building the candidate list.
+    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address.
+    # This can trigger router responses and refresh NDP/MAC state before
+    # candidate discovery. Running this before building the candidate list
+    # ensures gateways that were not yet in the neighbor table have a chance
+    # to appear before the list is built. Mirrors 99-ipv6-setup behavior.
     log "Triggering NDP all-routers probe before gateway scan"
-    ping6 -c 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
-    sleep 2
+    ping6 -c 1 -W 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
+    sleep 4
 
-    # Combine neighbor table and existing route table for the candidate list.
-    # The neighbor table alone can miss gateways if NDP was incomplete at the
-    # time of the scan. Using both sources matches 99-ipv6-setup behavior and
-    # ensures no known gateway is overlooked.
-    for gw in $(
+    # Build initial candidate list after the multicast probe so any gateways
+    # that responded to ff02::2 are already present in the neighbor table.
+    CANDIDATES=$(
         { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
           ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
         } | sort -u | grep -v '^$'
-    ); do
+    )
+
+    # Direct unicast probe to each discovered candidate. This gives the kernel
+    # another chance to resolve MAC entries via neighbor solicitation before
+    # the final scan runs, beyond what the multicast probe alone triggers.
+    for gw in $CANDIDATES; do
+        ping6 -c 1 -W 1 -I "$WAN_DEV" "$gw" >/dev/null 2>&1
+    done
+
+    sleep 2
+
+    # Rebuild candidates after the unicast probes. NDP may have populated new
+    # usable entries during the probe window that were not present in the
+    # initial list.
+    CANDIDATES=$(
+        { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
+          ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
+        } | sort -u | grep -v '^$'
+    )
+
+    for gw in $CANDIDATES; do
         mac=$(ip -6 neigh show dev "$WAN_DEV" \
             | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
 
@@ -761,6 +780,7 @@ fix_gateway() {
         if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
            ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
             log "Gateway replaced with $gw (mac $mac pinned, internet verified)"
+            echo 0 > "$FAIL_FILE"
             return 0
         fi
 
@@ -1538,6 +1558,12 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 ---
 
 ## Changelog
+
+### v3.3
+- Fixed `fix_gateway()` false failure counter: healthy-gateway path now resets `FAIL_FILE` and returns `0` instead of `1`, preventing a spurious `Connectivity failure 1` log entry after the current gateway was already confirmed reachable.
+- Fixed `fix_gateway()` NDP timing: candidate list is now built after the all-routers multicast probe instead of before it, so gateways that respond to `ff02::2` are captured in the initial scan. Candidates are rebuilt a second time after unicast probes, giving NDP a full two-pass window to populate MAC entries before the scan runs.
+- Added direct unicast probe to each candidate gateway between the multicast probe and the final scan, triggering per-gateway neighbor solicitation to reduce false "no MAC, skipping" cycles after PLDT prefix changes.
+- Added `echo 0 > "$FAIL_FILE"` to the successful gateway replacement path inside the scan loop, ensuring the counter resets immediately on success.
 
 ### v3.2
 - Added all-routers multicast probe (`ping6 ff02::2`) inside `fix_gateway()` before the candidate scan, refreshing NDP/MAC state to reduce false "no MAC" skip results after PLDT RA/NDP flaps.
