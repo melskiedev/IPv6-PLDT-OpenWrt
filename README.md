@@ -172,7 +172,22 @@ Tested on:
 - OpenWrt 25.12.2 (vanilla OpenWrt, not GL.iNet stock firmware)
 - GL.iNet GL-MT6000 (Flint 2)
 
-![Network Topology](diagram-network-topology.svg)
+```text
+  PLDT Fiber             ONT / Modem            GL.iNet Flint 2           LAN Clients        Internet
+  ┌──────────────┐       ┌──────────────────┐     ┌──────────────────────┐    ┌──────────────┐    ┌──────────────┐
+  │ Fiber ISP    │ fiber │ no NAT           │eth1 │ reqaddress=none      │    │ PC / Phone   │    │ IPv6 native  │
+  │              │──────▶│ no routing       │────▶│ reqprefix=56         │───▶│ IPv6 SLAAC   │───▶│ 2001:4860::  │
+  │ IPv6 /56 PD  │       │ WAN session      │     │ accept_ra=1          │    ├──────────────┤    │ 2606:4700::  │
+  │ RA + DHCPv6  │       │ passed directly  │     │ LAN /64 delegated    │    │ IoT / Server │    ├──────────────┤
+  │ CGNAT IPv4   │       │ to router        │     │ watchdog active      │    │ IPv6 SLAAC   │    │ IPv4 CGNAT   │
+  │              │       ├──────────────────┤     │                      │    └──────────────┘    └──────────────┘
+  └──────────────┘       │ ONT bridge mode  │     │ IPv6: native DHCPv6  │
+                         └──────────────────┘     │ not NAT6 / no tunnel │
+                                                  └──────────────────────┘
+
+  ──▶ active WAN path    ···▶ routed traffic    █ this guide applies here (edge device)
+  guide scope: native DHCPv6 + prefix delegation only — not applicable to NAT6, static IPv6, or tunnel setups
+```
 
 May work on:
 - Other ISPs with similar IA_NA + RA gateway issues (common with CGNAT providers)
@@ -227,7 +242,38 @@ The ISP assigns a `/128` WAN address via IA_NA alongside the delegated `/56` pre
 
 This is the dominant failure. Everything else amplifies or destabilizes it.
 
-![Failure Points](diagram-failure-points.svg)
+```text
+  PLDT ISP          OpenWrt                          Internet
+  ┌─────────────┐   ┌────────────────────┐             ┌──────────────┐
+  │ RA + DHCPv6 │──▶│ wan6 / eth1        │────────────▶│ IPv6 global  │
+  └─────────────┘   └────────────────────┘             └──────────────┘
+         │                    │
+         │                    └─────────────────────────────────┐
+         │                                                      │
+         ▼                                                      ▼
+  ┌──────────────────────────┐              ┌────────────────────────────────────────┐
+  │ FAIL 2 — dead RA gateway │              │ PRIMARY — /128 IA_NA drop              │
+  │ ISP sends 2 gateways     │              │ Linux prefers /128 as source address   │
+  │ OpenWrt picks first —    │              │ PLDT silently drops ALL outbound       │
+  │ it's dead (INCOMPLETE)   │              │ traffic from it                        │
+  └──────────────────────────┘              └────────────────────────────────────────┘
+
+  ─────────────────────────── RUNTIME / STARTUP ISSUES ──────────────────────────────
+
+  ┌──────────────────────────┐  ┌─────────────────────────┐  ┌────────────────────────┐  ┌───────────────────────────┐
+  │ FAIL 3 — race condition  │  │ FAIL 4 — RA override    │  │ FAIL 5 — accept_ra=2   │  │ FAIL 6 — NoPrefixAvail   │
+  │ wan6 starts before LLA   │  │ New RA reinstalls dead  │  │ Removes RA fallback    │  │ ISP refuses prefix        │
+  │ ready, DHCPv6 fails,     │  │ gateway. Works at boot, │  │ from wan6. Complete    │  │ delegation. Stale lease   │
+  │ no default route         │  │ breaks silently later   │  │ IPv6 fail every boot   │  │ — ISP-side issue          │
+  └──────────────────────────┘  └─────────────────────────┘  └────────────────────────┘  └───────────────────────────┘
+
+  ───────────────────────────────── FIXES APPLIED ───────────────────────────────────
+
+  ┌──────────────────┐  ┌────────────────────────────┐  ┌───────────────────┐  ┌────────────────────┐  ┌──────────────────────┐
+  │ reqaddress=none  │  │ 99-ipv6-setup              │  │ 98-wan6-delay     │  │ ipv6-watchdog      │  │ renew + bootstrap    │
+  │ blocks /128 IA_NA│  │ best GW + MAC pin + LAN RA │  │ 15s delay + reset │  │ GW fix + escalation│  │ prefix recovery      │
+  └──────────────────┘  └────────────────────────────┘  └───────────────────┘  └────────────────────┘  └──────────────────────┘
+```
 
 ### Secondary issues
 
@@ -268,7 +314,38 @@ Watchdog (every 1 min) -> check connectivity -> fix route -> escalate if needed 
 | E - Bootstrap recovery | `ipv6-watchdog` | Recovers DHCPv6 prefix failures automatically |
 | F - Notifications | `ipv6-discord-logger` | Optional Discord alerts and log forwarding |
 
-![Boot Sequence](diagram-boot-sequence.svg)
+```text
+  STEP 1          STEP 2 — FIX B        STEP 3 — FIX B       STEP 4              STEP 5 — FIX C
+  ┌────────────┐  ┌──────────────────┐  ┌───────────────┐    ┌──────────────────┐  ┌────────────────────────┐
+  │  WAN up    │  │   reset wan6     │  │   15s delay   │    │  wan6 starts     │  │   route engine         │
+  │            │─▶│                  │─▶│               │───▶│                  │─▶│                        │
+  │ eth1 online│  │ ifdown if early  │  │ WAN + ISP     │    │ clean DHCPv6     │  │ best GW selected       │
+  │            │  │ clears pending   │  │ ready         │    │ /56 prefix       │  │ + pinned               │
+  └────────────┘  │ session          │  │ 98-wan6-delay │    │ acquired         │  │ default route          │
+  boot event      └──────────────────┘  └───────────────┘    └──────────────────┘  │ installed              │
+                  state correction      timing control        prefix delegation     │ /128 removed           │
+                                                                                    └────────────────────────┘
+                                                                                     GW select + MAC pin
+
+                                    ┌────────────────────────────────┐
+                                    │  IPv6 online, steady state     │
+                                    └────────────────────────────────┘
+                                                    │
+                        ┌───────────────────────────┘
+                        │
+                        ▼
+              ┌──────────────────────────────────────────────┐
+              │  watchdog — runtime monitoring — flock + jitter  │
+              └──────────────────────────────────────────────┘
+
+  ────────────────── RUNTIME RECOVERY LADDER (no prefix) ─────────────────────────
+
+  ┌───────────────────┐  ┌──────────────────────┐  ┌──────────────────┐  ┌──────────────────────────────────┐
+  │ 1. restart wan6   │  │ 2. DHCPv6 renew      │  │ 3. /128 bootstrap│  │ 4. WAN restart → ONT alert       │
+  │ backoff 10 min    │  │ verify + backoff      │  │ backoff 30 min   │  │ cooldown 20 min, limit 3,        │
+  └───────────────────┘  │ 20 min               │  └──────────────────┘  │ then notify                      │
+                         └──────────────────────┘                         └──────────────────────────────────┘
+```
 
 ---
 
