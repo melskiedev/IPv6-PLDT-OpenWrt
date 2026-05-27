@@ -575,9 +575,19 @@ log() { logger -t "$LOGTAG" "$1"; }
 
 # Prevent overlapping executions. If a previous run is still active
 # (e.g. during bootstrap or WAN restart), exit immediately.
+# flock is preferred; mkdir is a fallback for OpenWrt images without flock.
 LOCK="$STATE_DIR/watchdog.lock"
-exec 9>"$LOCK"
-flock -n 9 || { log "Already running, skipping this tick"; exit 0; }
+LOCK_DIR="$STATE_DIR/watchdog.lock.dir"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK"
+    flock -n 9 || { log "Already running, skipping this tick"; exit 0; }
+else
+    mkdir "$LOCK_DIR" 2>/dev/null || { log "Already running, skipping this tick"; exit 0; }
+    cleanup_lock() { rmdir "$LOCK_DIR" 2>/dev/null; }
+    trap 'cleanup_lock' EXIT
+    trap 'cleanup_lock; exit 130' INT
+    trap 'cleanup_lock; exit 143' TERM
+fi
 
 [ -f "$CONF" ] && . "$CONF"
 
@@ -699,8 +709,8 @@ fix_gateway() {
     # If it points at the dead gateway, LAN clients have no IPv6 even when
     # the generic default route is healthy. Remove it unconditionally first.
     ip -6 route show default dev "$WAN_DEV" | grep 'from' | while read -r route; do
-        gw=$(echo "$route" | awk '{print $5}')
-        src=$(echo "$route" | awk '{print $3}')
+        gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+        src=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
         if [ -n "$gw" ] && [ -n "$src" ]; then
             if ! ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && \
                ! ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
@@ -710,7 +720,8 @@ fix_gateway() {
         fi
     done
 
-    current=$(ip -6 route show default dev "$WAN_DEV" | awk 'NR==1{print $3}')
+    current=$(ip -6 route show default dev "$WAN_DEV" \
+        | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
 
     # Current gateway is only considered good if internet reachability works.
     # Do not trust link-local gateway ping alone on PLDT -- the dead gateway
@@ -853,7 +864,7 @@ notify_ont_powercycle() {
 EOF
 )
 
-    curl -s \
+    curl -s --connect-timeout 3 --max-time 8 \
         -H "Content-Type: application/json" \
         -X POST \
         -d "$payload" \
@@ -872,8 +883,10 @@ try_128_bootstrap() {
 
     sleep 30
 
-    # Restore and re-cycle so netifd picks up the restored setting.
-    uci set network.wan6.reqaddress='none'
+    # Restore committed steady-state value and clear staged bootstrap delta.
+    # uci revert discards the staged 'try' and returns to the committed 'none'
+    # without committing from within the watchdog.
+    uci revert network.wan6.reqaddress
     ubus call network reload >/dev/null 2>&1
     ifdown wan6; sleep 5; ifup wan6
 
@@ -908,7 +921,7 @@ try_128_bootstrap() {
 if ipv6_ok; then
     if [ -f "$ONT_FLAG" ] && [ -n "$DISCORD_WEBHOOK" ]; then
         RECOVERY_PAYLOAD='{"embeds":[{"title":"IPv6 Recovered","color":3066993,"description":"IPv6 connectivity restored. All counters reset.","footer":{"text":"ipv6-watchdog"}}]}'
-        curl -s -H "Content-Type: application/json" -X POST \
+        curl -s --connect-timeout 3 --max-time 8 -H "Content-Type: application/json" -X POST \
             -d "$RECOVERY_PAYLOAD" "$DISCORD_WEBHOOK" >/dev/null 2>&1
         log "IPv6 recovered after critical failure, Discord recovery notice sent"
     fi
@@ -1558,6 +1571,12 @@ This guide focuses on ISP-provided global IPv6 with self-healing routing. The de
 ---
 
 ## Changelog
+
+### v3.4
+- Added `flock`/`mkdir` lock fallback: when `flock` is unavailable, a `mkdir`-based lock is used with a `cleanup_lock` function and per-signal traps (`EXIT`, `INT 130`, `TERM 143`) for correct BusyBox ash behavior on OpenWrt images where `flock` may be absent.
+- Hardened `fix_gateway()` route parsing to keyword-based `via`/`from` extraction using `awk` loops, replacing fixed field positions that could break on non-standard route output shapes.
+- Fixed `try_128_bootstrap()` restore: replaced `uci set network.wan6.reqaddress='none'` with `uci revert network.wan6.reqaddress` to correctly discard the staged `try` delta without issuing a commit from within the watchdog.
+- Added `--connect-timeout 3 --max-time 8` to both Discord `curl` calls to prevent network stalls from holding the lock and blocking cron cycles during outage conditions.
 
 ### v3.3
 - Fixed `fix_gateway()` false failure counter: healthy-gateway path now resets `FAIL_FILE` and returns `0` instead of `1`, preventing a spurious `Connectivity failure 1` log entry after the current gateway was already confirmed reachable.
