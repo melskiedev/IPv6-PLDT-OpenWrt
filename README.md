@@ -668,6 +668,17 @@ fi
 
 [ -f "$CONF" ] && . "$CONF"
 
+# LAN bridge device. Override in /etc/ipv6-watchdog.conf if different on target router.
+LAN_DEV="${LAN_DEV:-br-lan}"
+
+# Remove temporary WAN /128 addresses after bootstrap succeeds.
+# Set to 0 on routers where WAN /128 is a legitimate persistent address (e.g. Globe IA_NA mode).
+CLEANUP_WAN128="${CLEANUP_WAN128:-1}"
+
+# Remove deprecated global IPv6 addresses from LAN bridge after ipv6_ok passes.
+# Set to 0 to disable if stale deprecated address cleanup is not desired.
+CLEANUP_DEPRECATED_LAN="${CLEANUP_DEPRECATED_LAN:-1}"
+
 # How long to wait after a full WAN restart before trying again (20 minutes).
 # Aligned with PLDT stale lease behavior documented in Edge Case 6.
 WAN_RESTART_COOLDOWN=1200
@@ -728,6 +739,8 @@ WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
     | jsonfilter -e '@["l3_device"]')
 [ -z "$WAN_DEV" ] && { log "ERROR: WAN_DEV not found, wan6 may be down"; exit 1; }
 
+# --- Functions ---
+
 # Layered validation: prefix, route, then reachability.
 # Checking in order gives specific failure classification in logs,
 # not just a binary pass/fail from ping alone.
@@ -779,6 +792,24 @@ dhcpv6_renew() {
     return 1
 }
 
+# Remove deprecated global IPv6 addresses from br-lan.
+# Called only after ipv6_ok() passes to avoid removing addresses during recovery.
+# The 'ip -6 addr show deprecated' filter selects only addresses the kernel has
+# marked deprecated, meaning their preferred lifetime has expired or a new
+# suffix replaced them (e.g. after changing ip6ifaceid from ::1 to random).
+# Deprecated addresses are still valid for existing connections but are avoided
+# for new ones per RFC 6724 source selection. Removing them prevents stale
+# entries from lingering indefinitely after prefix rotation or suffix changes.
+cleanup_deprecated_v6() {
+    [ "$CLEANUP_DEPRECATED_LAN" = "1" ] || return 0
+    ip -6 addr show dev "$LAN_DEV" deprecated | \
+        awk '/inet6.*scope global/{print $2}' | \
+    while read -r addr; do
+        ip -6 addr del "$addr" dev "$LAN_DEV" 2>/dev/null && \
+            log "Removed deprecated $LAN_DEV IPv6: $addr"
+    done
+}
+
 fix_gateway() {
     # ===== STEP 1: Remove dead prefix-specific routes =====
     # PLDT installs a source-based route: 'default from <prefix>/56 via <gateway>'
@@ -808,49 +839,30 @@ fix_gateway() {
         if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
            ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
             log "Current gateway $current has internet reachability, no fix needed"
-            echo 0 > "$FAIL_FILE"
             return 0
         fi
         log "Current gateway $current has no internet reachability, scanning alternatives"
     fi
 
-    # Trigger an all-routers multicast probe before building the candidate list.
-    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address.
-    # This can trigger router responses and refresh NDP/MAC state before
-    # candidate discovery. Running this before building the candidate list
-    # ensures gateways that were not yet in the neighbor table have a chance
-    # to appear before the list is built. Mirrors 99-ipv6-setup behavior.
+    # Trigger an all-routers multicast probe before scanning candidates.
+    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address,
+    # prompting routers to respond and refreshing NDP/MAC state in the
+    # neighbor table. Without this, gateways may be present in the table
+    # but have no MAC yet (INCOMPLETE state), causing the loop to skip all
+    # candidates and fall through to no-fix. Mirrors 99-ipv6-setup behavior.
     log "Triggering NDP all-routers probe before gateway scan"
-    ping6 -c 1 -W 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
-    sleep 4
-
-    # Build initial candidate list after the multicast probe so any gateways
-    # that responded to ff02::2 are already present in the neighbor table.
-    CANDIDATES=$(
-        { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
-          ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
-        } | sort -u | grep -v '^$'
-    )
-
-    # Direct unicast probe to each discovered candidate. This gives the kernel
-    # another chance to resolve MAC entries via neighbor solicitation before
-    # the final scan runs, beyond what the multicast probe alone triggers.
-    for gw in $CANDIDATES; do
-        ping6 -c 1 -W 1 -I "$WAN_DEV" "$gw" >/dev/null 2>&1
-    done
-
+    ping6 -c 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
     sleep 2
 
-    # Rebuild candidates after the unicast probes. NDP may have populated new
-    # usable entries during the probe window that were not present in the
-    # initial list.
-    CANDIDATES=$(
+    # Combine neighbor table and existing route table for the candidate list.
+    # The neighbor table alone can miss gateways if NDP was incomplete at the
+    # time of the scan. Using both sources matches 99-ipv6-setup behavior and
+    # ensures no known gateway is overlooked.
+    for gw in $(
         { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
-          ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
+          ip -6 route show default dev "$WAN_DEV" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1)}}'
         } | sort -u | grep -v '^$'
-    )
-
-    for gw in $CANDIDATES; do
+    ); do
         mac=$(ip -6 neigh show dev "$WAN_DEV" \
             | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
 
@@ -868,7 +880,6 @@ fix_gateway() {
         if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
            ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
             log "Gateway replaced with $gw (mac $mac pinned, internet verified)"
-            echo 0 > "$FAIL_FILE"
             return 0
         fi
 
@@ -890,6 +901,7 @@ do_wan_restart() {
     echo "$NOW" > "$LAST_WAN_RESTART_FILE"
     echo 0 > "$PREFIX_FAIL_FILE"
     echo 0 > "$FAIL_FILE"
+    rm -f "$PREFIX_BACKOFF_FILE"
 
     log "Full WAN restart #$WAN_RESTARTS of $WAN_RESTART_LIMIT"
     ifdown wan6; ifdown wan
@@ -922,7 +934,7 @@ notify_ont_powercycle() {
     HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
     FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
-    payload=$(cat <<EOF
+    payload=$(cat <<PAYLOAD
 {
   "embeds": [{
     "title": "IPv6 Alert: ONT Power Cycle Required",
@@ -938,7 +950,7 @@ notify_ont_powercycle() {
     "footer": { "text": "ipv6-watchdog on $FW_ESC" }
   }]
 }
-EOF
+PAYLOAD
 )
 
     curl -s --connect-timeout 3 --max-time 8 \
@@ -978,11 +990,15 @@ try_128_bootstrap() {
     if [ -n "$prefix" ]; then
         log "Prefix acquired via bootstrap: $prefix, verifying connectivity"
         if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1; then
-            ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
-            | while read -r addr; do
-                ip -6 addr del "$addr" dev "$WAN_DEV"
-                log "Removed /128: $addr"
-            done
+            if [ "$CLEANUP_WAN128" = "1" ]; then
+                ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
+                | while read -r addr; do
+                    ip -6 addr del "$addr" dev "$WAN_DEV"
+                    log "Removed temporary /128: $addr"
+                done
+            else
+                log "CLEANUP_WAN128 disabled, keeping WAN /128 addresses on $WAN_DEV"
+            fi
             return 0
         else
             log "Prefix present but connectivity failed, keeping /128 for next cycle"
@@ -993,6 +1009,8 @@ try_128_bootstrap() {
         return 1
     fi
 }
+
+# --- Main logic ---
 
 # Happy path: reset all state.
 if ipv6_ok; then
@@ -1009,6 +1027,7 @@ if ipv6_ok; then
     echo 0 > "$LAST_WAN_RESTART_FILE"
     rm -f "$ONT_FLAG"
     rm -f "$PREFIX_BACKOFF_FILE"
+    cleanup_deprecated_v6
     exit 0
 fi
 
@@ -1073,6 +1092,7 @@ if fix_gateway; then
     if ipv6_ok; then
         echo 0 > "$FAIL_FILE"
         echo 0 > "$PREFIX_FAIL_FILE"
+        cleanup_deprecated_v6
         exit 0
     fi
 fi
@@ -1090,7 +1110,6 @@ fi
 ```sh
 chmod +x /usr/bin/ipv6-watchdog
 ```
-
 ---
 
 ## Step 5 - Cron Setup
@@ -1608,13 +1627,50 @@ This section is informational only and not required for the core setup.
 
 ### DUID (DHCPv6 Unique Identifier)
 
-OpenWrt automatically generates a DUID and PLDT accepts it without issues. No manual configuration is needed for this setup.
+OpenWrt automatically generates a DUID on first boot. PLDT uses this to identify the DHCPv6 client and anchor prefix delegation leases.
 
-However, in some environments a persistent or custom DUID may be required, particularly if the ISP assigns inconsistent prefixes or sessions across reconnects.
+**OpenWrt 25.12 DUID change:** OpenWrt 25.12 changed the default DUID type from DUID-LL (Type 3, MAC-based) to DUID-UUID (Type 4, random). The new DUID-UUID is persistent across reboots and sysupgrades when settings are kept. On a fresh flash with no settings preserved, a new random DUID is generated on first boot.
 
-In some cases, resetting the default DUID after flashing may help clear stale ISP leases and restore prefix delegation. This setup uses the default auto-generated DUID, which works reliably with PLDT in testing.
+**Why DUID pinning matters on PLDT:** Without a pinned DUID, every `wan6` restart that generates a new DUID is treated by PLDT as a new client. PLDT may assign a different prefix, delay assignment, or withhold the prefix entirely until the previous lease expires. This is the underlying cause of prefix rotation observed during wan6 recovery events. Pinning the DUID gives PLDT a stable client identity to anchor lease renewal against, which significantly reduces prefix rotation across restarts.
 
-**OpenWrt 25.12 DUID change:** OpenWrt 25.12 changed the default DUID type from DUID-LL (Type 3, MAC-based) to DUID-UUID (Type 4, random). The new DUID-UUID is persistent across reboots and sysupgrades when settings are kept. On a fresh flash with no settings preserved, a new random DUID is generated on first boot. Some ISPs that expect a MAC-based DUID may not immediately update the lease. In those cases, the old lease may need to expire first, or a manual DUID override may be required.
+**How to pin the DUID:**
+
+First, capture your current DUID before it changes:
+
+```sh
+# Read the DUID currently presented by odhcp6c on wan6
+uci get network.wan6.clientid 2>/dev/null || \
+    strings /var/lib/odhcp6c.*.clientid 2>/dev/null | head -1
+```
+
+If the above returns empty, check the running odhcp6c process:
+
+```sh
+cat /proc/$(pidof odhcp6c)/cmdline 2>/dev/null | tr '\0' '\n' | grep -A1 "\-c"
+```
+
+Once you have the value, pin it:
+
+```sh
+# Replace with your actual DUID value
+uci set network.wan6.clientid='00041cfaf8bebab84698b8e85b9717e138b1'
+uci commit network
+```
+
+**Critical rules for DUID:**
+
+- Capture and record your DUID before any firmware flash
+- Never copy a DUID from one router to another; each device must have a unique DUID
+- After a fresh flash with no settings preserved, a new DUID is generated; re-pin it after first boot
+- Add `network.wan6.clientid` to your sysupgrade backup or document the value externally
+
+**Add to sysupgrade preserve list:**
+
+```sh
+# The clientid is stored in /etc/config/network, which is preserved by default.
+# Confirm it survives sysupgrade by checking after flash:
+uci get network.wan6.clientid
+```
 
 In rare cases, a DUID change may result in loss of prefix delegation or delayed assignment until the ISP releases the previous lease. This presents as `wan6` up but no prefix assigned, similar to Edge Case 6 (`NoPrefixAvail`).
 
@@ -1640,14 +1696,38 @@ ULA may be useful if:
 
 | Feature | Used in this setup | Required |
 |---|---|---|
-| DUID | Auto-generated by OpenWrt | No |
+| DUID pin | Recommended for prefix stability | No, but strongly advised |
 | ULA | Not used | No |
 
 This guide focuses on ISP-provided global IPv6 with self-healing routing. The design philosophy is to fix ISP behavior dynamically rather than compensate with alternate addressing schemes.
 
+### LAN Interface IPv6 Suffix
+
+By default, OpenWrt assigns the router's own LAN IPv6 address using suffix `::1` from the delegated prefix (e.g. `2001:4451:xxxx:xxxx::1/64`). This is the address the router presents on `br-lan`.
+
+The suffix can be changed in LuCI under **Network -> Interfaces -> lan -> Edit -> Advanced Settings -> IPv6 suffix**. Options are:
+
+| Value | Behavior |
+|---|---|
+| (unset) | Defaults to `::1` |
+| `::1` | Static suffix, same across reboots and prefix changes |
+| `eui64` | Derived from the router MAC address, stable but device-specific |
+| `random` | Random suffix generated by `odhcpd`, changes on interface restart or prefix rotation |
+
+When the suffix changes, the old address remains on `br-lan` as `deprecated` until its lifetime expires. The `cleanup_deprecated_v6()` function in `ipv6-watchdog` removes these stale deprecated addresses automatically after IPv6 is confirmed healthy, so they do not linger indefinitely.
+
 ---
 
 ## Changelog
+
+### v3.5
+- Added `LAN_DEV="${LAN_DEV:-br-lan}"` configurable LAN bridge device variable, overridable via `/etc/ipv6-watchdog.conf` for portability across routers with different LAN bridge names.
+- Added `CLEANUP_WAN128="${CLEANUP_WAN128:-1}"` toggle to guard `/128` cleanup in `try_128_bootstrap()`. Set to `0` on routers where WAN `/128` is a legitimate persistent address rather than a temporary bootstrap artifact.
+- Added `CLEANUP_DEPRECATED_LAN="${CLEANUP_DEPRECATED_LAN:-1}"` toggle to control deprecated LAN GUA cleanup behavior per deployment.
+- Added `cleanup_deprecated_v6()` function: removes deprecated global IPv6 addresses from the LAN bridge after `ipv6_ok()` confirms IPv6 is healthy. Prevents stale deprecated router-owned LAN addresses from lingering after prefix rotation or LAN suffix changes (e.g. after changing the LAN interface IPv6 suffix from `::1` to `random` or `eui64` in LuCI Advanced Settings). Called in both the initial happy path and after successful `fix_gateway()` recovery.
+- Fixed prefix backoff timer surviving full WAN restart: `do_wan_restart()` now removes `PREFIX_BACKOFF_FILE` so the next recovery cycle is not delayed by a stale backoff timestamp.
+- Added `rm -f "$PREFIX_BACKOFF_FILE"` to the happy path to clear stale backoff on full IPv6 recovery.
+- Updated Advanced Notes DUID section: pinning `network.wan6.clientid` is now documented as recommended practice for PLDT prefix stability, with capture instructions, per-router uniqueness warning, and sysupgrade guidance.
 
 ### v3.4
 - Added `flock`/`mkdir` lock fallback: when `flock` is unavailable, a `mkdir`-based lock is used with a `cleanup_lock` function and per-signal traps (`EXIT`, `INT 130`, `TERM 143`) for correct BusyBox ash behavior on OpenWrt images where `flock` may be absent.
