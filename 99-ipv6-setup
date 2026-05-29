@@ -134,3 +134,35 @@ else
 fi
 
 log "=== setup complete ==="
+
+# ===== VERIFY LAN RA CONFIG =====
+# Checks that odhcpd is configured correctly for IPv6 RA and DHCPv6 on LAN.
+# Auto-corrects and restarts odhcpd if any setting is wrong.
+# Guards against config drift after sysupgrade or manual changes.
+ra_ok=1
+for key in ra ra_slaac dhcpv6 ra_default; do
+    val=$(uci get dhcp.lan.$key 2>/dev/null)
+    case "$key" in
+        ra)         expected="server" ;;
+        ra_slaac)   expected="1" ;;
+        dhcpv6)     expected="server" ;;
+        ra_default) expected="1" ;;
+    esac
+    if [ "$val" != "$expected" ]; then
+        log "WARNING: dhcp.lan.$key is '${val:-unset}', expected '$expected' -- fixing"
+        uci set dhcp.lan.$key="$expected"
+        ra_ok=0
+    fi
+done
+
+if [ "$ra_ok" -eq 0 ]; then
+    uci commit dhcp
+    if /etc/init.d/odhcpd running 2>/dev/null; then
+        /etc/init.d/odhcpd restart
+    else
+        /etc/init.d/odhcpd start
+    fi
+    log "LAN RA config corrected and odhcpd restarted"
+else
+    log "LAN RA config OK"
+fi
