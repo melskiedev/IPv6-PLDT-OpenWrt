@@ -178,7 +178,7 @@ grep -qxF '*/1 * * * * /usr/bin/ipv6-watchdog' /etc/crontabs/root || \
   echo '*/1 * * * * /usr/bin/ipv6-watchdog' >> /etc/crontabs/root
 /etc/init.d/cron restart
 
-# Step 6 — gratuitous ARP (optional: upload 97-garp to repo first, otherwise use the heredoc in Step 6)
+# Step 6 — gratuitous ARP
 wget -q "$BASE/97-garp" -O /etc/hotplug.d/iface/97-garp \
   && chmod +x /etc/hotplug.d/iface/97-garp
 ```
@@ -591,7 +591,7 @@ SCRIPT
 chmod +x /etc/hotplug.d/iface/97-garp
 ```
 
-Alternatively, if you have uploaded `97-garp` to your repo, deploy with:
+Alternatively, deploy from repo:
 
 ```sh
 wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/97-garp \
