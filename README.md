@@ -141,19 +141,31 @@ Good: returns at least one line confirming the renew tier is present.
 
 Apply in this order, then reboot:
 
-1. Apply UCI config
-2. Create **`/etc/hotplug.d/iface/98-wan6-delay`**
-3. Create **`/etc/hotplug.d/iface/99-ipv6-setup`**
-4. Create **`/usr/bin/ipv6-watchdog`**
-5. Add cron job and restart cron
-6. Create **`/etc/hotplug.d/iface/97-garp`** (gratuitous ARP for router swap recovery)
+1. Complete [Step 1 - UCI Config](#step-1---uci-config)
+2. Deploy `98-wan6-delay`
+3. Deploy `99-ipv6-setup`
+4. Deploy `ipv6-watchdog`
+5. Add the watchdog cron job
+6. Deploy `97-garp`
 7. Reboot
+
+The commands below deploy Steps 2 through 6. Step 1 must be completed first because the scripts read the UCI network settings at runtime.
 
 Optional: set up Discord notifications (see [Optional: Discord Notifications](#optional-discord-notifications)).
 
-### One-command deploy (recommended)
+### Before running the commands
 
-Scripts 2, 3, 4, and 6 can be deployed directly from the repo over SSH.
+Install required packages first. Only `iputils-arping` is required for `97-garp`. `curl` is optional and only needed if `wget` fails or if Discord notifications are enabled.
+
+```sh
+apk update
+apk add iputils-arping
+apk add curl
+```
+
+IPv4 internet must be working to run `apk`. A fresh OpenWrt flash provides it via the default DHCP WAN.
+
+### One-command script deploy (recommended)
 
 ```sh
 BASE="https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main"
@@ -184,8 +196,6 @@ wget -q "$BASE/97-garp" -O /etc/hotplug.d/iface/97-garp \
 ```
 
 > The watchdog deploy uses a temp file and `sh -n` syntax check before replacing the live script. A bad download or interrupted transfer will not overwrite a working watchdog.
-
-> `wget` is used because it is available on all standard OpenWrt images without extra packages. `curl` requires `apk add curl` and is only needed for the optional Discord notification feature.
 
 Test after reboot:
 
