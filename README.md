@@ -9,6 +9,8 @@
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
 
+> **Personal project, shared freely.** This started as a fix for my own PLDT Fiber setup and grew into something worth documenting. Feel free to use it, adapt it, or build on it. Everything here is based on behaviors I actually observed with PLDT in bridge mode — your ISP or hardware may behave differently. No guarantees, no warranties. Back up your router config before applying anything, and make sure you have physical or LAN access before making changes. You take full responsibility for your own setup.
+
 ---
 
 ## TL;DR
@@ -132,7 +134,6 @@ Good: returns at least one line confirming the renew tier is present.
 - [Preserving Scripts Across Firmware Upgrades](#preserving-scripts-across-firmware-upgrades)
 - [Known Edge Cases](#known-edge-cases)
 - [Advanced Notes: DUID and ULA](#advanced-notes-duid-and-ula)
-- [Disclaimer](#disclaimer)
 
 ---
 
@@ -149,6 +150,42 @@ Apply in this order, then reboot:
 7. Reboot
 
 Optional: set up Discord notifications (see [Optional: Discord Notifications](#optional-discord-notifications)).
+
+### One-command deploy (recommended)
+
+Scripts 2, 3, 4, and 6 can be deployed directly from the repo over SSH.
+
+```sh
+BASE="https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main"
+
+# Step 2 — wan6 startup delay
+wget -q "$BASE/98-wan6-delay" -O /etc/hotplug.d/iface/98-wan6-delay \
+  && chmod +x /etc/hotplug.d/iface/98-wan6-delay
+
+# Step 3 — IPv6 route fix engine
+wget -q "$BASE/99-ipv6-setup" -O /etc/hotplug.d/iface/99-ipv6-setup \
+  && chmod +x /etc/hotplug.d/iface/99-ipv6-setup
+
+# Step 4 — IPv6 watchdog (safe deploy: syntax check before replacing live script)
+wget -q "$BASE/ipv6-watchdog" -O /tmp/ipv6-watchdog.new \
+  && sh -n /tmp/ipv6-watchdog.new \
+  && mv /tmp/ipv6-watchdog.new /usr/bin/ipv6-watchdog \
+  && chmod +x /usr/bin/ipv6-watchdog && echo "watchdog deployed ok" \
+  || echo "syntax check failed, not deployed"
+
+# Step 5 — cron (command only, no file needed)
+grep -qxF '*/1 * * * * /usr/bin/ipv6-watchdog' /etc/crontabs/root || \
+  echo '*/1 * * * * /usr/bin/ipv6-watchdog' >> /etc/crontabs/root
+/etc/init.d/cron restart
+
+# Step 6 — gratuitous ARP (optional: upload 97-garp to repo first, otherwise use the heredoc in Step 6)
+wget -q "$BASE/97-garp" -O /etc/hotplug.d/iface/97-garp \
+  && chmod +x /etc/hotplug.d/iface/97-garp
+```
+
+> The watchdog deploy uses a temp file and `sh -n` syntax check before replacing the live script. A bad download or interrupted transfer will not overwrite a working watchdog.
+
+> `wget` is used because it is available on all standard OpenWrt images without extra packages. `curl` requires `apk add curl` and is only needed for the optional Discord notification feature.
 
 Test after reboot:
 
@@ -422,36 +459,22 @@ What each setting does:
 
 ## Step 2 — wan6 Startup Delay
 
-**File:** `/etc/hotplug.d/iface/98-wan6-delay`
+**File:** [`98-wan6-delay`](98-wan6-delay) → `/etc/hotplug.d/iface/98-wan6-delay`
 
 Waits for WAN to be fully ready before starting `wan6`, eliminating early DHCPv6 startup failures that can leave the interface stuck in a `pending` state. Ensures a clean start by resetting any prematurely started session and delaying until the ISP is ready.
 
-```sh
-#!/bin/sh
-[ "$ACTION" = "ifup" ] || exit 0
-[ "$INTERFACE" = "wan" ] || exit 0
-
-logger -t wan6-delay "WAN up detected, preparing wan6..."
-
-# Force reset in case wan6 started too early
-ifdown wan6 2>/dev/null
-
-# Wait for WAN + ISP DHCPv6 readiness
-sleep 15
-
-logger -t wan6-delay "Starting wan6 after delay"
-ifup wan6
-```
+**Deploy:**
 
 ```sh
-chmod +x /etc/hotplug.d/iface/98-wan6-delay
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/98-wan6-delay \
+  -O /etc/hotplug.d/iface/98-wan6-delay && chmod +x /etc/hotplug.d/iface/98-wan6-delay
 ```
 
 ---
 
 ## Step 3 - IPv6 Route Fix Engine
 
-**File:** `/etc/hotplug.d/iface/99-ipv6-setup`
+**File:** [`99-ipv6-setup`](99-ipv6-setup) → `/etc/hotplug.d/iface/99-ipv6-setup`
 
 Runs whenever `wan6` comes up. This is the authoritative startup fix. It ensures a working gateway is selected, its MAC address is pinned to prevent re-introduction of the dead gateway, and the `/128` is removed once connectivity is confirmed.
 
@@ -465,150 +488,18 @@ Runs whenever `wan6` comes up. This is the authoritative startup fix. It ensures
 
 **Defers to watchdog on missing prefix.** If no prefix is assigned after 45 seconds, the script logs a warning and exits clean. The watchdog handles prefix recovery via the escalation ladder.
 
-```sh
-#!/bin/sh
-[ "$ACTION" = "ifup" ] || exit 0
-[ "$INTERFACE" = "wan6" ] || exit 0
-
-LOGTAG="ipv6-setup"
-log() { logger -t "$LOGTAG" "$1"; }
-
-# ===== GET WAN DEVICE =====
-WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
-    | jsonfilter -e '@["l3_device"]' 2>/dev/null)
-[ -z "$WAN_DEV" ] && { log "ERROR: cannot determine WAN device"; exit 1; }
-log "WAN device: $WAN_DEV"
-
-# ===== WAIT FOR LINK-LOCAL =====
-for i in $(seq 1 10); do
-    lla=$(ip -6 addr show dev "$WAN_DEV" | awk '/fe80.*scope link/{print $2}')
-    [ -n "$lla" ] && { log "LLA ready: $lla"; break; }
-    [ "$i" -eq 10 ] && { log "ERROR: LLA never appeared on $WAN_DEV"; exit 1; }
-    sleep 2
-done
-
-# ===== WAIT FOR PREFIX DELEGATION =====
-log "Waiting for prefix delegation..."
-PREFIX=""
-for i in $(seq 1 15); do
-    PREFIX=$(ubus call network.interface.wan6 status 2>/dev/null \
-        | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null)
-    [ -n "$PREFIX" ] && { log "Prefix received: $PREFIX"; break; }
-    sleep 3
-done
-[ -z "$PREFIX" ] && log "WARNING: no PD received after 45s -- continuing anyway"
-
-# ===== TRIGGER NDP DISCOVERY =====
-# Ping all-routers multicast to trigger router responses and refresh NDP state for routers on the link.
-# This discovers ALL gateways, not just the one already in the default route.
-log "Triggering NDP discovery via all-routers multicast..."
-ping6 -c 3 -W 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
-sleep 3
-
-# Also probe existing default route gateways to refresh their neighbor entries.
-ip -6 route show default dev "$WAN_DEV" | awk '{print $3}' \
-| while read -r gw; do
-    [ -n "$gw" ] && ping6 -c 1 -W 1 -I "$WAN_DEV" "$gw" >/dev/null 2>&1
-done
-sleep 3
-
-# ===== DISCOVER WORKING GATEWAY =====
-# Combine neighbor table and existing routes for the candidate list.
-# The neighbor table alone can miss gateways if NDP was incomplete at startup.
-log "Scanning gateways on $WAN_DEV..."
-BEST_GW=""
-BEST_MAC=""
-
-for gw in $(
-    { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
-      ip -6 route show default dev "$WAN_DEV" | awk '{print $3}'
-    } | sort -u | grep -v '^$'
-); do
-    state=$(ip -6 neigh show dev "$WAN_DEV" | awk -v g="$gw" '$1==g{print $NF}')
-    mac=$(ip -6 neigh show dev "$WAN_DEV" | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
-    log "  Gateway $gw -- state: ${state:-unknown} mac: ${mac:-unknown}"
-
-    ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1 || {
-        log "  Gateway $gw -- probe FAILED"
-        continue
-    }
-    log "  Gateway $gw -- probe OK"
-
-    if [ -z "$mac" ]; then
-        sleep 2
-        mac=$(ip -6 neigh show dev "$WAN_DEV" \
-            | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
-    fi
-
-    [ -z "$mac" ] && { log "  Gateway $gw -- MAC not resolved, skipping"; continue; }
-
-    BEST_GW="$gw"
-    BEST_MAC="$mac"
-    log "  Gateway $gw -- selected (mac $BEST_MAC)"
-    break
-done
-
-# ===== NO GATEWAY FOUND -- RECOVER =====
-if [ -z "$BEST_GW" ]; then
-    log "ERROR: no working gateway found -- restarting WAN"
-    ifdown wan6
-    ifdown wan
-    sleep 20
-    ifup wan
-    sleep 40
-    ifup wan6
-    exit 0
-fi
-
-# ===== PIN GATEWAY =====
-# Pin the MAC in the neighbor table using nud stale.
-# This prevents the kernel from evicting the entry and re-running NDP,
-# which would allow PLDT's dead gateway to be reintroduced via RA.
-# nud stale keeps the entry stable while still allowing natural revalidation.
-log "Pinning gateway $BEST_GW ($BEST_MAC) as reachable"
-ip -6 neigh replace "$BEST_GW" lladdr "$BEST_MAC" dev "$WAN_DEV" nud stale
-
-# ===== INSTALL DEFAULT ROUTE =====
-log "Installing default route via $BEST_GW"
-ip -6 route show default dev "$WAN_DEV" | awk '{print $3}' \
-| while read -r old_gw; do
-    [ "$old_gw" = "$BEST_GW" ] && continue
-    ip -6 route del default via "$old_gw" dev "$WAN_DEV" 2>/dev/null
-    log "Removed old default via $old_gw"
-done
-ip -6 route replace default via "$BEST_GW" dev "$WAN_DEV" metric 512
-
-# ===== VERIFY AND CLEAN UP /128 =====
-# Check both Google and Cloudflare IPv6 resolvers before removing /128.
-# This matches the watchdog's ipv6_ok() function for consistent behavior.
-sleep 3
-if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
-   ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-    log "SUCCESS: IPv6 internet reachable via $BEST_GW"
-    ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
-    | while read -r addr; do
-        ip -6 addr del "$addr" dev "$WAN_DEV" 2>/dev/null
-        log "Removed /128 $addr after confirmed connectivity"
-    done
-else
-    log "WARNING: gateway pinned but internet unreachable"
-    v128=$(ip -6 addr show dev "$WAN_DEV" \
-        | awk '/\/128 scope global/{print $2}' | head -1)
-    [ -n "$v128" ] && log "Keeping /128 $v128 as fallback"
-fi
-
-log "=== setup complete ==="
-```
+**Deploy:**
 
 ```sh
-chmod +x /etc/hotplug.d/iface/99-ipv6-setup
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/99-ipv6-setup \
+  -O /etc/hotplug.d/iface/99-ipv6-setup && chmod +x /etc/hotplug.d/iface/99-ipv6-setup
 ```
 
 ---
 
 ## Step 4 - IPv6 Watchdog
 
-**File:** `/usr/bin/ipv6-watchdog`
+**File:** [`ipv6-watchdog`](ipv6-watchdog) → `/usr/bin/ipv6-watchdog`
 
 Runs every 1 minute via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check. A Tier 0 check runs first to recover `wan6` if it is fully down before any other logic executes.
 
@@ -637,479 +528,18 @@ After 3 full WAN restarts with no recovery: stop, notify once via log and Discor
 
 **Why backoff matters:** Rapid reconnects worsen stale lease conditions on PLDT's DHCPv6 server (see Edge Case 6). The spacing gives the ISP time between attempts.
 
-```sh
-#!/bin/sh
-# /usr/bin/ipv6-watchdog
-# IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
-# Runs every 1 minute via cron.
-
-LOGTAG="ipv6-watchdog"
-STATE_DIR="/tmp/ipv6-watchdog"
-CONF="/etc/ipv6-watchdog.conf"
-mkdir -p "$STATE_DIR"
-
-log() { logger -t "$LOGTAG" "$1"; }
-
-# Prevent overlapping executions. If a previous run is still active
-# (e.g. during bootstrap or WAN restart), exit immediately.
-# flock is preferred; mkdir is a fallback for OpenWrt images without flock.
-LOCK="$STATE_DIR/watchdog.lock"
-LOCK_DIR="$STATE_DIR/watchdog.lock.dir"
-if command -v flock >/dev/null 2>&1; then
-    exec 9>"$LOCK"
-    flock -n 9 || { log "Already running, skipping this tick"; exit 0; }
-else
-    mkdir "$LOCK_DIR" 2>/dev/null || { log "Already running, skipping this tick"; exit 0; }
-    cleanup_lock() { rmdir "$LOCK_DIR" 2>/dev/null; }
-    trap 'cleanup_lock' EXIT
-    trap 'cleanup_lock; exit 130' INT
-    trap 'cleanup_lock; exit 143' TERM
-fi
-
-[ -f "$CONF" ] && . "$CONF"
-
-# LAN bridge device. Override in /etc/ipv6-watchdog.conf if different on target router.
-LAN_DEV="${LAN_DEV:-br-lan}"
-
-# Remove temporary WAN /128 addresses after bootstrap succeeds.
-# Set to 0 on routers where WAN /128 is a legitimate persistent address (e.g. Globe IA_NA mode).
-CLEANUP_WAN128="${CLEANUP_WAN128:-1}"
-
-# Remove deprecated global IPv6 addresses from LAN bridge after ipv6_ok passes.
-# Set to 0 to disable if stale deprecated address cleanup is not desired.
-CLEANUP_DEPRECATED_LAN="${CLEANUP_DEPRECATED_LAN:-1}"
-
-# How long to wait after a full WAN restart before trying again (20 minutes).
-# Aligned with PLDT stale lease behavior documented in Edge Case 6.
-WAN_RESTART_COOLDOWN=1200
-
-# How many full WAN restarts before stopping and requiring manual ONT powercycle.
-WAN_RESTART_LIMIT=3
-
-# State files
-FAIL_FILE="$STATE_DIR/fail_count"
-PREFIX_FAIL_FILE="$STATE_DIR/prefix_fail_count"
-WAN_RESTART_FILE="$STATE_DIR/wan_restart_count"
-LAST_WAN_RESTART_FILE="$STATE_DIR/last_wan_restart"
-PREFIX_BACKOFF_FILE="$STATE_DIR/prefix_next_attempt"
-ONT_FLAG="$STATE_DIR/ont_notified"
-
-FAILS=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
-PREFIX_FAILS=$(cat "$PREFIX_FAIL_FILE" 2>/dev/null || echo 0)
-WAN_RESTARTS=$(cat "$WAN_RESTART_FILE" 2>/dev/null || echo 0)
-LAST_RESTART=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null || echo 0)
-PREFIX_NEXT=$(cat "$PREFIX_BACKOFF_FILE" 2>/dev/null || echo 0)
-NOW=$(date +%s)
-
-# Add jitter to avoid synchronized retry bursts across rapid cron ticks.
-sleep $((RANDOM % 5 + 5))
-
-# ===== BOOT GRACE PERIOD =====
-# If the system just booted, exit immediately and let 98-wan6-delay and
-# 99-ipv6-setup complete before this watchdog takes any action.
-# Without this, cron fires within seconds of boot and Tier 0 can pull
-# wan6 back down while it is still initializing, creating a restart loop.
-UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999)
-if [ "$UPTIME_SECS" -lt 120 ]; then
-    log "Boot grace period active (uptime ${UPTIME_SECS}s < 120s), exiting"
-    exit 0
-fi
-
-# ===== TIER 0: wan6 DOWN RECOVERY =====
-# Handles the case where wan6 never came up after boot or a link event.
-# This runs before all other checks since WAN_DEV cannot be determined
-# when wan6 is down, which would otherwise cause an early exit.
-if ! ubus call network.interface.wan6 status 2>/dev/null \
-        | jsonfilter -e '@["up"]' | grep -q true; then
-    log "Tier 0: wan6 is DOWN -- attempting recovery"
-    ifdown wan6
-    sleep 5
-    ifup wan6
-    sleep 15
-    if ubus call network.interface.wan6 status 2>/dev/null \
-            | jsonfilter -e '@["up"]' | grep -q true; then
-        log "Tier 0: wan6 recovery SUCCESS"
-    else
-        log "Tier 0: wan6 recovery FAILED -- will retry on next cycle"
-    fi
-    exit 0
-fi
-
-WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
-    | jsonfilter -e '@["l3_device"]')
-[ -z "$WAN_DEV" ] && { log "ERROR: WAN_DEV not found, wan6 may be down"; exit 1; }
-
-# --- Functions ---
-
-# Layered validation: prefix, route, then reachability.
-# Checking in order gives specific failure classification in logs,
-# not just a binary pass/fail from ping alone.
-ipv6_ok() {
-    # Layer 1: prefix must exist
-    if ! ubus call network.interface.wan6 status 2>/dev/null \
-            | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .; then
-        log "Validation failed: no prefix assigned"
-        return 1
-    fi
-
-    # Layer 2: default route must exist
-    if ! ip -6 route show default dev "$WAN_DEV" | grep -q default; then
-        log "Validation failed: no default IPv6 route"
-        return 1
-    fi
-
-    # Layer 3: external reachability
-    ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
-    ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
-
-    log "Validation failed: prefix and route exist but internet unreachable"
-    return 1
-}
-
-has_prefix() {
-    ubus call network.interface.wan6 status 2>/dev/null \
-        | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .
-}
-
-# Attempt a DHCPv6 renew before resorting to full interface restart.
-# This is less disruptive and sufficient when the ISP just needs a re-request.
-# Waits 10 seconds after renew to verify the prefix was restored in the same run.
-dhcpv6_renew() {
-    log "Attempting DHCPv6 renew"
-    ubus call network.interface.wan6 renew 2>/dev/null || {
-        log "DHCPv6 renew failed or not supported"
-        return 1
-    }
-
-    sleep 10
-
-    if has_prefix; then
-        log "DHCPv6 renew succeeded, prefix restored"
-        return 0
-    fi
-
-    log "DHCPv6 renew completed but no prefix yet, will escalate next cycle"
-    return 1
-}
-
-# Remove deprecated global IPv6 addresses from br-lan.
-# Called only after ipv6_ok() passes to avoid removing addresses during recovery.
-# The 'ip -6 addr show deprecated' filter selects only addresses the kernel has
-# marked deprecated, meaning their preferred lifetime has expired or a new
-# suffix replaced them (e.g. after changing ip6ifaceid from ::1 to random).
-# Deprecated addresses are still valid for existing connections but are avoided
-# for new ones per RFC 6724 source selection. Removing them prevents stale
-# entries from lingering indefinitely after prefix rotation or suffix changes.
-cleanup_deprecated_v6() {
-    [ "$CLEANUP_DEPRECATED_LAN" = "1" ] || return 0
-    ip -6 addr show dev "$LAN_DEV" deprecated | \
-        awk '/inet6.*scope global/{print $2}' | \
-    while read -r addr; do
-        ip -6 addr del "$addr" dev "$LAN_DEV" 2>/dev/null && \
-            log "Removed deprecated $LAN_DEV IPv6: $addr"
-    done
-}
-
-fix_gateway() {
-    # ===== STEP 1: Remove dead prefix-specific routes =====
-    # PLDT installs a source-based route: 'default from <prefix>/56 via <gateway>'
-    # This takes priority over the generic default for LAN client traffic.
-    # If it points at the dead gateway, LAN clients have no IPv6 even when
-    # the generic default route is healthy. Remove it unconditionally first.
-    ip -6 route show default dev "$WAN_DEV" | grep 'from' | while read -r route; do
-        gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-        src=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
-        if [ -n "$gw" ] && [ -n "$src" ]; then
-            if ! ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && \
-               ! ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-                ip -6 route del default from "$src" via "$gw" dev "$WAN_DEV" 2>/dev/null && \
-                    log "Removed dead prefix-specific route: default from $src via $gw"
-            fi
-        fi
-    done
-
-    current=$(ip -6 route show default dev "$WAN_DEV" \
-        | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-
-    # Current gateway is only considered good if internet reachability works.
-    # Do not trust link-local gateway ping alone on PLDT -- the dead gateway
-    # responds to direct ping6 intermittently but does not forward internet
-    # traffic reliably.
-    if [ -n "$current" ]; then
-        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
-           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-            log "Current gateway $current has internet reachability, no fix needed"
-            return 0
-        fi
-        log "Current gateway $current has no internet reachability, scanning alternatives"
-    fi
-
-    # Trigger an all-routers multicast probe before scanning candidates.
-    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address,
-    # prompting routers to respond and refreshing NDP/MAC state in the
-    # neighbor table. Without this, gateways may be present in the table
-    # but have no MAC yet (INCOMPLETE state), causing the loop to skip all
-    # candidates and fall through to no-fix. Mirrors 99-ipv6-setup behavior.
-    log "Triggering NDP all-routers probe before gateway scan"
-    ping6 -c 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
-    sleep 2
-
-    # Combine neighbor table and existing route table for the candidate list.
-    # The neighbor table alone can miss gateways if NDP was incomplete at the
-    # time of the scan. Using both sources matches 99-ipv6-setup behavior and
-    # ensures no known gateway is overlooked.
-    for gw in $(
-        { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
-          ip -6 route show default dev "$WAN_DEV" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1)}}'
-        } | sort -u | grep -v '^$'
-    ); do
-        mac=$(ip -6 neigh show dev "$WAN_DEV" \
-            | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
-
-        [ -z "$mac" ] && {
-            log "Gateway $gw has no MAC, skipping"
-            continue
-        }
-
-        # Install candidate temporarily and test internet reachability.
-        # Do not accept a candidate just because it replies to local ping.
-        ip -6 neigh replace "$gw" lladdr "$mac" dev "$WAN_DEV" nud stale
-        ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512
-        sleep 2
-
-        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
-           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-            log "Gateway replaced with $gw (mac $mac pinned, internet verified)"
-            return 0
-        fi
-
-        log "Gateway $gw responds locally but has no internet reachability, rejecting"
-    done
-
-    log "No gateway candidate passed internet reachability test"
-    return 1
-}
-
-in_cooldown() {
-    ELAPSED=$((NOW - LAST_RESTART))
-    [ "$LAST_RESTART" -gt 0 ] && [ "$ELAPSED" -lt "$WAN_RESTART_COOLDOWN" ]
-}
-
-do_wan_restart() {
-    WAN_RESTARTS=$((WAN_RESTARTS + 1))
-    echo "$WAN_RESTARTS" > "$WAN_RESTART_FILE"
-    echo "$NOW" > "$LAST_WAN_RESTART_FILE"
-    echo 0 > "$PREFIX_FAIL_FILE"
-    echo 0 > "$FAIL_FILE"
-    rm -f "$PREFIX_BACKOFF_FILE"
-
-    log "Full WAN restart #$WAN_RESTARTS of $WAN_RESTART_LIMIT"
-    ifdown wan6; ifdown wan
-    sleep 30
-    ifup wan; sleep 20; ifup wan6
-}
-
-notify_ont_powercycle() {
-    local restarts="$1"
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-
-    log "ACTION REQUIRED: IPv6 prefix not recovered after $restarts WAN restarts."
-    log "ACTION REQUIRED: Power off ONT, wait 15-30 minutes, then power on."
-    log "ACTION REQUIRED: Likely cause: stale DHCPv6 lease (NoPrefixAvail) on PLDT side."
-
-    [ -z "$DISCORD_WEBHOOK" ] && return 0
-
-    # Read router identity dynamically so this works on any device.
-    local payload
-    MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || grep -m1 'machine' /proc/cpuinfo | cut -d: -f2)
-    FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
-    HOST=$(uci get system.@system[0].hostname 2>/dev/null)
-
-    MODEL=${MODEL:-Unknown}
-    FW=${FW:-OpenWrt}
-    HOST=${HOST:-N/A}
-
-    MODEL_ESC=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
-
-    payload=$(cat <<PAYLOAD
-{
-  "embeds": [{
-    "title": "IPv6 Alert: ONT Power Cycle Required",
-    "color": 15158332,
-    "fields": [
-      { "name": "Router", "value": "$MODEL_ESC", "inline": true },
-      { "name": "Hostname", "value": "$HOST_ESC", "inline": true },
-      { "name": "WAN restarts", "value": "$restarts", "inline": true },
-      { "name": "Time", "value": "$timestamp", "inline": false },
-      { "name": "Likely cause", "value": "NoPrefixAvail: stale DHCPv6 lease on ISP side", "inline": false },
-      { "name": "Action required", "value": "Power off ONT. Wait 15-30 minutes. Power on.", "inline": false }
-    ],
-    "footer": { "text": "ipv6-watchdog on $FW_ESC" }
-  }]
-}
-PAYLOAD
-)
-
-    curl -s --connect-timeout 3 --max-time 8 \
-        -H "Content-Type: application/json" \
-        -X POST \
-        -d "$payload" \
-        "$DISCORD_WEBHOOK" >/dev/null 2>&1 \
-    && log "Discord alert sent" \
-    || log "Discord alert failed (curl error)"
-}
-
-try_128_bootstrap() {
-    log "Attempting /128 bootstrap to recover prefix delegation"
-
-    # Stage 'try' without committing so it never persists across reboots.
-    uci set network.wan6.reqaddress='try'
-    ubus call network reload >/dev/null 2>&1
-    ifdown wan6; sleep 5; ifup wan6
-
-    sleep 30
-
-    # Restore committed steady-state value and clear staged bootstrap delta.
-    # uci revert discards the staged 'try' and returns to the committed 'none'
-    # without committing from within the watchdog.
-    uci revert network.wan6.reqaddress
-    ubus call network reload >/dev/null 2>&1
-    ifdown wan6; sleep 5; ifup wan6
-
-    local i prefix
-    for i in $(seq 1 10); do
-        prefix=$(ubus call network.interface.wan6 status 2>/dev/null \
-            | jsonfilter -e '@["ipv6-prefix"][0].address')
-        [ -n "$prefix" ] && break
-        sleep 3
-    done
-
-    if [ -n "$prefix" ]; then
-        log "Prefix acquired via bootstrap: $prefix, verifying connectivity"
-        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1; then
-            if [ "$CLEANUP_WAN128" = "1" ]; then
-                ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
-                | while read -r addr; do
-                    ip -6 addr del "$addr" dev "$WAN_DEV"
-                    log "Removed temporary /128: $addr"
-                done
-            else
-                log "CLEANUP_WAN128 disabled, keeping WAN /128 addresses on $WAN_DEV"
-            fi
-            return 0
-        else
-            log "Prefix present but connectivity failed, keeping /128 for next cycle"
-            return 1
-        fi
-    else
-        log "Bootstrap failed, no prefix acquired after restore"
-        return 1
-    fi
-}
-
-# --- Main logic ---
-
-# Happy path: reset all state.
-if ipv6_ok; then
-    if [ -f "$ONT_FLAG" ] && [ -n "$DISCORD_WEBHOOK" ]; then
-        RECOVERY_PAYLOAD='{"embeds":[{"title":"IPv6 Recovered","color":3066993,"description":"IPv6 connectivity restored. All counters reset.","footer":{"text":"ipv6-watchdog"}}]}'
-        curl -s --connect-timeout 3 --max-time 8 -H "Content-Type: application/json" -X POST \
-            -d "$RECOVERY_PAYLOAD" "$DISCORD_WEBHOOK" >/dev/null 2>&1
-        log "IPv6 recovered after critical failure, Discord recovery notice sent"
-    fi
-
-    echo 0 > "$FAIL_FILE"
-    echo 0 > "$PREFIX_FAIL_FILE"
-    echo 0 > "$WAN_RESTART_FILE"
-    echo 0 > "$LAST_WAN_RESTART_FILE"
-    rm -f "$ONT_FLAG"
-    rm -f "$PREFIX_BACKOFF_FILE"
-    cleanup_deprecated_v6
-    exit 0
-fi
-
-# No prefix: escalating recovery path.
-if ! has_prefix; then
-
-    if [ "$WAN_RESTARTS" -ge "$WAN_RESTART_LIMIT" ]; then
-        if [ ! -f "$ONT_FLAG" ]; then
-            notify_ont_powercycle "$WAN_RESTARTS"
-            touch "$ONT_FLAG"
-        else
-            log "Awaiting manual ONT powercycle (restart limit reached), no action taken"
-        fi
-        exit 0
-    fi
-
-    if in_cooldown; then
-        ELAPSED=$((NOW - LAST_RESTART))
-        REMAINING=$((WAN_RESTART_COOLDOWN - ELAPSED))
-        log "In post-restart cooldown, ${REMAINING}s remaining, skipping"
-        exit 0
-    fi
-
-    if [ "$NOW" -lt "$PREFIX_NEXT" ]; then
-        REMAINING=$((PREFIX_NEXT - NOW))
-        log "Prefix backoff active, ${REMAINING}s remaining, skipping"
-        exit 0
-    fi
-
-    PREFIX_FAILS=$((PREFIX_FAILS + 1))
-    echo "$PREFIX_FAILS" > "$PREFIX_FAIL_FILE"
-
-    # Exponential backoff capped at 30 minutes:
-    # fail 1 = 10 min, fail 2 = 20 min, fail 3+ = 30 min cap.
-    BACKOFF_SECS=$(( 600 * (1 << (PREFIX_FAILS - 1)) ))
-    [ "$BACKOFF_SECS" -gt 1800 ] && BACKOFF_SECS=1800
-    echo $((NOW + BACKOFF_SECS)) > "$PREFIX_BACKOFF_FILE"
-
-    if [ "$PREFIX_FAILS" -eq 1 ]; then
-        log "No prefix (attempt $PREFIX_FAILS), restarting wan6, backoff ${BACKOFF_SECS}s"
-        ifdown wan6; sleep 10; ifup wan6
-
-    elif [ "$PREFIX_FAILS" -eq 2 ]; then
-        log "No prefix (attempt $PREFIX_FAILS), attempting DHCPv6 renew, backoff ${BACKOFF_SECS}s"
-        dhcpv6_renew
-
-    elif [ "$PREFIX_FAILS" -eq 3 ]; then
-        log "No prefix (attempt $PREFIX_FAILS), trying /128 bootstrap, backoff ${BACKOFF_SECS}s"
-        try_128_bootstrap
-
-    else
-        log "No prefix (attempt $PREFIX_FAILS), escalating to full WAN restart"
-        do_wan_restart
-    fi
-
-    exit 0
-fi
-
-# Has prefix but connectivity is broken: try gateway fix first.
-if fix_gateway; then
-    sleep 5
-    if ipv6_ok; then
-        echo 0 > "$FAIL_FILE"
-        echo 0 > "$PREFIX_FAIL_FILE"
-        cleanup_deprecated_v6
-        exit 0
-    fi
-fi
-
-FAILS=$((FAILS + 1))
-echo "$FAILS" > "$FAIL_FILE"
-log "Connectivity failure $FAILS (prefix present, gateway broken or route dead)"
-
-if [ "$FAILS" -ge 3 ]; then
-    log "3 consecutive connectivity failures, escalating to full WAN restart"
-    do_wan_restart
-fi
-```
+**Deploy from repo (recommended):**
 
 ```sh
-chmod +x /usr/bin/ipv6-watchdog
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6-watchdog \
+  -O /tmp/ipv6-watchdog.new && sh -n /tmp/ipv6-watchdog.new \
+  && mv /tmp/ipv6-watchdog.new /usr/bin/ipv6-watchdog \
+  && chmod +x /usr/bin/ipv6-watchdog && echo "watchdog deployed ok" \
+  || echo "syntax check failed, not deployed"
 ```
+
+The watchdog deploy downloads to a temp file first, runs a shell syntax check (`sh -n`), and only replaces the live script if the check passes. A bad download or interrupted transfer will not overwrite a working watchdog.
+
 ---
 
 ## Step 5 - Cron Setup
@@ -1159,6 +589,13 @@ LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
 [ -n "$LAN_IP" ] && arping -A -I br-lan -c 3 "$LAN_IP"
 SCRIPT
 chmod +x /etc/hotplug.d/iface/97-garp
+```
+
+Alternatively, if you have uploaded `97-garp` to your repo, deploy with:
+
+```sh
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/97-garp \
+  -O /etc/hotplug.d/iface/97-garp && chmod +x /etc/hotplug.d/iface/97-garp
 ```
 
 Add to sysupgrade preserve list:
@@ -1720,6 +1157,13 @@ When the suffix changes, the old address remains on `br-lan` as `deprecated` unt
 
 ## Changelog
 
+### v3.6
+- Added `wget` one-command deploy for `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, and optionally `97-garp` via raw GitHub URLs. Scripts download to temp file with `sh -n` syntax check before replacing live files (watchdog only). Cron setup remains a direct command with no file needed.
+- Added consolidated one-liner block in Quick Deploy section covering all scripts in order.
+- Fixed `try_128_bootstrap()` connectivity check: now accepts Google OR Cloudflare (`2606:4700:4700::1111`), matching `ipv6_ok()` and `fix_gateway()`. Previously only checked Google, which could cause a false connectivity failure during a transient Google-only outage.
+- Fixed `fix_gateway()` STEP 1: hoisted external reachability check once before the route-removal loop instead of re-running the same ping pair per route entry. Corrected comment from "unconditionally" to accurately describe conditional behavior.
+- Updated recovery Discord payload: now includes Router and Hostname as inline fields, with firmware shown in the footer, matching the identity style used by the ONT alert. Previously the recovery embed was a static string with no device identity, making it ambiguous across multiple routers.
+
 ### v3.5
 - Added `LAN_DEV="${LAN_DEV:-br-lan}"` configurable LAN bridge device variable, overridable via `/etc/ipv6-watchdog.conf` for portability across routers with different LAN bridge names.
 - Added `CLEANUP_WAN128="${CLEANUP_WAN128:-1}"` toggle to guard `/128` cleanup in `try_128_bootstrap()`. Set to `0` on routers where WAN `/128` is a legitimate persistent address rather than a temporary bootstrap artifact.
@@ -1782,11 +1226,3 @@ When the suffix changes, the old address remains on `br-lan` as `deprecated` unt
 ### v1.0
 - Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
 - Fixes PLDT `/128` IA_NA drop, dead RA gateway selection, wan6 startup race condition, and RA runtime override.
-
----
-
-## Disclaimer
-
-This guide is provided as-is based on real-world testing on a specific setup. Results may vary depending on your ISP configuration, firmware version, or hardware.
-
-Always back up your router configuration before making changes.
