@@ -172,21 +172,24 @@ cleanup_deprecated_v6() {
 
 fix_gateway() {
     # ===== STEP 1: Remove dead prefix-specific routes =====
+    # Remove prefix-specific default routes only when external IPv6 reachability is already broken.
     # PLDT installs a source-based route: 'default from <prefix>/56 via <gateway>'
-    # This takes priority over the generic default for LAN client traffic.
+    # which takes priority over the generic default for LAN client traffic.
     # If it points at the dead gateway, LAN clients have no IPv6 even when
-    # the generic default route is healthy. Remove it unconditionally first.
-    ip -6 route show default dev "$WAN_DEV" | grep 'from' | while read -r route; do
-        gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-        src=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
-        if [ -n "$gw" ] && [ -n "$src" ]; then
-            if ! ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && \
-               ! ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+    # the generic default route is healthy.
+    # Reachability is checked once here and reused for all matching routes to
+    # avoid redundant slow pings per route entry.
+    if ! ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && \
+       ! ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+        ip -6 route show default dev "$WAN_DEV" | grep 'from' | while read -r route; do
+            gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+            src=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
+            if [ -n "$gw" ] && [ -n "$src" ]; then
                 ip -6 route del default from "$src" via "$gw" dev "$WAN_DEV" 2>/dev/null && \
                     log "Removed dead prefix-specific route: default from $src via $gw"
             fi
-        fi
-    done
+        done
+    fi
 
     current=$(ip -6 route show default dev "$WAN_DEV" \
         | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
@@ -349,7 +352,8 @@ try_128_bootstrap() {
 
     if [ -n "$prefix" ]; then
         log "Prefix acquired via bootstrap: $prefix, verifying connectivity"
-        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1; then
+        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
+           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
             if [ "$CLEANUP_WAN128" = "1" ]; then
                 ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
                 | while read -r addr; do
@@ -375,7 +379,30 @@ try_128_bootstrap() {
 # Happy path: reset all state.
 if ipv6_ok; then
     if [ -f "$ONT_FLAG" ] && [ -n "$DISCORD_WEBHOOK" ]; then
-        RECOVERY_PAYLOAD='{"embeds":[{"title":"IPv6 Recovered","color":3066993,"description":"IPv6 connectivity restored. All counters reset.","footer":{"text":"ipv6-watchdog"}}]}'
+        REC_MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || grep -m1 'machine' /proc/cpuinfo | cut -d: -f2)
+        REC_HOST=$(uci get system.@system[0].hostname 2>/dev/null)
+        REC_FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
+        REC_MODEL=${REC_MODEL:-Unknown}
+        REC_HOST=${REC_HOST:-N/A}
+        REC_FW=${REC_FW:-OpenWrt}
+        REC_MODEL_ESC=$(printf '%s' "$REC_MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        REC_HOST_ESC=$(printf '%s' "$REC_HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        REC_FW_ESC=$(printf '%s' "$REC_FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        RECOVERY_PAYLOAD=$(cat <<RECPAYLOAD
+{
+  "embeds": [{
+    "title": "IPv6 Recovered",
+    "color": 3066993,
+    "description": "IPv6 connectivity restored. All counters reset.",
+    "fields": [
+      { "name": "Router", "value": "$REC_MODEL_ESC", "inline": true },
+      { "name": "Hostname", "value": "$REC_HOST_ESC", "inline": true }
+    ],
+    "footer": { "text": "ipv6-watchdog on $REC_FW_ESC" }
+  }]
+}
+RECPAYLOAD
+)
         curl -s --connect-timeout 3 --max-time 8 -H "Content-Type: application/json" -X POST \
             -d "$RECOVERY_PAYLOAD" "$DISCORD_WEBHOOK" >/dev/null 2>&1
         log "IPv6 recovered after critical failure, Discord recovery notice sent"
