@@ -1,0 +1,11 @@
+#!/bin/sh
+# /etc/hotplug.d/iface/97-garp
+# Sends a gratuitous ARP on br-lan ifup.
+# Forces LAN clients to update their ARP cache after a router swap,
+# preventing Layer 2 traffic loss when the MAC address changes.
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$DEVICE" = "br-lan" ] || exit 0
+sleep 3
+LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
+[ -n "$LAN_IP" ] && arping -A -I br-lan -c 3 "$LAN_IP"
