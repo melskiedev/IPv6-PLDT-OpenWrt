@@ -9,7 +9,7 @@
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
 
-> **Personal project, shared freely.** This started as a fix for my own PLDT Fiber setup and grew into something worth documenting. Feel free to use it, adapt it, or build on it. Everything here is based on behaviors I actually observed with PLDT in bridge mode — your ISP or hardware may behave differently. No guarantees, no warranties. Back up your router config before applying anything, and make sure you have physical or LAN access before making changes. You take full responsibility for your own setup.
+> **Personal use, shared openly.** This is my own home network fix that I'm sharing in case it helps someone else. I run this on my own routers daily. Use it at your own risk, adapt it as needed, and always take a sysupgrade backup before applying anything.
 
 ---
 
@@ -127,13 +127,13 @@ Good: returns at least one line confirming the renew tier is present.
 - [Step 4 - IPv6 Watchdog](#step-4---ipv6-watchdog)
 - [Step 5 - Cron Setup](#step-5---cron-setup)
 - [Step 6 - Gratuitous ARP (Router Swap Recovery)](#step-6---gratuitous-arp-router-swap-recovery)
-- [Optional: Discord Notifications](#optional-discord-notifications)
 - [Troubleshooting and Debug Commands](#troubleshooting-and-debug-commands)
 - [Validated Behavior](#validated-behavior)
 - [Final Result](#final-result)
 - [Preserving Scripts Across Firmware Upgrades](#preserving-scripts-across-firmware-upgrades)
 - [Known Edge Cases](#known-edge-cases)
 - [Advanced Notes: DUID and ULA](#advanced-notes-duid-and-ula)
+- [Optional: Discord Notifications](#optional-discord-notifications)
 
 ---
 
@@ -622,175 +622,6 @@ ACTION=ifup DEVICE=br-lan /etc/hotplug.d/iface/97-garp
 
 ---
 
-## Optional: Discord Notifications
-
-This section is entirely optional. The core IPv6 fix works without it. If you skip this section, the watchdog still self-heals and logs everything locally via `logread`.
-
-If you want real-time visibility on your phone or desktop, you can wire up two Discord webhook channels.
-
-**What you get:**
-
-| Channel | What it receives |
-|---|---|
-| `#ipv6-alerts` | ONT powercycle alert (red embed, once per incident) and recovery notice (green embed) |
-| `#ipv6-logs` | All tagged syslog lines in real time: gateway fixes, prefix failures, bootstrap attempts, cooldown skips, WAN restarts |
-
-**Prerequisite: install curl**
-
-```sh
-apk update && apk add curl
-```
-
-### Step A - Create the config file
-
-**File:** `/etc/ipv6-watchdog.conf`
-
-```sh
-# Primary webhook: ONT alerts and recovery notices only.
-DISCORD_WEBHOOK="https://discord.com/api/webhooks/YOUR_ALERTS_WEBHOOK_HERE"
-
-# Log webhook: all tagged syslog lines in real time.
-# Falls back to DISCORD_WEBHOOK if unset.
-DISCORD_LOG_WEBHOOK="https://discord.com/api/webhooks/YOUR_LOGS_WEBHOOK_HERE"
-```
-
-Keep this file out of public repositories as the webhook URLs are secrets.
-
-To create Discord webhooks: open your server, go to Server Settings, then Integrations, then Webhooks, and create one webhook per channel.
-
-### Step B - Create the log forwarder daemon
-
-**File:** `/usr/bin/ipv6-discord-logger`
-
-Tails `logread -f` and forwards any line tagged with your script names to Discord. No existing scripts need to be modified. Any future scripts using `logger -t` with a watched tag are picked up automatically.
-
-```sh
-#!/bin/sh
-# /usr/bin/ipv6-discord-logger
-# Tails syslog and forwards tagged entries to a Discord webhook.
-# Managed by procd via /etc/init.d/ipv6-discord-logger.
-
-LOGTAG="discord-logger"
-CONF="/etc/ipv6-watchdog.conf"
-
-[ -f "$CONF" ] && . "$CONF"
-
-[ -z "$DISCORD_LOG_WEBHOOK" ] && DISCORD_LOG_WEBHOOK="$DISCORD_WEBHOOK"
-
-[ -z "$DISCORD_LOG_WEBHOOK" ] && {
-    logger -t "$LOGTAG" "ERROR: No webhook configured in $CONF, exiting"
-    exit 1
-}
-
-# Syslog tags to forward. Pipe-separated for grep -E.
-WATCH_TAGS="ipv6-setup|ipv6-watchdog|discord-logger"
-
-color_for() {
-    case "$1" in
-        *"ACTION REQUIRED"*)            echo 15158332 ;;  # red
-        *"ERROR"*)                       echo 15158332 ;;  # red
-        *"WARN"*)                        echo 16744272 ;;  # orange
-        *"recovered"*|*"Recovered"*)     echo 3066993  ;;  # green
-        *"bootstrap"*|*"restart"*)       echo 16744272 ;;  # orange
-        *)                               echo 9807270  ;;  # gray
-    esac
-}
-
-logger -t "$LOGTAG" "Log forwarder started, watching: $WATCH_TAGS"
-
-logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r line; do
-    COLOR=$(color_for "$line")
-    TIMESTAMP=$(date '+%b %d %Y %I:%M:%S %p')
-    # Strip syslog prefix, forward only the actual log message.
-    MSG=$(echo "$line" | cut -d' ' -f8-)
-    HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
-
-    # Escape backslashes and double quotes for JSON safety.
-    SAFE=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
-
-    PAYLOAD=$(cat <<EOF
-{
-  "embeds": [{
-    "description": "\`\`\`$SAFE\`\`\`",
-    "color": $COLOR,
-    "footer": { "text": "$HOST $TIMESTAMP" }
-  }]
-}
-EOF
-)
-
-    curl -s \
-        -H "Content-Type: application/json" \
-        -X POST \
-        -d "$PAYLOAD" \
-        "$DISCORD_LOG_WEBHOOK" >/dev/null 2>&1
-
-    # Discord allows 5 requests per 2 seconds per webhook.
-    # Sleep 1s between posts to stay under the limit during log bursts.
-    sleep 1
-done
-```
-
-```sh
-chmod +x /usr/bin/ipv6-discord-logger
-```
-
-### Step C - Create the init.d service
-
-**File:** `/etc/init.d/ipv6-discord-logger`
-
-```sh
-#!/bin/sh /etc/rc.common
-
-START=99
-STOP=10
-USE_PROCD=1
-
-start_service() {
-    procd_open_instance
-    procd_set_param command /usr/bin/ipv6-discord-logger
-    procd_set_param respawn 30 5 0
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    procd_close_instance
-}
-```
-
-```sh
-chmod +x /etc/init.d/ipv6-discord-logger
-/etc/init.d/ipv6-discord-logger enable
-/etc/init.d/ipv6-discord-logger start
-```
-
-### Step D - Verify
-
-```sh
-ps | grep ipv6-discord-logger
-logread | grep discord-logger
-```
-
-You should see the process running and a `Log forwarder started` line in the logs. Send a test message to confirm the pipe is working:
-
-```sh
-logger -t ipv6-watchdog "Test message from router"
-```
-
-This should appear in `#ipv6-logs` within a few seconds.
-
-### Discord sysupgrade additions
-
-If using Discord notifications, add these to your preserve list in addition to the core files:
-
-```sh
-cat >> /etc/sysupgrade.conf << 'EOF'
-/usr/bin/ipv6-discord-logger
-/etc/init.d/ipv6-discord-logger
-/etc/ipv6-watchdog.conf
-EOF
-```
-
----
-
 ## Troubleshooting and Debug Commands
 
 ### ICMPv6 and firewall
@@ -1165,7 +996,101 @@ When the suffix changes, the old address remains on `br-lan` as `deprecated` unt
 
 ---
 
+## Optional: Discord Notifications
+
+This section is entirely optional. The core IPv6 fix works without it. If you skip this section, the watchdog still self-heals and logs everything locally via `logread`.
+
+If you want real-time visibility on your phone or desktop, you can wire up two Discord webhook channels.
+
+**What you get:**
+
+| Channel | What it receives |
+|---|---|
+| `#ipv6-alerts` | ONT powercycle alert (red embed, once per incident) and recovery notice (green embed) |
+| `#ipv6-logs` | All tagged syslog lines in real time: gateway fixes, prefix failures, bootstrap attempts, cooldown skips, WAN restarts |
+
+**Prerequisite: install curl**
+
+```sh
+apk update && apk add curl
+```
+
+### Step A - Create the config file
+
+**File:** `/etc/ipv6-watchdog.conf`
+
+```sh
+# Primary webhook: ONT alerts and recovery notices only.
+DISCORD_WEBHOOK="https://discord.com/api/webhooks/YOUR_ALERTS_WEBHOOK_HERE"
+
+# Log webhook: all tagged syslog lines in real time.
+# Falls back to DISCORD_WEBHOOK if unset.
+DISCORD_LOG_WEBHOOK="https://discord.com/api/webhooks/YOUR_LOGS_WEBHOOK_HERE"
+```
+
+Keep this file out of public repositories as the webhook URLs are secrets.
+
+To create Discord webhooks: open your server, go to Server Settings, then Integrations, then Webhooks, and create one webhook per channel.
+
+### Step B - Deploy the log forwarder
+
+**File:** [`ipv6-discord-logger`](ipv6-discord-logger) → `/usr/bin/ipv6-discord-logger`
+
+Tails `logread -f` and forwards any line tagged with your script names to Discord. No existing scripts need to be modified. Any future scripts using `logger -t` with a watched tag are picked up automatically.
+
+```sh
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6-discord-logger \
+  -O /usr/bin/ipv6-discord-logger && chmod +x /usr/bin/ipv6-discord-logger
+```
+
+### Step C - Deploy the init.d service
+
+**File:** [`ipv6-discord-logger.init`](ipv6-discord-logger.init) → `/etc/init.d/ipv6-discord-logger`
+
+Manages the log forwarder as a procd service with automatic restart. Includes `stop_service` and `killall` guards to prevent duplicate logger instances from accumulating across restarts.
+
+```sh
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6-discord-logger.init \
+  -O /etc/init.d/ipv6-discord-logger && chmod +x /etc/init.d/ipv6-discord-logger
+/etc/init.d/ipv6-discord-logger enable
+/etc/init.d/ipv6-discord-logger start
+```
+
+### Step D - Verify
+
+```sh
+ps | grep ipv6-discord-logger
+logread | grep discord-logger
+```
+
+You should see the process running and a `Log forwarder started` line in the logs. Send a test message to confirm the pipe is working:
+
+```sh
+logger -t ipv6-watchdog "Test message from router"
+```
+
+This should appear in `#ipv6-logs` within a few seconds.
+
+### Discord sysupgrade additions
+
+If using Discord notifications, add these to your preserve list in addition to the core files:
+
+```sh
+cat >> /etc/sysupgrade.conf << 'EOF'
+/usr/bin/ipv6-discord-logger
+/etc/init.d/ipv6-discord-logger
+/etc/ipv6-watchdog.conf
+EOF
+```
+
+---
+
 ## Changelog
+
+### v3.7
+- Fixed `ipv6-discord-logger` MSG extraction: added `sed 's/^[^:]*: //'` after `cut` to strip the syslog tag prefix (e.g. `ipv6-watchdog:`) from Discord message bodies. Previously the tag appeared in the forwarded message because `logger -t` embeds it in the syslog line at field 8.
+- Updated `ipv6-discord-logger` `WATCH_TAGS`: removed `tailscale-watchdog` and `ipv6-prefix` which belong to separate projects outside this repo. Correct set is `ipv6-setup|ipv6-watchdog|discord-logger`.
+- Updated `/etc/init.d/ipv6-discord-logger`: added `stop_service()` block with `killall` to clean up stale `logread -f` processes on stop, and added the same `killall` guards at the start of `start_service()` to prevent duplicate logger instances from accumulating across restarts.
 
 ### v3.6
 - Added `wget` one-command deploy for `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, and optionally `97-garp` via raw GitHub URLs. Scripts download to temp file with `sh -n` syntax check before replacing live files (watchdog only). Cron setup remains a direct command with no file needed.
