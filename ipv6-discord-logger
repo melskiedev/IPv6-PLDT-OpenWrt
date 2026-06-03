@@ -20,7 +20,9 @@ CONF="/etc/ipv6-watchdog.conf"
 }
 
 # Syslog tags to forward. Pipe-separated for grep -E.
-WATCH_TAGS="ipv6-setup|ipv6-watchdog|discord-logger"
+# Override in /etc/ipv6-watchdog.conf to add tags from other scripts
+# (e.g. WATCH_TAGS="ipv6-setup|ipv6-watchdog|discord-logger|tailscale-watchdog|ipv6-prefix").
+WATCH_TAGS="${WATCH_TAGS:-ipv6-setup|ipv6-watchdog|discord-logger}"
 
 color_for() {
     case "$1" in
@@ -33,17 +35,31 @@ color_for() {
     esac
 }
 
+# Strip only the known syslog tag prefix from the message body.
+# Reads WATCH_TAGS dynamically so adding tags to the conf file
+# automatically updates both grep filtering and message extraction.
+extract_msg() {
+    local line="$1"
+    local tag prefix
+    for tag in $(echo "$WATCH_TAGS" | tr '|' ' '); do
+        prefix="${tag}: "
+        case "$line" in
+            *"$prefix"*)
+                printf '%s\n' "${line#*${prefix}}"
+                return
+            ;;
+        esac
+    done
+    printf '%s\n' "$line"
+}
+
 logger -t "$LOGTAG" "Log forwarder started, watching: $WATCH_TAGS"
 
 logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r line; do
     COLOR=$(color_for "$line")
     TIMESTAMP=$(date '+%b %d %Y %I:%M:%S %p')
 
-    # Strip syslog header (day-of-week, date with optional double space for single-digit days,
-    # time, year, facility, hostname) then strip the tag prefix (e.g. "ipv6-watchdog: ").
-    # The *[^ ]* absorbs the extra space that syslog inserts before single-digit day numbers.
-    MSG=$(echo "$line" | sed 's/^[^ ]* [^ ]* *[^ ]* [^ ]* [^ ]* [^ ]* [^ ]* //' \
-        | sed 's/^[^:]*: //')
+    MSG=$(extract_msg "$line")
 
     # Escape backslashes and double quotes for JSON safety.
     SAFE=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
