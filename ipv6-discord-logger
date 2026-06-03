@@ -69,7 +69,7 @@ logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r
     PAYLOAD=$(cat <<PAYLOAD
 {
   "embeds": [{
-    "description": "\`\`\`$SAFE\`\`\`",
+    "description": "\`\`\`\n$SAFE\n\`\`\`",
     "color": $COLOR,
     "footer": { "text": "$HOST $TIMESTAMP" }
   }]
