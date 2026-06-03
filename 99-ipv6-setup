@@ -1,5 +1,6 @@
 #!/bin/sh
 # /etc/hotplug.d/iface/99-ipv6-setup
+# Version: 3.6
 # IPv6 route fix engine. Runs on wan6 ifup.
 # Selects the working gateway, pins its MAC, installs the default route, and removes the /128.
 
@@ -133,7 +134,7 @@ else
     [ -n "$v128" ] && log "Keeping /128 $v128 as fallback"
 fi
 
-log "=== setup complete ==="
+log "IPv6 setup complete"
 
 # ===== VERIFY LAN RA CONFIG =====
 # Checks that odhcpd is configured correctly for IPv6 RA and DHCPv6 on LAN.
