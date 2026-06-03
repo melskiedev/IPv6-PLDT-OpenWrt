@@ -39,8 +39,11 @@ logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r
     COLOR=$(color_for "$line")
     TIMESTAMP=$(date '+%b %d %Y %I:%M:%S %p')
 
-    # Strip syslog tag prefix (e.g. "ipv6-watchdog: ") so it does not appear in Discord messages.
-    MSG=$(echo "$line" | cut -d' ' -f8- | sed 's/^[^:]*: //')
+    # Strip syslog header (day-of-week, date with optional double space for single-digit days,
+    # time, year, facility, hostname) then strip the tag prefix (e.g. "ipv6-watchdog: ").
+    # The *[^ ]* absorbs the extra space that syslog inserts before single-digit day numbers.
+    MSG=$(echo "$line" | sed 's/^[^ ]* [^ ]* *[^ ]* [^ ]* [^ ]* [^ ]* [^ ]* //' \
+        | sed 's/^[^:]*: //')
 
     # Escape backslashes and double quotes for JSON safety.
     SAFE=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
