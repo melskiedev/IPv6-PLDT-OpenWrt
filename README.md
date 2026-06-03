@@ -1043,6 +1043,18 @@ wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6
   -O /usr/bin/ipv6-discord-logger && chmod +x /usr/bin/ipv6-discord-logger
 ```
 
+The default `WATCH_TAGS` covers this repo's scripts only. To forward logs from additional scripts (e.g. `tailscale-watchdog`, `ipv6-prefix`), add this to `/etc/ipv6-watchdog.conf`:
+
+```sh
+WATCH_TAGS="ipv6-setup|ipv6-watchdog|tailscale-watchdog|discord-logger|ipv6-prefix"
+```
+
+Then restart the logger to pick up the change:
+
+```sh
+/etc/init.d/ipv6-discord-logger restart
+```
+
 ### Step C - Deploy the init.d service
 
 **File:** [`init.d-ipv6-discord-logger`](init.d-ipv6-discord-logger) → `/etc/init.d/ipv6-discord-logger`
@@ -1088,9 +1100,8 @@ EOF
 ## Changelog
 
 ### v3.7
-- Fixed `ipv6-discord-logger` MSG extraction: replaced `cut -d' ' -f8-` with a `sed`-based header strip that correctly handles syslog's double space before single-digit day numbers (e.g. `Jun  3`). The old `cut` approach caused messages to split across lines on single-digit days. Tag prefix stripping (`sed 's/^[^:]*: //'`) retained.
-- Updated `ipv6-discord-logger` `WATCH_TAGS`: removed `tailscale-watchdog` and `ipv6-prefix` which belong to separate projects outside this repo. Correct set is `ipv6-setup|ipv6-watchdog|discord-logger`.
-- Updated `/etc/init.d/ipv6-discord-logger`: added `stop_service()` block with `killall` to clean up stale `logread -f` processes on stop, and added the same `killall` guards at the start of `start_service()` to prevent duplicate logger instances from accumulating across restarts.
+- Fixed `ipv6-discord-logger` MSG extraction: replaced `cut`-based field splitting and generic `sed` strip with an `extract_msg()` function that strips only known syslog tag prefixes. The old approach stripped legitimate message content like `WAN device:` and `LLA ready:` on single-digit syslog days (e.g. `Jun  3`) due to field count shifting.
+- Made `WATCH_TAGS` configurable via `/etc/ipv6-watchdog.conf`. Repo default is `ipv6-setup|ipv6-watchdog|discord-logger`. Override in conf to add tags from other scripts (e.g. `tailscale-watchdog`, `ipv6-prefix`) without modifying the script. `extract_msg()` reads `WATCH_TAGS` dynamically so both grep filtering and tag stripping stay in sync automatically.
 - Added `ipv6-discord-logger` and `init.d-ipv6-discord-logger` as separate repo files with wget deploy commands. Optional Discord section moved to the bottom of the README before Changelog.
 - Updated disclaimer to personal use tone.
 
