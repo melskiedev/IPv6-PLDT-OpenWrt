@@ -53,6 +53,22 @@ extract_msg() {
     printf '%s\n' "$line"
 }
 
+# Return the matched syslog tag for use in the Discord footer.
+extract_tag() {
+    local line="$1"
+    local tag prefix
+    for tag in $(echo "$WATCH_TAGS" | tr '|' ' '); do
+        prefix="${tag}: "
+        case "$line" in
+            *"$prefix"*)
+                printf '%s\n' "$tag"
+                return
+            ;;
+        esac
+    done
+    printf '%s\n' "unknown"
+}
+
 logger -t "$LOGTAG" "Log forwarder started, watching: $WATCH_TAGS"
 
 logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r line; do
@@ -60,6 +76,7 @@ logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r
     TIMESTAMP=$(date '+%b %d %Y %I:%M:%S %p')
 
     MSG=$(extract_msg "$line")
+    SRC_TAG=$(extract_tag "$line")
 
     # Escape backslashes and double quotes for JSON safety.
     SAFE=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -71,7 +88,7 @@ logread -f 2>/dev/null | grep -E "$WATCH_TAGS" | grep -v "crond" | while read -r
   "embeds": [{
     "description": "\`\`\`\n$SAFE\n\`\`\`",
     "color": $COLOR,
-    "footer": { "text": "$HOST $TIMESTAMP" }
+    "footer": { "text": "$HOST | $SRC_TAG | $TIMESTAMP" }
   }]
 }
 PAYLOAD
