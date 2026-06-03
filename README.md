@@ -1045,12 +1045,12 @@ wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6
 
 ### Step C - Deploy the init.d service
 
-**File:** [`ipv6-discord-logger.init`](ipv6-discord-logger.init) → `/etc/init.d/ipv6-discord-logger`
+**File:** [`init.d-ipv6-discord-logger`](init.d-ipv6-discord-logger) → `/etc/init.d/ipv6-discord-logger`
 
 Manages the log forwarder as a procd service with automatic restart. Includes `stop_service` and `killall` guards to prevent duplicate logger instances from accumulating across restarts.
 
 ```sh
-wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6-discord-logger.init \
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/init.d-ipv6-discord-logger \
   -O /etc/init.d/ipv6-discord-logger && chmod +x /etc/init.d/ipv6-discord-logger
 /etc/init.d/ipv6-discord-logger enable
 /etc/init.d/ipv6-discord-logger start
@@ -1088,9 +1088,11 @@ EOF
 ## Changelog
 
 ### v3.7
-- Fixed `ipv6-discord-logger` MSG extraction: added `sed 's/^[^:]*: //'` after `cut` to strip the syslog tag prefix (e.g. `ipv6-watchdog:`) from Discord message bodies. Previously the tag appeared in the forwarded message because `logger -t` embeds it in the syslog line at field 8.
+- Fixed `ipv6-discord-logger` MSG extraction: replaced `cut -d' ' -f8-` with a `sed`-based header strip that correctly handles syslog's double space before single-digit day numbers (e.g. `Jun  3`). The old `cut` approach caused messages to split across lines on single-digit days. Tag prefix stripping (`sed 's/^[^:]*: //'`) retained.
 - Updated `ipv6-discord-logger` `WATCH_TAGS`: removed `tailscale-watchdog` and `ipv6-prefix` which belong to separate projects outside this repo. Correct set is `ipv6-setup|ipv6-watchdog|discord-logger`.
 - Updated `/etc/init.d/ipv6-discord-logger`: added `stop_service()` block with `killall` to clean up stale `logread -f` processes on stop, and added the same `killall` guards at the start of `start_service()` to prevent duplicate logger instances from accumulating across restarts.
+- Added `ipv6-discord-logger` and `init.d-ipv6-discord-logger` as separate repo files with wget deploy commands. Optional Discord section moved to the bottom of the README before Changelog.
+- Updated disclaimer to personal use tone.
 
 ### v3.6
 - Added `wget` one-command deploy for `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, and optionally `97-garp` via raw GitHub URLs. Scripts download to temp file with `sh -n` syntax check before replacing live files (watchdog only). Cron setup remains a direct command with no file needed.
