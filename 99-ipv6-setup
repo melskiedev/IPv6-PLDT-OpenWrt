@@ -63,13 +63,13 @@ for gw in $(
 ); do
     state=$(ip -6 neigh show dev "$WAN_DEV" | awk -v g="$gw" '$1==g{print $NF}')
     mac=$(ip -6 neigh show dev "$WAN_DEV" | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
-    log "  Gateway $gw -- state: ${state:-unknown} mac: ${mac:-unknown}"
+    log "Gateway $gw -- state: ${state:-unknown} mac: ${mac:-unknown}"
 
     ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1 || {
-        log "  Gateway $gw -- probe FAILED"
+        log "Gateway $gw -- probe FAILED"
         continue
     }
-    log "  Gateway $gw -- probe OK"
+    log "Gateway $gw -- probe OK"
 
     if [ -z "$mac" ]; then
         sleep 2
@@ -77,11 +77,11 @@ for gw in $(
             | awk -v g="$gw" '$1==g && /lladdr/{print $3}')
     fi
 
-    [ -z "$mac" ] && { log "  Gateway $gw -- MAC not resolved, skipping"; continue; }
+    [ -z "$mac" ] && { log "Gateway $gw -- MAC not resolved, skipping"; continue; }
 
     BEST_GW="$gw"
     BEST_MAC="$mac"
-    log "  Gateway $gw -- selected (mac $BEST_MAC)"
+    log "Gateway $gw -- selected (mac $BEST_MAC)"
     break
 done
 
