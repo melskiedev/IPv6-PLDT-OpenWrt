@@ -931,7 +931,8 @@ Once you have the value, pin it:
 
 ```sh
 # Replace with your actual DUID value
-uci set network.wan6.clientid='00041cfaf8bebab84698b8e85b9717e138b1'
+# Example only. Replace with your router's own DUID. Do not copy another router's DUID.
+uci set network.wan6.clientid='0004xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 uci commit network
 ```
 
