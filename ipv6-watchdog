@@ -57,7 +57,6 @@ ONT_FLAG="$STATE_DIR/ont_notified"
 FAILS=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
 PREFIX_FAILS=$(cat "$PREFIX_FAIL_FILE" 2>/dev/null || echo 0)
 WAN_RESTARTS=$(cat "$WAN_RESTART_FILE" 2>/dev/null || echo 0)
-LAST_RESTART=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null || echo 0)
 PREFIX_NEXT=$(cat "$PREFIX_BACKOFF_FILE" 2>/dev/null || echo 0)
 NOW=$(date +%s)
 
@@ -254,8 +253,26 @@ fix_gateway() {
 }
 
 in_cooldown() {
-    ELAPSED=$((NOW - LAST_RESTART))
-    [ "$LAST_RESTART" -gt 0 ] && [ "$ELAPSED" -lt "$WAN_RESTART_COOLDOWN" ]
+    # Use -s to guard against empty file (written as empty on state reset).
+    # Re-read the value here so arithmetic is never performed on an empty string.
+    [ -s "$LAST_WAN_RESTART_FILE" ] || return 1
+    local last
+    last=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null || echo 0)
+    [ "$last" -gt 0 ] || return 1
+    [ "$((NOW - last))" -lt "$WAN_RESTART_COOLDOWN" ]
+}
+
+# Centralized state reset called on all recovery success paths.
+# Resets all counters and removes transient flag files.
+# LAST_WAN_RESTART_FILE is written as empty (not 0) so in_cooldown() can
+# distinguish "never restarted" from a real timestamp via -s check.
+reset_recovery_state() {
+    echo 0 > "$FAIL_FILE"
+    echo 0 > "$PREFIX_FAIL_FILE"
+    echo 0 > "$WAN_RESTART_FILE"
+    : > "$LAST_WAN_RESTART_FILE"
+    rm -f "$ONT_FLAG"
+    rm -f "$PREFIX_BACKOFF_FILE"
 }
 
 do_wan_restart() {
@@ -333,22 +350,42 @@ try_128_bootstrap() {
     ubus call network reload >/dev/null 2>&1
     ifdown wan6; sleep 5; ifup wan6
 
-    sleep 30
-
-    # Restore committed steady-state value and clear staged bootstrap delta.
-    # uci revert discards the staged 'try' and returns to the committed 'none'
-    # without committing from within the watchdog.
-    uci revert network.wan6.reqaddress
-    ubus call network reload >/dev/null 2>&1
-    ifdown wan6; sleep 5; ifup wan6
-
+    # Wait for prefix while 'try' is still active.
+    # Check before reverting so the prefix acquisition window is not wasted.
+    # Using a while loop avoids a fork-per-iteration from seq on ash/BusyBox.
     local i prefix
-    for i in $(seq 1 10); do
+    i=0
+    while [ "$i" -lt 15 ]; do
+        i=$((i + 1))
         prefix=$(ubus call network.interface.wan6 status 2>/dev/null \
             | jsonfilter -e '@["ipv6-prefix"][0].address')
         [ -n "$prefix" ] && break
-        sleep 3
+        sleep 4
     done
+
+    # Always revert regardless of outcome. Never let 'try' persist past this function.
+    # uci revert discards the staged value and returns to the committed 'none'
+    # without committing from within the watchdog.
+    # ubus call network reload applies the revert; no second ifdown/ifup is needed.
+    # A second interface flap here would disrupt a prefix that was just acquired.
+    uci revert network.wan6.reqaddress
+    ubus call network reload >/dev/null 2>&1
+
+    # Brief settle delay to let the revert reload stabilize before re-checking.
+    [ -n "$prefix" ] && sleep 10
+
+    # Confirm the prefix survived the revert. On PLDT, PD is independent of IA_NA,
+    # so reverting reqaddress to 'none' should not withdraw the prefix. But since
+    # PLDT DHCPv6 behavior is non-standard, an explicit check is cheap insurance.
+    if [ -n "$prefix" ]; then
+        local post_revert_prefix
+        post_revert_prefix=$(ubus call network.interface.wan6 status 2>/dev/null \
+            | jsonfilter -e '@["ipv6-prefix"][0].address')
+        if [ -z "$post_revert_prefix" ]; then
+            log "Bootstrap prefix lost after reverting reqaddress, will retry next cycle"
+            return 1
+        fi
+    fi
 
     if [ -n "$prefix" ]; then
         log "Prefix acquired via bootstrap: $prefix, verifying connectivity"
@@ -357,19 +394,19 @@ try_128_bootstrap() {
             if [ "$CLEANUP_WAN128" = "1" ]; then
                 ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
                 | while read -r addr; do
-                    ip -6 addr del "$addr" dev "$WAN_DEV"
-                    log "Removed temporary /128: $addr"
+                    ip -6 addr del "$addr" dev "$WAN_DEV" 2>/dev/null && \
+                        log "Removed temporary /128: $addr"
                 done
             else
                 log "CLEANUP_WAN128 disabled, keeping WAN /128 addresses on $WAN_DEV"
             fi
             return 0
         else
-            log "Prefix present but connectivity failed, keeping /128 for next cycle"
+            log "Prefix present after bootstrap revert but connectivity failed, will retry next cycle"
             return 1
         fi
     else
-        log "Bootstrap failed, no prefix acquired after restore"
+        log "Bootstrap failed, no prefix acquired"
         return 1
     fi
 }
@@ -408,12 +445,7 @@ RECPAYLOAD
         log "IPv6 recovered after critical failure, Discord recovery notice sent"
     fi
 
-    echo 0 > "$FAIL_FILE"
-    echo 0 > "$PREFIX_FAIL_FILE"
-    echo 0 > "$WAN_RESTART_FILE"
-    echo 0 > "$LAST_WAN_RESTART_FILE"
-    rm -f "$ONT_FLAG"
-    rm -f "$PREFIX_BACKOFF_FILE"
+    reset_recovery_state
     cleanup_deprecated_v6
     exit 0
 fi
@@ -432,8 +464,9 @@ if ! has_prefix; then
     fi
 
     if in_cooldown; then
-        ELAPSED=$((NOW - LAST_RESTART))
-        REMAINING=$((WAN_RESTART_COOLDOWN - ELAPSED))
+        last_restart=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null | tr -d '[:space:]')
+        REMAINING=$((WAN_RESTART_COOLDOWN - (NOW - last_restart)))
+        [ "$REMAINING" -lt 0 ] && REMAINING=0
         log "In post-restart cooldown, ${REMAINING}s remaining, skipping"
         exit 0
     fi
@@ -463,7 +496,10 @@ if ! has_prefix; then
 
     elif [ "$PREFIX_FAILS" -eq 3 ]; then
         log "No prefix (attempt $PREFIX_FAILS), trying /128 bootstrap, backoff ${BACKOFF_SECS}s"
-        try_128_bootstrap
+        if try_128_bootstrap; then
+            reset_recovery_state
+            cleanup_deprecated_v6
+        fi
 
     else
         log "No prefix (attempt $PREFIX_FAILS), escalating to full WAN restart"
@@ -477,8 +513,7 @@ fi
 if fix_gateway; then
     sleep 5
     if ipv6_ok; then
-        echo 0 > "$FAIL_FILE"
-        echo 0 > "$PREFIX_FAIL_FILE"
+        reset_recovery_state
         cleanup_deprecated_v6
         exit 0
     fi
@@ -491,4 +526,5 @@ log "Connectivity failure $FAILS (prefix present, gateway broken or route dead)"
 if [ "$FAILS" -ge 3 ]; then
     log "3 consecutive connectivity failures, escalating to full WAN restart"
     do_wan_restart
+    exit 0
 fi
