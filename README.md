@@ -254,7 +254,7 @@ Core components used by the scripts:
 
 - `odhcp6c` - DHCPv6 client (critical for prefix delegation)
 - `netifd` - network interface management and hotplug system
-- `busybox` - shell environment (`awk`, `grep`, `seq`, etc.)
+- `busybox` - shell environment (`awk`, `grep`, etc.)
 - `ip` - IPv6 routing and neighbor commands
 - `ubus` and `jsonfilter` - interface status and prefix detection
 - `ping6` - connectivity checks
@@ -494,9 +494,11 @@ Runs whenever `wan6` comes up. This is the authoritative startup fix. It ensures
 
 **LLA failure exit.** If no link-local address appears on the WAN interface after 20 seconds, the script exits immediately with a logged error rather than proceeding with an incomplete interface state.
 
-**Dual-target connectivity check.** Pings both Google (`2001:4860:4860::8888`) and Cloudflare (`2606:4700:4700::1111`) before removing the `/128`. Either succeeding is enough. This matches the watchdog's `ipv6_ok` function for consistent behavior across both startup and runtime paths.
+**Per-gateway internet reachability testing.** For each candidate gateway, the script installs the route temporarily and tests connectivity to both Google (`2001:4860:4860::8888`) and Cloudflare (`2606:4700:4700::1111`) before accepting the candidate. A gateway that responds locally but does not forward internet traffic is rejected and the next candidate is tried. This matches `fix_gateway()` in the watchdog and is the correct defense against PLDT's dead gateway failure mode.
 
-**Defers to watchdog on missing prefix.** If no prefix is assigned after 45 seconds, the script logs a warning and exits clean. The watchdog handles prefix recovery via the escalation ladder.
+**Lock mechanism.** Prevents overlapping executions on rapid `wan6` hotplug events using `flock` with `mkdir` fallback, matching the watchdog's approach. The script can run for over 2 minutes during gateway scan and WAN recovery.
+
+**Defers to watchdog on missing prefix.** If no prefix is assigned after 45 seconds, the script logs a warning and exits cleanly. Prefix recovery (DHCPv6 renew, /128 bootstrap, WAN restart escalation) is the watchdog's responsibility, not the hotplug script's.
 
 **Deploy:**
 
@@ -921,7 +923,7 @@ uci get network.wan6.clientid 2>/dev/null || \
     strings /var/lib/odhcp6c.*.clientid 2>/dev/null | head -1
 ```
 
-If the above returns empty, check the running odhcp6c process:
+Note: `strings` may not be available on all OpenWrt builds. If the command is not found, check the running odhcp6c process instead:
 
 ```sh
 cat /proc/$(pidof odhcp6c)/cmdline 2>/dev/null | tr '\0' '\n' | grep -A1 "\-c"
@@ -1102,6 +1104,8 @@ EOF
 
 ### v3.8
 
+**ipv6-watchdog:**
+
 - Fixed `try_128_bootstrap()` sequencing: prefix acquisition loop now runs before `uci revert`, so the check window is active while `reqaddress='try'` is still in effect. Removed the second `ifdown/ifup` flap after revert, which was disrupting a prefix that had just been acquired. `ubus call network reload` alone applies the revert without tearing the interface down again. Replaced `seq`-based loop with `while` loop and extended check window from ~30 seconds to 60 seconds.
 - Fixed `try_128_bootstrap()`: added post-revert prefix check after `uci revert` and settle delay to confirm the prefix survived the revert before proceeding to connectivity verification. On PLDT, PD and IA_NA are independent so this should always pass, but the check is cheap insurance against non-standard ISP behavior.
 - Fixed `fix_gateway()` success path: now resets all recovery counters including `WAN_RESTART_FILE`, `LAST_WAN_RESTART_FILE`, `ONT_FLAG`, and `PREFIX_BACKOFF_FILE`. Previously only `FAIL_FILE` and `PREFIX_FAIL_FILE` were reset, leaving stale WAN restart counts that could incorrectly advance a recovered router toward the ONT notification limit.
@@ -1111,6 +1115,21 @@ EOF
 - Cooldown log `REMAINING` calculation now reads the file directly with whitespace stripping and a negative-value guard, matching what `in_cooldown()` sees.
 - `/128` address removal in `try_128_bootstrap()` now gates the log line on successful deletion (`2>/dev/null &&`), consistent with how `cleanup_deprecated_v6()` handles address removal.
 - Explicit `exit 0` added after `do_wan_restart()` in the connectivity failure path. Every other action path in the script exits explicitly; this was the only implicit fall-through.
+
+**99-ipv6-setup (route fix engine):**
+
+- Added `flock`/`mkdir` lock to prevent overlapping hotplug executions on rapid `wan6` events. The script can run for over 2 minutes during gateway scan; without a lock, repeated `wan6` events could stack up concurrent instances.
+- Replaced `seq`-based loops with `while` loops for BusyBox ash portability, matching the watchdog pattern.
+- Implemented per-gateway internet reachability testing: installs each candidate route temporarily, tests Google and Cloudflare connectivity, accepts or rejects before moving to the next candidate. Matches `fix_gateway()` behavior in the watchdog. This is the behavior the README had claimed since v3.0 but was not actually implemented until now.
+- Added keyword-based `awk` route extraction using `via`/`from` field scanning to handle source-specific route formats correctly, replacing fixed field-position `awk '{print $3}'`.
+- Added `CLEANUP_WAN128` toggle sourced from `/etc/ipv6-watchdog.conf` for compatibility with non-PLDT ISPs where a WAN `/128` is a legitimate persistent address.
+- Fixed missing prefix handling: script now exits cleanly and defers prefix recovery to `ipv6-watchdog` instead of continuing into gateway selection with no prefix assigned.
+- Fixed competing route cleanup to preserve only the winning generic default route, removing source-specific routes pointing to other gateways to leave a clean route state.
+
+**ipv6-discord-logger:**
+
+- Added `--connect-timeout 3 --max-time 8` to `curl` to prevent hangs during network outages, matching the watchdog's Discord `curl` pattern. Without this, a Discord outage during a network failure blocked the log forwarding loop indefinitely.
+- Reordered `color_for()` patterns so `"Prefix acquired via bootstrap"` is colored green and `"Bootstrap failed"` is colored red, before the generic `"bootstrap"` orange rule. Previously both matched the orange catch-all.
 
 ### v3.7
 
@@ -1173,7 +1192,7 @@ EOF
 - Rewrote `fix_gateway()` to validate internet reachability per candidate gateway instead of trusting local link-local ping. PLDT gateways may respond locally but fail to forward internet traffic, so each candidate is temporarily installed and accepted only if external IPv6 reachability succeeds.
 - Added 120-second boot grace period to `ipv6-watchdog` to prevent Tier 0 from racing with `98-wan6-delay` and `99-ipv6-setup` during boot initialization.
 - `fix_gateway()` now removes dead PLDT prefix-specific routes before checking the generic default gateway.
-- `99-ipv6-setup` upgraded with explicit per-gateway internet reachability testing during boot.
+- `99-ipv6-setup` upgraded with dual-target connectivity check (Google + Cloudflare) before removing the `/128`. The check runs once after selecting the first locally-responsive gateway. Per-gateway internet reachability testing (install route, test, accept/reject per candidate) was added in v3.8.
 - Added `97-garp` hotplug script to send gratuitous ARP on `br-lan` ifup, forcing LAN clients to update ARP cache after router swap.
 - Updated `ipv6-discord-logger`: timestamp changed to 12-hour AM/PM format, syslog prefix stripped from embed, hostname shown in footer.
 - Improved wan6 startup delay: replaced 5s fixed delay with 15s and added forced `ifdown wan6` reset before delay to prevent DHCPv6 pending state at boot.
