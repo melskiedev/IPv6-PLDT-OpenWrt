@@ -1100,13 +1100,27 @@ EOF
 
 ## Changelog
 
+### v3.8
+
+- Fixed `try_128_bootstrap()` sequencing: prefix acquisition loop now runs before `uci revert`, so the check window is active while `reqaddress='try'` is still in effect. Removed the second `ifdown/ifup` flap after revert, which was disrupting a prefix that had just been acquired. `ubus call network reload` alone applies the revert without tearing the interface down again. Replaced `seq`-based loop with `while` loop and extended check window from ~30 seconds to 60 seconds.
+- Fixed `try_128_bootstrap()`: added post-revert prefix check after `uci revert` and settle delay to confirm the prefix survived the revert before proceeding to connectivity verification. On PLDT, PD and IA_NA are independent so this should always pass, but the check is cheap insurance against non-standard ISP behavior.
+- Fixed `fix_gateway()` success path: now resets all recovery counters including `WAN_RESTART_FILE`, `LAST_WAN_RESTART_FILE`, `ONT_FLAG`, and `PREFIX_BACKOFF_FILE`. Previously only `FAIL_FILE` and `PREFIX_FAIL_FILE` were reset, leaving stale WAN restart counts that could incorrectly advance a recovered router toward the ONT notification limit.
+- Added `reset_recovery_state()` helper function: centralizes the full counter reset used in the happy path and gateway fix success path, eliminating duplicated reset blocks.
+- Bootstrap success path now calls `reset_recovery_state()` and `cleanup_deprecated_v6()` immediately on return 0, consistent with all other recovery success paths. Previously stale `PREFIX_FAIL_FILE` and `PREFIX_BACKOFF_FILE` state persisted until the next cron tick.
+- `in_cooldown()` rewritten to be self-contained: reads `LAST_WAN_RESTART_FILE` internally rather than relying on a top-level variable. Uses `[ -s ]` to distinguish an empty file (written on state reset) from a real timestamp, eliminating the semantic ambiguity of using `0` as a sentinel.
+- Cooldown log `REMAINING` calculation now reads the file directly with whitespace stripping and a negative-value guard, matching what `in_cooldown()` sees.
+- `/128` address removal in `try_128_bootstrap()` now gates the log line on successful deletion (`2>/dev/null &&`), consistent with how `cleanup_deprecated_v6()` handles address removal.
+- Explicit `exit 0` added after `do_wan_restart()` in the connectivity failure path. Every other action path in the script exits explicitly; this was the only implicit fall-through.
+
 ### v3.7
+
 - Fixed `ipv6-discord-logger` MSG extraction: replaced `cut`-based field splitting and generic `sed` strip with an `extract_msg()` function that strips only known syslog tag prefixes. The old approach stripped legitimate message content like `WAN device:` and `LLA ready:` on single-digit syslog days (e.g. `Jun  3`) due to field count shifting.
 - Made `WATCH_TAGS` configurable via `/etc/ipv6-watchdog.conf`. Repo default is `ipv6-setup|ipv6-watchdog|discord-logger`. Override in conf to add tags from other scripts (e.g. `tailscale-watchdog`, `ipv6-prefix`) without modifying the script. `extract_msg()` reads `WATCH_TAGS` dynamically so both grep filtering and tag stripping stay in sync automatically.
 - Added `ipv6-discord-logger` and `init.d-ipv6-discord-logger` as separate repo files with wget deploy commands. Optional Discord section moved to the bottom of the README before Changelog.
 - Updated disclaimer to personal use tone.
 
 ### v3.6
+
 - Added `wget` one-command deploy for `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, and optionally `97-garp` via raw GitHub URLs. Scripts download to temp file with `sh -n` syntax check before replacing live files (watchdog only). Cron setup remains a direct command with no file needed.
 - Added consolidated one-liner block in Quick Deploy section covering all scripts in order.
 - Fixed `try_128_bootstrap()` connectivity check: now accepts Google OR Cloudflare (`2606:4700:4700::1111`), matching `ipv6_ok()` and `fix_gateway()`. Previously only checked Google, which could cause a false connectivity failure during a transient Google-only outage.
@@ -1114,6 +1128,7 @@ EOF
 - Updated recovery Discord payload: now includes Router and Hostname as inline fields, with firmware shown in the footer, matching the identity style used by the ONT alert. Previously the recovery embed was a static string with no device identity, making it ambiguous across multiple routers.
 
 ### v3.5
+
 - Added `LAN_DEV="${LAN_DEV:-br-lan}"` configurable LAN bridge device variable, overridable via `/etc/ipv6-watchdog.conf` for portability across routers with different LAN bridge names.
 - Added `CLEANUP_WAN128="${CLEANUP_WAN128:-1}"` toggle to guard `/128` cleanup in `try_128_bootstrap()`. Set to `0` on routers where WAN `/128` is a legitimate persistent address rather than a temporary bootstrap artifact.
 - Added `CLEANUP_DEPRECATED_LAN="${CLEANUP_DEPRECATED_LAN:-1}"` toggle to control deprecated LAN GUA cleanup behavior per deployment.
@@ -1123,22 +1138,26 @@ EOF
 - Updated Advanced Notes DUID section: pinning `network.wan6.clientid` is now documented as recommended practice for PLDT prefix stability, with capture instructions, per-router uniqueness warning, and sysupgrade guidance.
 
 ### v3.4
+
 - Added `flock`/`mkdir` lock fallback: when `flock` is unavailable, a `mkdir`-based lock is used with a `cleanup_lock` function and per-signal traps (`EXIT`, `INT 130`, `TERM 143`) for correct BusyBox ash behavior on OpenWrt images where `flock` may be absent.
 - Hardened `fix_gateway()` route parsing to keyword-based `via`/`from` extraction using `awk` loops, replacing fixed field positions that could break on non-standard route output shapes.
 - Fixed `try_128_bootstrap()` restore: replaced `uci set network.wan6.reqaddress='none'` with `uci revert network.wan6.reqaddress` to correctly discard the staged `try` delta without issuing a commit from within the watchdog.
 - Added `--connect-timeout 3 --max-time 8` to both Discord `curl` calls to prevent network stalls from holding the lock and blocking cron cycles during outage conditions.
 
 ### v3.3
+
 - Fixed `fix_gateway()` false failure counter: healthy-gateway path now resets `FAIL_FILE` and returns `0` instead of `1`, preventing a spurious `Connectivity failure 1` log entry after the current gateway was already confirmed reachable.
 - Fixed `fix_gateway()` NDP timing: candidate list is now built after the all-routers multicast probe instead of before it, so gateways that respond to `ff02::2` are captured in the initial scan. Candidates are rebuilt a second time after unicast probes, giving NDP a full two-pass window to populate MAC entries before the scan runs.
 - Added direct unicast probe to each candidate gateway between the multicast probe and the final scan, triggering per-gateway neighbor solicitation to reduce false "no MAC, skipping" cycles after PLDT prefix changes.
 - Added `echo 0 > "$FAIL_FILE"` to the successful gateway replacement path inside the scan loop, ensuring the counter resets immediately on success.
 
 ### v3.2
+
 - Added all-routers multicast probe (`ping6 ff02::2`) inside `fix_gateway()` before the candidate scan, refreshing NDP/MAC state to reduce false "no MAC" skip results after PLDT RA/NDP flaps.
 - Expanded `fix_gateway()` candidate loop to combine neighbor table (`router` flag entries) and existing route table gateways, matching the dual-source approach already used in `99-ipv6-setup`. Prevents overlooking a gateway that exists in the route table but is not currently flagged `router` in the neighbor table.
 
 ### v3.1
+
 - Updated Step 1 UCI config: `device='eth1'` changed to `device='@wan'` to tie `wan6` to the `wan` interface lifecycle rather than a hardcoded device name.
 - Added `force_link='1'`, `multipath='off'`, and `sourcefilter='0'` to `network.wan6`. These were confirmed required during multi-unit replication testing.
 - Added `network.globals` settings: `rpfilter='0'` and `ipv6_sourcefilter='1'`.
@@ -1150,6 +1169,7 @@ EOF
 - Added LAN clients IPv6 row to Final Result table.
 
 ### v3.0
+
 - Rewrote `fix_gateway()` to validate internet reachability per candidate gateway instead of trusting local link-local ping. PLDT gateways may respond locally but fail to forward internet traffic, so each candidate is temporarily installed and accepted only if external IPv6 reachability succeeds.
 - Added 120-second boot grace period to `ipv6-watchdog` to prevent Tier 0 from racing with `98-wan6-delay` and `99-ipv6-setup` during boot initialization.
 - `fix_gateway()` now removes dead PLDT prefix-specific routes before checking the generic default gateway.
@@ -1159,6 +1179,7 @@ EOF
 - Improved wan6 startup delay: replaced 5s fixed delay with 15s and added forced `ifdown wan6` reset before delay to prevent DHCPv6 pending state at boot.
 
 ### v2.0
+
 - Added layered `ipv6_ok` validation: checks prefix, default route, and reachability in sequence. Logs specific failure reason for faster debugging.
 - Added `dhcpv6_renew` as new escalation tier between wan6 restart and `/128` bootstrap. Sends DHCPv6 Renew to ISP without tearing down interface state.
 - Escalation ladder expanded from three to four tiers: wan6 restart, DHCPv6 renew, `/128` bootstrap, full WAN restart.
@@ -1173,5 +1194,6 @@ EOF
 - Replaced wan6 already-up guard with forced reset and extended delay to prevent DHCPv6 pending state at boot.
 
 ### v1.0
+
 - Initial release: UCI config, `98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, cron setup.
 - Fixes PLDT `/128` IA_NA drop, dead RA gateway selection, wan6 startup race condition, and RA runtime override.
