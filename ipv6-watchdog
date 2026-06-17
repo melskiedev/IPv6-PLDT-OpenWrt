@@ -1,7 +1,7 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
-# v3.9-rc1 — adds optional sticky gateway enforcement for PLDT RA behavior.
+# v3.9-rc2 — moves sticky gateway enforcement before ipv6_ok for proactive interception.
 # Runs every 1 minute via cron.
 
 LOGTAG="ipv6-watchdog"
@@ -221,8 +221,12 @@ keep_gateway() {
     good_gw=$(cat "$GOOD_GW_FILE" 2>/dev/null)
 
     if [ -z "$good_gw" ]; then
-        echo "$current_gw" > "$GOOD_GW_FILE"
-        log "Sticky gateway baseline set: $current_gw"
+        if internet_ok_now; then
+            echo "$current_gw" > "$GOOD_GW_FILE"
+            log "Sticky gateway baseline set: $current_gw"
+        else
+            log "Sticky gateway baseline not set: current gateway $current_gw has no internet reachability"
+        fi
         return 0
     fi
 
@@ -244,12 +248,14 @@ keep_gateway() {
     if internet_ok_now; then
         log "Sticky gateway restored: $good_gw (mac $mac, internet verified)"
         echo "$good_gw" > "$GOOD_GW_FILE"
+        sleep 3
         return 0
     fi
 
     log "Sticky gateway preferred $good_gw failed internet test, restoring current $current_gw"
     ip -6 route replace default via "$current_gw" dev "$WAN_DEV" metric 512 2>/dev/null
     echo "$current_gw" > "$GOOD_GW_FILE"
+    sleep 3
     return 0
 }
 
@@ -501,6 +507,13 @@ try_128_bootstrap() {
 
 # --- Main logic ---
 
+# Proactive sticky gateway check runs before ipv6_ok so it can restore the
+# known-good gateway before the validation ping fires. If keep_gateway restores
+# the preferred gateway successfully, ipv6_ok will pass and no fix_gateway call
+# is needed. If keep_gateway fails or is disabled, the normal ipv6_ok and
+# fix_gateway paths handle recovery as before.
+keep_gateway
+
 # Happy path: reset all state.
 if ipv6_ok; then
     if [ -f "$ONT_FLAG" ] && [ -n "$DISCORD_WEBHOOK" ]; then
@@ -533,7 +546,6 @@ RECPAYLOAD
         log "IPv6 recovered after critical failure, Discord recovery notice sent"
     fi
 
-    keep_gateway
     reset_recovery_state
     cleanup_deprecated_v6
     exit 0
