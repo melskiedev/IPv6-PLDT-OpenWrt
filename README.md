@@ -591,7 +591,8 @@ Changes to `/etc/ipv6-watchdog.conf` take effect on the next cron tick. No watch
 
 | Log line | Meaning |
 |---|---|
-| `Sticky gateway baseline set: fe80::...` | First tick after enabling, current gateway saved as known-good |
+| `Sticky gateway baseline set: fe80::...` | First tick after enabling, current gateway verified and saved as known-good |
+| `Sticky gateway baseline not set: current gateway fe80::... has no internet reachability` | First tick, current gateway is already dead, baseline deferred until next good tick |
 | `Sticky gateway check: current gateway changed fe80::old -> fe80::new` | PLDT RA swapped the gateway |
 | `Sticky gateway restored: fe80::old (mac ..., internet verified)` | Old gateway still works, re-pinned |
 | `Sticky gateway preferred fe80::old failed internet test, restoring current fe80::new` | Old gateway is dead, new one accepted as known-good |
@@ -1146,17 +1147,18 @@ EOF
 
 ## Changelog
 
-### v3.9-rc1
+### v3.9
 
 **ipv6-watchdog:**
 
 - Added optional sticky gateway feature controlled by `STICKY_GATEWAY` in `/etc/ipv6-watchdog.conf`. Disabled by default (`STICKY_GATEWAY=0`). When enabled on PLDT routers, re-pins the last known-good gateway whenever PLDT's RA replaces it with an alternative. If the preferred gateway fails internet reachability, the current gateway is accepted and saved as the new known-good. Safe to enable independently per router without modifying the script.
-- Added `GOOD_GW_FILE="$STATE_DIR/good_gateway"` state file to persist the known-good gateway across cron ticks.
-- Added `keep_gateway()` function: reads known-good gateway from state file, detects route changes caused by incoming RAs, attempts to restore the preferred gateway via `ip -6 route replace` and MAC re-pin, falls back to current gateway if the preferred one fails internet reachability. Called on every happy-path tick after `ipv6_ok()` passes.
+- Added `GOOD_GW_FILE="$STATE_DIR/good_gateway"` state file to persist the known-good gateway across cron ticks. Intentionally excluded from `reset_recovery_state()` so the baseline survives prefix failures, WAN restarts, and all other recovery events.
+- Added `keep_gateway()` function: runs proactively before `ipv6_ok()` on every tick so it can intercept PLDT's RA gateway swaps before connectivity breaks. Reads known-good gateway from state file, detects route changes, attempts to restore the preferred gateway via `ip -6 route replace` and MAC re-pin, falls back to current gateway if the preferred one fails internet reachability. Baseline seeding is guarded by `internet_ok_now()` to prevent saving a dead gateway as known-good.
 - Added `current_default_gw()`, `gateway_mac()`, and `internet_ok_now()` helper functions to support `keep_gateway()` and reduce inline logic duplication.
+- Added `sleep 3` settle delay inside `keep_gateway()` after both the successful restore path and the fallback-to-current path, giving the restored route time to stabilize before `ipv6_ok()` runs its reachability ping.
 - Fixed `fix_gateway()` current-gateway-good path: now writes `echo "$current" > "$GOOD_GW_FILE"` when the current gateway has internet reachability, seeding the sticky baseline immediately rather than waiting for the next tick.
 - Fixed `fix_gateway()` candidate-swap success path: now writes `echo "$gw" > "$GOOD_GW_FILE"` when a replacement gateway is accepted and internet-verified, keeping the sticky baseline in sync with the route table after every successful fix.
-- `GOOD_GW_FILE` is intentionally excluded from `reset_recovery_state()` so the known-good gateway baseline survives prefix failures, WAN restarts, and all other recovery events. The baseline is only updated when a gateway is positively confirmed via internet reachability.
+- Removed ISP-specific reference from `CLEANUP_WAN128` comment; now describes the condition generically.
 
 ### v3.8
 
@@ -1205,7 +1207,7 @@ EOF
 ### v3.5
 
 - Added `LAN_DEV="${LAN_DEV:-br-lan}"` configurable LAN bridge device variable, overridable via `/etc/ipv6-watchdog.conf` for portability across routers with different LAN bridge names.
-- Added `CLEANUP_WAN128="${CLEANUP_WAN128:-1}"` toggle to guard `/128` cleanup in `try_128_bootstrap()`. Set to `0` on routers where WAN `/128` is a legitimate persistent address assigned via IA_NA rather than a temporary bootstrap artifact.
+- Added `CLEANUP_WAN128="${CLEANUP_WAN128:-1}"` toggle to guard `/128` cleanup in `try_128_bootstrap()`. Set to `0` on routers where WAN `/128` is a legitimate persistent address rather than a temporary bootstrap artifact.
 - Added `CLEANUP_DEPRECATED_LAN="${CLEANUP_DEPRECATED_LAN:-1}"` toggle to control deprecated LAN GUA cleanup behavior per deployment.
 - Added `cleanup_deprecated_v6()` function: removes deprecated global IPv6 addresses from the LAN bridge after `ipv6_ok()` confirms IPv6 is healthy. Prevents stale deprecated router-owned LAN addresses from lingering after prefix rotation or LAN suffix changes (e.g. after changing the LAN interface IPv6 suffix from `::1` to `random` or `eui64` in LuCI Advanced Settings). Called in both the initial happy path and after successful `fix_gateway()` recovery.
 - Fixed prefix backoff timer surviving full WAN restart: `do_wan_restart()` now removes `PREFIX_BACKOFF_FILE` so the next recovery cycle is not delayed by a stale backoff timestamp.
