@@ -552,6 +552,50 @@ wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6
 
 The watchdog deploy downloads to a temp file first, runs a shell syntax check (`sh -n`), and only replaces the live script if the check passes. A bad download or interrupted transfer will not overwrite a working watchdog.
 
+### Optional: Sticky Gateway (PLDT routers only)
+
+The watchdog includes an optional sticky gateway feature that re-pins the last known-good gateway when PLDT's RA replaces it with a dead one. It is disabled by default (`STICKY_GATEWAY=0`) so the script is safe on all routers. Enable it only on PLDT routers where dead gateway advertisements are a known issue.
+
+The setting lives in `/etc/ipv6-watchdog.conf`, which the watchdog sources on every tick. This keeps the script itself identical across all routers while allowing per-router behavior.
+
+**Enable sticky gateway via SSH:**
+
+```sh
+grep -q '^STICKY_GATEWAY=' /etc/ipv6-watchdog.conf \
+  && sed -i 's/^STICKY_GATEWAY=.*/STICKY_GATEWAY=1/' /etc/ipv6-watchdog.conf \
+  || echo 'STICKY_GATEWAY=1' >> /etc/ipv6-watchdog.conf
+```
+
+**Disable sticky gateway via SSH:**
+
+```sh
+sed -i 's/^STICKY_GATEWAY=.*/STICKY_GATEWAY=0/' /etc/ipv6-watchdog.conf
+```
+
+**Check current value:**
+
+```sh
+grep '^STICKY_GATEWAY=' /etc/ipv6-watchdog.conf
+```
+
+**Check what the running watchdog sees (reads conf on every tick, no restart needed):**
+
+```sh
+/usr/bin/ipv6-watchdog
+logread | grep ipv6-watchdog | tail -5
+```
+
+Changes to `/etc/ipv6-watchdog.conf` take effect on the next cron tick. No watchdog restart is required.
+
+**Expected log patterns when sticky gateway is active:**
+
+| Log line | Meaning |
+|---|---|
+| `Sticky gateway baseline set: fe80::...` | First tick after enabling, current gateway saved as known-good |
+| `Sticky gateway check: current gateway changed fe80::old -> fe80::new` | PLDT RA swapped the gateway |
+| `Sticky gateway restored: fe80::old (mac ..., internet verified)` | Old gateway still works, re-pinned |
+| `Sticky gateway preferred fe80::old failed internet test, restoring current fe80::new` | Old gateway is dead, new one accepted as known-good |
+
 ---
 
 ## Step 5 - Cron Setup
@@ -1102,6 +1146,18 @@ EOF
 
 ## Changelog
 
+### v3.9-rc1
+
+**ipv6-watchdog:**
+
+- Added optional sticky gateway feature controlled by `STICKY_GATEWAY` in `/etc/ipv6-watchdog.conf`. Disabled by default (`STICKY_GATEWAY=0`). When enabled on PLDT routers, re-pins the last known-good gateway whenever PLDT's RA replaces it with an alternative. If the preferred gateway fails internet reachability, the current gateway is accepted and saved as the new known-good. Safe to enable independently per router without modifying the script.
+- Added `GOOD_GW_FILE="$STATE_DIR/good_gateway"` state file to persist the known-good gateway across cron ticks.
+- Added `keep_gateway()` function: reads known-good gateway from state file, detects route changes caused by incoming RAs, attempts to restore the preferred gateway via `ip -6 route replace` and MAC re-pin, falls back to current gateway if the preferred one fails internet reachability. Called on every happy-path tick after `ipv6_ok()` passes.
+- Added `current_default_gw()`, `gateway_mac()`, and `internet_ok_now()` helper functions to support `keep_gateway()` and reduce inline logic duplication.
+- Fixed `fix_gateway()` current-gateway-good path: now writes `echo "$current" > "$GOOD_GW_FILE"` when the current gateway has internet reachability, seeding the sticky baseline immediately rather than waiting for the next tick.
+- Fixed `fix_gateway()` candidate-swap success path: now writes `echo "$gw" > "$GOOD_GW_FILE"` when a replacement gateway is accepted and internet-verified, keeping the sticky baseline in sync with the route table after every successful fix.
+- `GOOD_GW_FILE` is intentionally excluded from `reset_recovery_state()` so the known-good gateway baseline survives prefix failures, WAN restarts, and all other recovery events. The baseline is only updated when a gateway is positively confirmed via internet reachability.
+
 ### v3.8
 
 **ipv6-watchdog:**
@@ -1149,7 +1205,7 @@ EOF
 ### v3.5
 
 - Added `LAN_DEV="${LAN_DEV:-br-lan}"` configurable LAN bridge device variable, overridable via `/etc/ipv6-watchdog.conf` for portability across routers with different LAN bridge names.
-- Added `CLEANUP_WAN128="${CLEANUP_WAN128:-1}"` toggle to guard `/128` cleanup in `try_128_bootstrap()`. Set to `0` on routers where WAN `/128` is a legitimate persistent address rather than a temporary bootstrap artifact.
+- Added `CLEANUP_WAN128="${CLEANUP_WAN128:-1}"` toggle to guard `/128` cleanup in `try_128_bootstrap()`. Set to `0` on routers where WAN `/128` is a legitimate persistent address assigned via IA_NA rather than a temporary bootstrap artifact.
 - Added `CLEANUP_DEPRECATED_LAN="${CLEANUP_DEPRECATED_LAN:-1}"` toggle to control deprecated LAN GUA cleanup behavior per deployment.
 - Added `cleanup_deprecated_v6()` function: removes deprecated global IPv6 addresses from the LAN bridge after `ipv6_ok()` confirms IPv6 is healthy. Prevents stale deprecated router-owned LAN addresses from lingering after prefix rotation or LAN suffix changes (e.g. after changing the LAN interface IPv6 suffix from `::1` to `random` or `eui64` in LuCI Advanced Settings). Called in both the initial happy path and after successful `fix_gateway()` recovery.
 - Fixed prefix backoff timer surviving full WAN restart: `do_wan_restart()` now removes `PREFIX_BACKOFF_FILE` so the next recovery cycle is not delayed by a stale backoff timestamp.
