@@ -3,8 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
+[![Release](https://img.shields.io/badge/Release-v3.9.2-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current release:** v3.9.2 (`ipv6-watchdog`)
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -15,7 +16,7 @@ Includes root-cause analysis, startup fixes, runtime recovery, escalating failur
 
 ## TL;DR
 
-PLDT Fiber, bridge mode, IPv6 broken: apply UCI config, add the three scripts, reboot, verify with `ping6 2001:4860:4860::8888`. Full instructions below.
+PLDT Fiber, bridge mode, IPv6 broken: apply UCI config, deploy the scripts (`98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, `97-garp`), add cron, reboot, verify with `ping6 2001:4860:4860::8888`. Full instructions below.
 
 ---
 
@@ -519,15 +520,17 @@ Runs every 1 minute via cron, with jitter and `flock` to prevent overlap. Checks
 
 | Condition | Recovery path |
 |---|---|
-| `wan6` fully down | Tier 0: restart wan6, retry next cycle |
-| Dead RA gateway (prefix present, connectivity broken) | Gateway fix with MAC pin, then WAN restart after 3 consecutive failures |
-| Missing prefix (DHCPv6 failure) | Escalating ladder: wan6 restart, DHCPv6 renew, /128 bootstrap, full WAN restart |
+| `wan6` fully down | Tier 0: soft `wan6` restart on attempts 1–2; after 3 failures, `maybe_wan_restart()` (full WAN restart with shared limit + cooldown) |
+| Dead RA gateway (prefix present, connectivity broken) | `keep_gateway()` (if sticky enabled) + `fix_gateway()` with MAC pin; after 3 consecutive failures, `maybe_wan_restart()` (same limit + cooldown) |
+| Missing prefix (DHCPv6 failure) | Escalating ladder: wan6 restart, DHCPv6 renew, `/128` bootstrap, full WAN restart via `maybe_wan_restart()` |
 | Persistent prefix failure after 3 WAN restarts | Stop retrying, notify once, wait for manual ONT powercycle |
 
 **Escalation timeline for persistent NoPrefixAvail:**
 
 ```
-Each tick: if wan6 is fully down, Tier 0 restarts it before any other check.
+Each tick: if wan6 is fully down, Tier 0 runs before all other checks.
+  Attempts 1–2: soft ifdown/ifup wan6
+  Attempt 3+:   maybe_wan_restart() (subject to WAN_RESTART_LIMIT and cooldown)
 
 Tick 1  (0 min)   No prefix. Restart wan6. Backoff 10 min.
 Tick 3  (10 min)  Still no prefix. DHCPv6 renew. Backoff 20 min.
@@ -551,6 +554,19 @@ wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6
 ```
 
 The watchdog deploy downloads to a temp file first, runs a shell syntax check (`sh -n`), and only replaces the live script if the check passes. A bad download or interrupted transfer will not overwrite a working watchdog.
+
+### Watchdog configuration (`/etc/ipv6-watchdog.conf`)
+
+The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below. Release versioning tracks `ipv6-watchdog` (currently **v3.9.2**); hotplug scripts do not carry separate version numbers.
+
+**WAN restart limits** (optional overrides; defaults shown):
+
+```sh
+WAN_RESTART_COOLDOWN=1200   # seconds between full WAN restarts (20 minutes)
+WAN_RESTART_LIMIT=3         # full WAN restarts before ONT powercycle alert
+```
+
+All full WAN restarts go through `maybe_wan_restart()`, which enforces these limits for Tier 0 escalation, no-prefix escalation, and connectivity-failure escalation.
 
 ### Optional: Sticky Gateway (PLDT routers only)
 
@@ -596,6 +612,9 @@ Changes to `/etc/ipv6-watchdog.conf` take effect on the next cron tick. No watch
 | `Sticky gateway check: current gateway changed fe80::old -> fe80::new` | PLDT RA swapped the gateway |
 | `Sticky gateway restored: fe80::old (mac ..., internet verified)` | Old gateway still works, re-pinned |
 | `Sticky gateway preferred fe80::old failed internet test, restoring current fe80::new` | Old gateway is dead, new one accepted as known-good |
+| `preferred ... has no MAC, accepting verified current ...` | Preferred gateway lost MAC; current gateway passed internet test |
+| `preferred ... has no MAC, current ... not verified, keeping baseline` | Neither gateway verified; baseline unchanged |
+| `In post-restart cooldown, ... skipping Tier 0 recovery` | Tier 0 deferred during WAN restart cooldown |
 
 ---
 
@@ -618,9 +637,9 @@ echo '*/1 * * * * /usr/bin/ipv6-watchdog' >> /etc/crontabs/root
 
 **File:** `/etc/hotplug.d/iface/97-garp`
 
-Fires on `br-lan` ifup and sends a gratuitous ARP broadcast, forcing all LAN clients to update their ARP cache with the router's current MAC address. Without this, swapping routers on the same ONT with the same LAN IP but a different MAC leaves LAN clients sending traffic to the old MAC — resulting in internet loss at Layer 2 that no watchdog can detect.
+Fires on LAN bridge ifup and sends a gratuitous ARP broadcast, forcing all LAN clients to update their ARP cache with the router's current MAC address. Without this, swapping routers on the same ONT with the same LAN IP but a different MAC leaves LAN clients sending traffic to the old MAC — resulting in internet loss at Layer 2 that no watchdog can detect.
 
-Reads LAN IP dynamically via UCI. No hardcoded addresses. Portable across all routers.
+Reads LAN IP dynamically via UCI. Uses `LAN_DEV` from `/etc/ipv6-watchdog.conf` (default `br-lan`). Portable across routers with non-default bridge names.
 
 First verify `arping` is available (included in standard OpenWrt builds):
 
@@ -639,11 +658,14 @@ Then deploy:
 ```sh
 cat > /etc/hotplug.d/iface/97-garp << 'SCRIPT'
 #!/bin/sh
+CONF="/etc/ipv6-watchdog.conf"
+[ -f "$CONF" ] && . "$CONF"
+LAN_DEV="${LAN_DEV:-br-lan}"
 [ "$ACTION" = "ifup" ] || exit 0
-[ "$DEVICE" = "br-lan" ] || exit 0
+[ "$DEVICE" = "$LAN_DEV" ] || exit 0
 sleep 3
 LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
-[ -n "$LAN_IP" ] && arping -A -I br-lan -c 3 "$LAN_IP"
+[ -n "$LAN_IP" ] && arping -A -I "$LAN_DEV" -c 3 "$LAN_IP"
 SCRIPT
 chmod +x /etc/hotplug.d/iface/97-garp
 ```
@@ -1161,6 +1183,14 @@ EOF
 - `WAN_RESTART_COOLDOWN` and `WAN_RESTART_LIMIT` overridable via `/etc/ipv6-watchdog.conf`.
 - `in_cooldown()` validates timestamp is numeric before arithmetic.
 - Recovery Discord notice logs curl success or failure.
+
+**97-garp:**
+
+- Reads `LAN_DEV` from `/etc/ipv6-watchdog.conf` (default `br-lan`) for non-default LAN bridge names.
+
+**99-ipv6-setup:**
+
+- Aligned `ff02::2` multicast probe timeout to `-W 3` (matches `ipv6-watchdog`).
 
 ### v3.9
 

@@ -71,7 +71,7 @@ fi
 # Ping all-routers multicast to trigger router responses and refresh NDP state
 # for all routers on the link before the candidate scan.
 log "Triggering NDP discovery via all-routers multicast..."
-ping6 -c 3 -W 1 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
+ping6 -c 3 -W 3 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
 sleep 3
 
 # Also send unicast probes to gateways already in the route table to refresh
