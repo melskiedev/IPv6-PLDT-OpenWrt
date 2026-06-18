@@ -1147,6 +1147,21 @@ EOF
 
 ## Changelog
 
+### v3.9.2
+
+**ipv6-watchdog:**
+
+- Reordered script so all functions are defined before Tier 0 and main recovery logic (BusyBox `ash` safety; fixes v3.9.1 forward-reference bug).
+- Added `maybe_wan_restart()` to centralize `WAN_RESTART_LIMIT`, post-restart cooldown, and ONT notification across all full WAN restart paths.
+- Tier 0: added `TIER0_FAIL_FILE`; respects global cooldown; escalates to `maybe_wan_restart()` after 3 consecutive soft `wan6` recovery failures.
+- Connectivity failure path (`FAILS >= 3`) and no-prefix WAN escalation now call `maybe_wan_restart()` instead of `do_wan_restart()` directly.
+- `keep_gateway()` no-MAC fallback requires `internet_ok_now()` before accepting current gateway as baseline; fallback path pins MAC for `current_gw`.
+- `fix_gateway()` candidate loop uses `gateway_mac()` (unicast NDP probe) instead of skipping gateways with no immediate MAC entry.
+- Added `-W 3` timeout on `ff02::2` all-routers multicast probe.
+- `WAN_RESTART_COOLDOWN` and `WAN_RESTART_LIMIT` overridable via `/etc/ipv6-watchdog.conf`.
+- `in_cooldown()` validates timestamp is numeric before arithmetic.
+- Recovery Discord notice logs curl success or failure.
+
 ### v3.9
 
 **ipv6-watchdog:**
