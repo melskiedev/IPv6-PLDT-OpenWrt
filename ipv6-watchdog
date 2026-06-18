@@ -1,7 +1,7 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
-# v3.9.3 — v3.9.2 logic with restored inline documentation and Discord JSON hardening.
+# v3.9.4: counter sanitization, bootstrap UCI cleanup trap, fix_gateway route restore, jitter after boot grace.
 # Runs every 1 minute via cron.
 
 LOGTAG="ipv6-watchdog"
@@ -11,21 +11,42 @@ mkdir -p "$STATE_DIR"
 
 log() { logger -t "$LOGTAG" "$1"; }
 
+# Coerce state-file reads to non-negative integers (empty or corrupt -> 0).
+# Mirrors the case guard in in_cooldown(); avoids silent wrong-branch selection.
+sanitize_int() {
+    case "$1" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Set to 1 while try_128_bootstrap has staged reqaddress='try'; on_exit reverts if still set.
+BOOTSTRAP_UCI_STAGED=0
+
 # Prevent overlapping executions. If a previous run is still active
 # (e.g. during bootstrap or WAN restart), exit immediately.
 # flock is preferred; mkdir is a fallback for OpenWrt images without flock.
 LOCK="$STATE_DIR/watchdog.lock"
 LOCK_DIR="$STATE_DIR/watchdog.lock.dir"
+cleanup_lock() { :; }
 if command -v flock >/dev/null 2>&1; then
     exec 9>"$LOCK"
     flock -n 9 || { log "Already running, skipping this tick"; exit 0; }
 else
     mkdir "$LOCK_DIR" 2>/dev/null || { log "Already running, skipping this tick"; exit 0; }
     cleanup_lock() { rmdir "$LOCK_DIR" 2>/dev/null; }
-    trap 'cleanup_lock' EXIT
-    trap 'cleanup_lock; exit 130' INT
-    trap 'cleanup_lock; exit 143' TERM
 fi
+
+on_exit() {
+    if [ "$BOOTSTRAP_UCI_STAGED" = "1" ]; then
+        uci revert network.wan6.reqaddress 2>/dev/null
+        BOOTSTRAP_UCI_STAGED=0
+    fi
+    cleanup_lock
+}
+trap 'on_exit' EXIT
+trap 'on_exit; exit 130' INT
+trap 'on_exit; exit 143' TERM
 
 [ -f "$CONF" ] && . "$CONF"
 
@@ -230,6 +251,15 @@ keep_gateway() {
 }
 
 fix_gateway() {
+    local saved_gw saved_mac
+
+    # Snapshot pre-scan default route so a failed candidate loop can restore it.
+    saved_gw=$(current_default_gw)
+    saved_mac=
+    if [ -n "$saved_gw" ]; then
+        saved_mac=$(gateway_mac "$saved_gw")
+    fi
+
     # ===== STEP 1: Remove dead prefix-specific routes =====
     # Remove prefix-specific default routes only when external IPv6 reachability is already broken.
     # PLDT installs a source-based route: 'default from <prefix>/56 via <gateway>'
@@ -309,6 +339,15 @@ fix_gateway() {
     done
 
     log "No gateway candidate passed internet reachability test"
+    if [ -n "$saved_gw" ]; then
+        [ -n "$saved_mac" ] && \
+            ip -6 neigh replace "$saved_gw" lladdr "$saved_mac" dev "$WAN_DEV" nud stale 2>/dev/null
+        ip -6 route replace default via "$saved_gw" dev "$WAN_DEV" metric 512 2>/dev/null
+        log "Restored pre-scan default gateway $saved_gw"
+    else
+        ip -6 route del default dev "$WAN_DEV" metric 512 2>/dev/null
+        log "Removed trial default route (no pre-scan gateway)"
+    fi
     return 1
 }
 
@@ -443,6 +482,8 @@ try_128_bootstrap() {
     log "Attempting /128 bootstrap to recover prefix delegation"
 
     # Stage 'try' without committing so it never persists across reboots.
+    # BOOTSTRAP_UCI_STAGED lets on_exit revert if this function is killed mid-run.
+    BOOTSTRAP_UCI_STAGED=1
     uci set network.wan6.reqaddress='try'
     ubus call network reload >/dev/null 2>&1
     ifdown wan6; sleep 5; ifup wan6
@@ -466,6 +507,7 @@ try_128_bootstrap() {
     # ubus call network reload applies the revert; no second ifdown/ifup is needed.
     # A second interface flap here would disrupt a prefix that was just acquired.
     uci revert network.wan6.reqaddress
+    BOOTSTRAP_UCI_STAGED=0
     ubus call network reload >/dev/null 2>&1
 
     # Brief settle delay to let the revert reload stabilize before re-checking.
@@ -510,15 +552,12 @@ try_128_bootstrap() {
 
 # --- Runtime state (read after all functions are defined) ---
 
-FAILS=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
-PREFIX_FAILS=$(cat "$PREFIX_FAIL_FILE" 2>/dev/null || echo 0)
-WAN_RESTARTS=$(cat "$WAN_RESTART_FILE" 2>/dev/null || echo 0)
-PREFIX_NEXT=$(cat "$PREFIX_BACKOFF_FILE" 2>/dev/null || echo 0)
-TIER0_FAILS=$(cat "$TIER0_FAIL_FILE" 2>/dev/null || echo 0)
+FAILS=$(sanitize_int "$(cat "$FAIL_FILE" 2>/dev/null)")
+PREFIX_FAILS=$(sanitize_int "$(cat "$PREFIX_FAIL_FILE" 2>/dev/null)")
+WAN_RESTARTS=$(sanitize_int "$(cat "$WAN_RESTART_FILE" 2>/dev/null)")
+PREFIX_NEXT=$(sanitize_int "$(cat "$PREFIX_BACKOFF_FILE" 2>/dev/null)")
+TIER0_FAILS=$(sanitize_int "$(cat "$TIER0_FAIL_FILE" 2>/dev/null)")
 NOW=$(date +%s)
-
-# Add jitter to avoid synchronized retry bursts across rapid cron ticks.
-sleep $((RANDOM % 5 + 5))
 
 # ===== BOOT GRACE PERIOD =====
 # If the system just booted, exit immediately and let 98-wan6-delay and
@@ -530,6 +569,9 @@ if [ "$UPTIME_SECS" -lt 120 ]; then
     log "Boot grace period active (uptime ${UPTIME_SECS}s < 120s), exiting"
     exit 0
 fi
+
+# Add jitter to avoid synchronized retry bursts across rapid cron ticks.
+sleep $((RANDOM % 5 + 5))
 
 # ===== TIER 0: wan6 DOWN RECOVERY =====
 # Handles the case where wan6 never came up after boot or a link event.

@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Release](https://img.shields.io/badge/Release-v3.9.3-blue)](#)
+[![Release](https://img.shields.io/badge/Release-v3.9.4-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current release:** v3.9.3 (`ipv6-watchdog`)
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current release:** v3.9.4 (`ipv6-watchdog`)
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -171,27 +171,27 @@ IPv4 internet must be working to run `apk`. A fresh OpenWrt flash provides it vi
 ```sh
 BASE="https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main"
 
-# Step 2 — wan6 startup delay
+# Step 2 - wan6 startup delay
 wget -q "$BASE/98-wan6-delay" -O /etc/hotplug.d/iface/98-wan6-delay \
   && chmod +x /etc/hotplug.d/iface/98-wan6-delay
 
-# Step 3 — IPv6 route fix engine
+# Step 3 - IPv6 route fix engine
 wget -q "$BASE/99-ipv6-setup" -O /etc/hotplug.d/iface/99-ipv6-setup \
   && chmod +x /etc/hotplug.d/iface/99-ipv6-setup
 
-# Step 4 — IPv6 watchdog (safe deploy: syntax check before replacing live script)
+# Step 4 - IPv6 watchdog (safe deploy: syntax check before replacing live script)
 wget -q "$BASE/ipv6-watchdog" -O /tmp/ipv6-watchdog.new \
   && sh -n /tmp/ipv6-watchdog.new \
   && mv /tmp/ipv6-watchdog.new /usr/bin/ipv6-watchdog \
   && chmod +x /usr/bin/ipv6-watchdog && echo "watchdog deployed ok" \
   || echo "syntax check failed, not deployed"
 
-# Step 5 — cron (command only, no file needed)
+# Step 5 - cron (command only, no file needed)
 grep -qxF '*/1 * * * * /usr/bin/ipv6-watchdog' /etc/crontabs/root || \
   echo '*/1 * * * * /usr/bin/ipv6-watchdog' >> /etc/crontabs/root
 /etc/init.d/cron restart
 
-# Step 6 — gratuitous ARP
+# Step 6 - gratuitous ARP
 wget -q "$BASE/97-garp" -O /etc/hotplug.d/iface/97-garp \
   && chmod +x /etc/hotplug.d/iface/97-garp
 ```
@@ -234,7 +234,7 @@ Tested on:
                                                   └──────────────────────┘
 
   ──▶ active WAN path    ···▶ routed traffic    █ this guide applies here (edge device)
-  guide scope: native DHCPv6 + prefix delegation only — not applicable to NAT6, static IPv6, or tunnel setups
+  guide scope: native DHCPv6 + prefix delegation only; not applicable to NAT6, static IPv6, or tunnel setups
 ```
 
 May work on:
@@ -300,19 +300,19 @@ This is the dominant failure. Everything else amplifies or destabilizes it.
          │                                                      │
          ▼                                                      ▼
   ┌──────────────────────────┐              ┌────────────────────────────────────────┐
-  │ FAIL 2 — dead RA gateway │              │ PRIMARY — /128 IA_NA drop              │
+  │ FAIL 2 - dead RA gateway │              │ PRIMARY - /128 IA_NA drop              │
   │ ISP sends 2 gateways     │              │ Linux prefers /128 as source address   │
-  │ OpenWrt picks first —    │              │ PLDT silently drops ALL outbound       │
+  │ OpenWrt picks first -    │              │ PLDT silently drops ALL outbound       │
   │ it's dead (INCOMPLETE)   │              │ traffic from it                        │
   └──────────────────────────┘              └────────────────────────────────────────┘
 
   ─────────────────────────── RUNTIME / STARTUP ISSUES ──────────────────────────────
 
   ┌──────────────────────────┐  ┌─────────────────────────┐  ┌────────────────────────┐  ┌───────────────────────────┐
-  │ FAIL 3 — race condition  │  │ FAIL 4 — RA override    │  │ FAIL 5 — accept_ra=2   │  │ FAIL 6 — NoPrefixAvail   │
+  │ FAIL 3 - race condition  │  │ FAIL 4 - RA override    │  │ FAIL 5 - accept_ra=2   │  │ FAIL 6 - NoPrefixAvail   │
   │ wan6 starts before LLA   │  │ New RA reinstalls dead  │  │ Removes RA fallback    │  │ ISP refuses prefix        │
   │ ready, DHCPv6 fails,     │  │ gateway. Works at boot, │  │ from wan6. Complete    │  │ delegation. Stale lease   │
-  │ no default route         │  │ breaks silently later   │  │ IPv6 fail every boot   │  │ — ISP-side issue          │
+  │ no default route         │  │ breaks silently later   │  │ IPv6 fail every boot   │  │ - ISP-side issue          │
   └──────────────────────────┘  └─────────────────────────┘  └────────────────────────┘  └───────────────────────────┘
 
   ───────────────────────────────── FIXES APPLIED ───────────────────────────────────
@@ -363,7 +363,7 @@ Watchdog (every 1 min) -> check connectivity -> fix route -> escalate if needed 
 | F - Notifications | `ipv6-discord-logger` | Optional Discord alerts and log forwarding |
 
 ```text
-  STEP 1          STEP 2 — FIX B        STEP 3 — FIX B       STEP 4              STEP 5 — FIX C
+  STEP 1          STEP 2 - FIX B        STEP 3 - FIX B       STEP 4              STEP 5 - FIX C
   ┌────────────┐  ┌──────────────────┐  ┌───────────────┐    ┌──────────────────┐  ┌────────────────────────┐
   │  WAN up    │  │   reset wan6     │  │   15s delay   │    │  wan6 starts     │  │   route engine         │
   │            │─▶│                  │─▶│               │───▶│                  │─▶│                        │
@@ -383,7 +383,7 @@ Watchdog (every 1 min) -> check connectivity -> fix route -> escalate if needed 
                         │
                         ▼
               ┌──────────────────────────────────────────────┐
-              │  watchdog — runtime monitoring — flock + jitter  │
+              │  watchdog - runtime monitoring - flock + jitter  │
               └──────────────────────────────────────────────┘
 
   ────────────────── RUNTIME RECOVERY LADDER (no prefix) ─────────────────────────
@@ -468,7 +468,7 @@ What each setting does:
 
 ---
 
-## Step 2 — wan6 Startup Delay
+## Step 2 - wan6 Startup Delay
 
 **File:** [`98-wan6-delay`](98-wan6-delay) → `/etc/hotplug.d/iface/98-wan6-delay`
 
@@ -557,7 +557,13 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 ### Watchdog configuration (`/etc/ipv6-watchdog.conf`)
 
-The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below. Release versioning tracks `ipv6-watchdog` (currently **v3.9.3**); hotplug scripts do not carry separate version numbers.
+The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below. Release versioning tracks `ipv6-watchdog` (currently **v3.9.4**); hotplug scripts do not carry separate version numbers.
+
+Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
+
+```sh
+chmod 600 /etc/ipv6-watchdog.conf
+```
 
 **WAN restart limits** (optional overrides; defaults shown):
 
@@ -637,7 +643,7 @@ echo '*/1 * * * * /usr/bin/ipv6-watchdog' >> /etc/crontabs/root
 
 **File:** `/etc/hotplug.d/iface/97-garp`
 
-Fires on LAN bridge ifup and sends a gratuitous ARP broadcast, forcing all LAN clients to update their ARP cache with the router's current MAC address. Without this, swapping routers on the same ONT with the same LAN IP but a different MAC leaves LAN clients sending traffic to the old MAC — resulting in internet loss at Layer 2 that no watchdog can detect.
+Fires on LAN bridge ifup and sends a gratuitous ARP broadcast, forcing all LAN clients to update their ARP cache with the router's current MAC address. Without this, swapping routers on the same ONT with the same LAN IP but a different MAC leaves LAN clients sending traffic to the old MAC, resulting in internet loss at Layer 2 that no watchdog can detect.
 
 Reads LAN IP dynamically via UCI. Uses `LAN_DEV` from `/etc/ipv6-watchdog.conf` (default `br-lan`). Portable across routers with non-default bridge names.
 
@@ -1096,6 +1102,8 @@ DISCORD_WEBHOOK="https://discord.com/api/webhooks/YOUR_ALERTS_WEBHOOK_HERE"
 # Log webhook: all tagged syslog lines in real time.
 # Falls back to DISCORD_WEBHOOK if unset.
 DISCORD_LOG_WEBHOOK="https://discord.com/api/webhooks/YOUR_LOGS_WEBHOOK_HERE"
+
+chmod 600 /etc/ipv6-watchdog.conf
 ```
 
 Keep this file out of public repositories as the webhook URLs are secrets.
@@ -1169,11 +1177,24 @@ EOF
 
 ## Changelog
 
+### v3.9.4
+
+**ipv6-watchdog:**
+
+- Added `sanitize_int()` for all counter state reads (`FAILS`, `PREFIX_FAILS`, `WAN_RESTARTS`, `PREFIX_NEXT`, `TIER0_FAILS`). Empty or corrupt state files no longer cause silent wrong-branch selection in `-ge`/`-lt` comparisons.
+- Added `BOOTSTRAP_UCI_STAGED` flag with unified `on_exit` trap (composes with mkdir lock cleanup) so staged `reqaddress='try'` is reverted if `try_128_bootstrap` is killed mid-run.
+- `fix_gateway()` snapshots the pre-scan default gateway and restores it when the candidate loop exhausts without a working gateway.
+- Moved cron jitter `sleep` to after the boot grace check so early boot ticks exit immediately without a 5-10s delay.
+
+**README:**
+
+- Document `chmod 600 /etc/ipv6-watchdog.conf` in the watchdog config and Discord setup sections.
+
 ### v3.9.3
 
 **ipv6-watchdog:**
 
-- Restored inline documentation from v3.9 (function behavior, PLDT routing notes, bootstrap sequencing, ash function-order note) on top of v3.9.2 logic — no IPv6 behavior changes.
+- Restored inline documentation from v3.9 (function behavior, PLDT routing notes, bootstrap sequencing, ash function-order note) on top of v3.9.2 logic; no IPv6 behavior changes.
 - Added `tr -d '\n\r\t'` to all six Discord JSON escape lines (`MODEL_ESC`, `HOST_ESC`, `FW_ESC`, `REC_*_ESC`) to prevent malformed embeds from stray whitespace in router identity fields.
 
 ### v3.9.2
