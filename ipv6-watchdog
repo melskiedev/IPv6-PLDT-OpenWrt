@@ -1,7 +1,7 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
-# v3.9.4: counter sanitization, bootstrap UCI cleanup trap, fix_gateway route restore, jitter after boot grace.
+# v3.9.5: fix_gateway full route snapshot restore; PREFIX_FAILS backoff overflow guard.
 # Runs every 1 minute via cron.
 
 LOGTAG="ipv6-watchdog"
@@ -42,6 +42,7 @@ on_exit() {
         uci revert network.wan6.reqaddress 2>/dev/null
         BOOTSTRAP_UCI_STAGED=0
     fi
+    rm -f "$STATE_DIR"/fix_gateway_routes.* 2>/dev/null
     cleanup_lock
 }
 trap 'on_exit' EXIT
@@ -250,15 +251,33 @@ keep_gateway() {
     return 0
 }
 
-fix_gateway() {
-    local saved_gw saved_mac
+# Replay every default route line saved before fix_gateway() modified the table.
+restore_route_snapshot() {
+    local snapshot="$1"
+    local route gw src metric
 
-    # Snapshot pre-scan default route so a failed candidate loop can restore it.
-    saved_gw=$(current_default_gw)
-    saved_mac=
-    if [ -n "$saved_gw" ]; then
-        saved_mac=$(gateway_mac "$saved_gw")
-    fi
+    [ -s "$snapshot" ] || return 0
+    while read -r route; do
+        [ -z "$route" ] && continue
+        gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+        src=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
+        metric=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="metric"){print $(i+1); exit}}')
+        [ -z "$metric" ] && metric=512
+        if [ -n "$src" ] && [ -n "$gw" ]; then
+            ip -6 route replace default from "$src" via "$gw" dev "$WAN_DEV" metric "$metric" 2>/dev/null
+        elif [ -n "$gw" ]; then
+            ip -6 route replace default via "$gw" dev "$WAN_DEV" metric "$metric" 2>/dev/null
+        fi
+    done < "$snapshot"
+    rm -f "$snapshot"
+}
+
+fix_gateway() {
+    local route_snapshot
+
+    # Snapshot the full default route set before any deletes or candidate installs.
+    route_snapshot="$STATE_DIR/fix_gateway_routes.$$"
+    ip -6 route show default dev "$WAN_DEV" 2>/dev/null > "$route_snapshot"
 
     # ===== STEP 1: Remove dead prefix-specific routes =====
     # Remove prefix-specific default routes only when external IPv6 reachability is already broken.
@@ -291,6 +310,7 @@ fix_gateway() {
            ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
             log "Current gateway $current has internet reachability, no fix needed"
             echo "$current" > "$GOOD_GW_FILE"
+            rm -f "$route_snapshot"
             return 0
         fi
         log "Current gateway $current has no internet reachability, scanning alternatives"
@@ -332,6 +352,7 @@ fix_gateway() {
            ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
             log "Gateway replaced with $gw (mac $mac pinned, internet verified)"
             echo "$gw" > "$GOOD_GW_FILE"
+            rm -f "$route_snapshot"
             return 0
         fi
 
@@ -339,14 +360,13 @@ fix_gateway() {
     done
 
     log "No gateway candidate passed internet reachability test"
-    if [ -n "$saved_gw" ]; then
-        [ -n "$saved_mac" ] && \
-            ip -6 neigh replace "$saved_gw" lladdr "$saved_mac" dev "$WAN_DEV" nud stale 2>/dev/null
-        ip -6 route replace default via "$saved_gw" dev "$WAN_DEV" metric 512 2>/dev/null
-        log "Restored pre-scan default gateway $saved_gw"
+    if [ -s "$route_snapshot" ]; then
+        restore_route_snapshot "$route_snapshot"
+        log "Restored pre-scan default route set"
     else
         ip -6 route del default dev "$WAN_DEV" metric 512 2>/dev/null
-        log "Removed trial default route (no pre-scan gateway)"
+        rm -f "$route_snapshot"
+        log "Removed trial default route (no pre-scan routes)"
     fi
     return 1
 }
@@ -696,8 +716,11 @@ if ! has_prefix; then
 
     # Exponential backoff capped at 30 minutes:
     # fail 1 = 10 min, fail 2 = 20 min, fail 3+ = 30 min cap.
-    BACKOFF_SECS=$(( 600 * (1 << (PREFIX_FAILS - 1)) ))
-    [ "$BACKOFF_SECS" -gt 1800 ] && BACKOFF_SECS=1800
+    if [ "$PREFIX_FAILS" -ge 3 ]; then
+        BACKOFF_SECS=1800
+    else
+        BACKOFF_SECS=$(( 600 * (1 << (PREFIX_FAILS - 1)) ))
+    fi
     echo $((NOW + BACKOFF_SECS)) > "$PREFIX_BACKOFF_FILE"
 
     if [ "$PREFIX_FAILS" -eq 1 ]; then

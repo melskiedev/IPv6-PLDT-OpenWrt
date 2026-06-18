@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Release](https://img.shields.io/badge/Release-v3.9.4-blue)](#)
+[![Release](https://img.shields.io/badge/Release-v3.9.5-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current release:** v3.9.4 (`ipv6-watchdog`)
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current release:** v3.9.5 (`ipv6-watchdog`)
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -557,7 +557,7 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 ### Watchdog configuration (`/etc/ipv6-watchdog.conf`)
 
-The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below. Release versioning tracks `ipv6-watchdog` (currently **v3.9.4**); hotplug scripts do not carry separate version numbers.
+The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below. Release versioning tracks `ipv6-watchdog` (currently **v3.9.5**); hotplug scripts do not carry separate version numbers.
 
 Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
 
@@ -1176,6 +1176,14 @@ EOF
 ---
 
 ## Changelog
+
+### v3.9.5
+
+**ipv6-watchdog:**
+
+- `fix_gateway()` snapshots the full pre-scan default route set (generic and source-specific `default from` routes) before STEP 1 or candidate testing; restores all saved routes when the gateway scan fails.
+- Replaced prefix backoff bit-shift with an explicit `PREFIX_FAILS >= 3` guard to avoid 32-bit signed overflow bypassing the 1800s cap.
+- `on_exit()` removes stale `fix_gateway_routes.*` snapshot files if the script is killed mid-scan.
 
 ### v3.9.4
 
