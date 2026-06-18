@@ -1,7 +1,7 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
-# v3.9.2 — function reorder, maybe_wan_restart(), keep_gateway/fix_gateway hardening.
+# v3.9.3 — v3.9.2 logic with restored inline documentation and Discord JSON hardening.
 # Runs every 1 minute via cron.
 
 LOGTAG="ipv6-watchdog"
@@ -63,20 +63,28 @@ GOOD_GW_FILE="$STATE_DIR/good_gateway"
 TIER0_FAIL_FILE="$STATE_DIR/tier0_fail_count"
 
 # --- Functions (all defined before any recovery branch calls them) ---
+# BusyBox ash registers functions when their definition line is executed.
+# Tier 0 and main logic call these helpers, so every function must appear above
+# the runtime state reads and recovery branches.
 
 # Layered validation: prefix, route, then reachability.
+# Checking in order gives specific failure classification in logs,
+# not just a binary pass/fail from ping alone.
 ipv6_ok() {
+    # Layer 1: prefix must exist
     if ! ubus call network.interface.wan6 status 2>/dev/null \
             | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .; then
         log "Validation failed: no prefix assigned"
         return 1
     fi
 
+    # Layer 2: default route must exist
     if ! ip -6 route show default dev "$WAN_DEV" | grep -q default; then
         log "Validation failed: no default IPv6 route"
         return 1
     fi
 
+    # Layer 3: external reachability
     ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
     ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
 
@@ -89,6 +97,9 @@ has_prefix() {
         | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .
 }
 
+# Attempt a DHCPv6 renew before resorting to full interface restart.
+# This is less disruptive and sufficient when the ISP just needs a re-request.
+# Waits 10 seconds after renew to verify the prefix was restored in the same run.
 dhcpv6_renew() {
     log "Attempting DHCPv6 renew"
     ubus call network.interface.wan6 renew 2>/dev/null || {
@@ -107,6 +118,14 @@ dhcpv6_renew() {
     return 1
 }
 
+# Remove deprecated global IPv6 addresses from the LAN bridge.
+# Called only after ipv6_ok() passes to avoid removing addresses during recovery.
+# The 'ip -6 addr show deprecated' filter selects only addresses the kernel has
+# marked deprecated, meaning their preferred lifetime has expired or a new
+# suffix replaced them (e.g. after changing ip6ifaceid from ::1 to random).
+# Deprecated addresses are still valid for existing connections but are avoided
+# for new ones per RFC 6724 source selection. Removing them prevents stale
+# entries from lingering indefinitely after prefix rotation or suffix changes.
 cleanup_deprecated_v6() {
     [ "$CLEANUP_DEPRECATED_LAN" = "1" ] || return 0
     ip -6 addr show dev "$LAN_DEV" deprecated | \
@@ -145,6 +164,11 @@ internet_ok_now() {
     return 1
 }
 
+# Optional sticky gateway enforcement.
+# When STICKY_GATEWAY=1 and the current default gateway differs from the last
+# known-good gateway, attempts to restore the preferred gateway. If the preferred
+# gateway fails internet reachability, accepts the current gateway as the new
+# known-good. Safe to call on every happy-path tick.
 keep_gateway() {
     [ "$STICKY_GATEWAY" = "1" ] || return 0
     has_prefix || return 0
@@ -206,6 +230,14 @@ keep_gateway() {
 }
 
 fix_gateway() {
+    # ===== STEP 1: Remove dead prefix-specific routes =====
+    # Remove prefix-specific default routes only when external IPv6 reachability is already broken.
+    # PLDT installs a source-based route: 'default from <prefix>/56 via <gateway>'
+    # which takes priority over the generic default for LAN client traffic.
+    # If it points at the dead gateway, LAN clients have no IPv6 even when
+    # the generic default route is healthy.
+    # Reachability is checked once here and reused for all matching routes to
+    # avoid redundant slow pings per route entry.
     if ! ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && \
        ! ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
         ip -6 route show default dev "$WAN_DEV" | grep 'from' | while read -r route; do
@@ -220,6 +252,10 @@ fix_gateway() {
 
     current=$(current_default_gw)
 
+    # Current gateway is only considered good if internet reachability works.
+    # Do not trust link-local gateway ping alone on PLDT -- the dead gateway
+    # responds to direct ping6 intermittently but does not forward internet
+    # traffic reliably.
     if [ -n "$current" ]; then
         if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
            ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
@@ -230,10 +266,20 @@ fix_gateway() {
         log "Current gateway $current has no internet reachability, scanning alternatives"
     fi
 
+    # Trigger an all-routers multicast probe before scanning candidates.
+    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address,
+    # prompting routers to respond and refreshing NDP/MAC state in the
+    # neighbor table. Without this, gateways may be present in the table
+    # but have no MAC yet (INCOMPLETE state), causing the loop to skip all
+    # candidates and fall through to no-fix. Mirrors 99-ipv6-setup behavior.
     log "Triggering NDP all-routers probe before gateway scan"
     ping6 -c 1 -W 3 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
     sleep 2
 
+    # Combine neighbor table and existing route table for the candidate list.
+    # The neighbor table alone can miss gateways if NDP was incomplete at the
+    # time of the scan. Using both sources matches 99-ipv6-setup behavior and
+    # ensures no known gateway is overlooked.
     for gw in $(
         { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
           ip -6 route show default dev "$WAN_DEV" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1)}}'
@@ -246,6 +292,8 @@ fix_gateway() {
             continue
         }
 
+        # Install candidate temporarily and test internet reachability.
+        # Do not accept a candidate just because it replies to local ping.
         ip -6 neigh replace "$gw" lladdr "$mac" dev "$WAN_DEV" nud stale 2>/dev/null
         ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null
         sleep 2
@@ -265,6 +313,8 @@ fix_gateway() {
 }
 
 in_cooldown() {
+    # Use -s to guard against empty file (written as empty on state reset).
+    # Re-read the value here so arithmetic is never performed on an empty string.
     [ -s "$LAST_WAN_RESTART_FILE" ] || return 1
     local last
     last=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null | tr -d '[:space:]')
@@ -277,6 +327,12 @@ in_cooldown() {
     [ "$((NOW - last))" -lt "$WAN_RESTART_COOLDOWN" ]
 }
 
+# Centralized state reset called on all recovery success paths.
+# Resets all counters and removes transient flag files.
+# LAST_WAN_RESTART_FILE is written as empty (not 0) so in_cooldown() can
+# distinguish "never restarted" from a real timestamp via -s check.
+# GOOD_GW_FILE is intentionally NOT cleared so the sticky gateway baseline
+# survives across recoveries.
 reset_recovery_state() {
     echo 0 > "$FAIL_FILE"
     echo 0 > "$PREFIX_FAIL_FILE"
@@ -313,6 +369,7 @@ notify_ont_powercycle() {
 
     [ -z "$DISCORD_WEBHOOK" ] && return 0
 
+    # Read router identity dynamically so this works on any device.
     local payload
     MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || grep -m1 'machine' /proc/cpuinfo | cut -d: -f2)
     FW=$(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)
@@ -322,9 +379,9 @@ notify_ont_powercycle() {
     FW=${FW:-OpenWrt}
     HOST=${HOST:-N/A}
 
-    MODEL_ESC=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    MODEL_ESC=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t')
+    HOST_ESC=$(printf '%s' "$HOST" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t')
+    FW_ESC=$(printf '%s' "$FW" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t')
 
     payload=$(cat <<PAYLOAD
 {
@@ -354,6 +411,8 @@ PAYLOAD
     || log "Discord alert failed (curl error)"
 }
 
+# Centralized WAN restart escalation. Enforces WAN_RESTART_LIMIT, post-restart
+# cooldown, and ONT notification before calling do_wan_restart().
 maybe_wan_restart() {
     local reason="$1"
     local last_restart remaining
@@ -383,10 +442,14 @@ maybe_wan_restart() {
 try_128_bootstrap() {
     log "Attempting /128 bootstrap to recover prefix delegation"
 
+    # Stage 'try' without committing so it never persists across reboots.
     uci set network.wan6.reqaddress='try'
     ubus call network reload >/dev/null 2>&1
     ifdown wan6; sleep 5; ifup wan6
 
+    # Wait for prefix while 'try' is still active.
+    # Check before reverting so the prefix acquisition window is not wasted.
+    # Using a while loop avoids a fork-per-iteration from seq on ash/BusyBox.
     local i prefix
     i=0
     while [ "$i" -lt 15 ]; do
@@ -397,11 +460,20 @@ try_128_bootstrap() {
         sleep 4
     done
 
+    # Always revert regardless of outcome. Never let 'try' persist past this function.
+    # uci revert discards the staged value and returns to the committed 'none'
+    # without committing from within the watchdog.
+    # ubus call network reload applies the revert; no second ifdown/ifup is needed.
+    # A second interface flap here would disrupt a prefix that was just acquired.
     uci revert network.wan6.reqaddress
     ubus call network reload >/dev/null 2>&1
 
+    # Brief settle delay to let the revert reload stabilize before re-checking.
     [ -n "$prefix" ] && sleep 10
 
+    # Confirm the prefix survived the revert. On PLDT, PD is independent of IA_NA,
+    # so reverting reqaddress to 'none' should not withdraw the prefix. But since
+    # PLDT DHCPv6 behavior is non-standard, an explicit check is cheap insurance.
     if [ -n "$prefix" ]; then
         local post_revert_prefix
         post_revert_prefix=$(ubus call network.interface.wan6 status 2>/dev/null \
@@ -445,9 +517,14 @@ PREFIX_NEXT=$(cat "$PREFIX_BACKOFF_FILE" 2>/dev/null || echo 0)
 TIER0_FAILS=$(cat "$TIER0_FAIL_FILE" 2>/dev/null || echo 0)
 NOW=$(date +%s)
 
+# Add jitter to avoid synchronized retry bursts across rapid cron ticks.
 sleep $((RANDOM % 5 + 5))
 
 # ===== BOOT GRACE PERIOD =====
+# If the system just booted, exit immediately and let 98-wan6-delay and
+# 99-ipv6-setup complete before this watchdog takes any action.
+# Without this, cron fires within seconds of boot and Tier 0 can pull
+# wan6 back down while it is still initializing, creating a restart loop.
 UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999)
 if [ "$UPTIME_SECS" -lt 120 ]; then
     log "Boot grace period active (uptime ${UPTIME_SECS}s < 120s), exiting"
@@ -455,6 +532,9 @@ if [ "$UPTIME_SECS" -lt 120 ]; then
 fi
 
 # ===== TIER 0: wan6 DOWN RECOVERY =====
+# Handles the case where wan6 never came up after boot or a link event.
+# This runs before all other checks since WAN_DEV cannot be determined
+# when wan6 is down, which would otherwise cause an early exit.
 if ! ubus call network.interface.wan6 status 2>/dev/null \
         | jsonfilter -e '@["up"]' | grep -q true; then
     log "Tier 0: wan6 is DOWN -- attempting recovery"
@@ -495,8 +575,14 @@ WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
 
 # --- Main logic ---
 
+# Proactive sticky gateway check runs before ipv6_ok so it can restore the
+# known-good gateway before the validation ping fires. If keep_gateway restores
+# the preferred gateway successfully, ipv6_ok will pass and no fix_gateway call
+# is needed. If keep_gateway fails or is disabled, the normal ipv6_ok and
+# fix_gateway paths handle recovery as before.
 keep_gateway
 
+# Happy path: reset all state.
 if ipv6_ok; then
     if [ -f "$ONT_FLAG" ] && [ -n "$DISCORD_WEBHOOK" ]; then
         REC_MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || grep -m1 'machine' /proc/cpuinfo | cut -d: -f2)
@@ -505,9 +591,9 @@ if ipv6_ok; then
         REC_MODEL=${REC_MODEL:-Unknown}
         REC_HOST=${REC_HOST:-N/A}
         REC_FW=${REC_FW:-OpenWrt}
-        REC_MODEL_ESC=$(printf '%s' "$REC_MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        REC_HOST_ESC=$(printf '%s' "$REC_HOST" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        REC_FW_ESC=$(printf '%s' "$REC_FW" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        REC_MODEL_ESC=$(printf '%s' "$REC_MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t')
+        REC_HOST_ESC=$(printf '%s' "$REC_HOST" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t')
+        REC_FW_ESC=$(printf '%s' "$REC_FW" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t')
         RECOVERY_PAYLOAD=$(cat <<RECPAYLOAD
 {
   "embeds": [{
@@ -536,6 +622,7 @@ RECPAYLOAD
     exit 0
 fi
 
+# No prefix: escalating recovery path.
 if ! has_prefix; then
 
     if [ "$WAN_RESTARTS" -ge "$WAN_RESTART_LIMIT" ]; then
@@ -565,6 +652,8 @@ if ! has_prefix; then
     PREFIX_FAILS=$((PREFIX_FAILS + 1))
     echo "$PREFIX_FAILS" > "$PREFIX_FAIL_FILE"
 
+    # Exponential backoff capped at 30 minutes:
+    # fail 1 = 10 min, fail 2 = 20 min, fail 3+ = 30 min cap.
     BACKOFF_SECS=$(( 600 * (1 << (PREFIX_FAILS - 1)) ))
     [ "$BACKOFF_SECS" -gt 1800 ] && BACKOFF_SECS=1800
     echo $((NOW + BACKOFF_SECS)) > "$PREFIX_BACKOFF_FILE"
@@ -592,6 +681,7 @@ if ! has_prefix; then
     exit 0
 fi
 
+# Has prefix but connectivity is broken: try gateway fix first.
 if fix_gateway; then
     sleep 5
     if ipv6_ok; then
