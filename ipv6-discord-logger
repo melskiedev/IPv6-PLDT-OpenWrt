@@ -1,5 +1,6 @@
 #!/bin/sh
 # /usr/bin/ipv6-discord-logger
+# v1.0.0: procd-safe init.d; JSON escape hardening (tr -d on embed fields).
 # Optional: only needed if you want real-time Discord log forwarding.
 # See the Optional: Discord Notifications section in the README for full setup instructions.
 # Requires a Discord webhook configured in /etc/ipv6-watchdog.conf.

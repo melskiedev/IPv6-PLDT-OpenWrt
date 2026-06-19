@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Release](https://img.shields.io/badge/Release-v3.9.5-blue)](#)
+[![Release](https://img.shields.io/badge/Release-v3.9.6-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current release:** v3.9.5 (`ipv6-watchdog`)
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.6 | **Components:** `ipv6-watchdog` v3.9.5, `ipv6-discord-logger` v1.0.0
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -557,7 +557,9 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 ### Watchdog configuration (`/etc/ipv6-watchdog.conf`)
 
-The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below. Release versioning tracks `ipv6-watchdog` (currently **v3.9.5**); hotplug scripts do not carry separate version numbers.
+The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below.
+
+**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Logic-heavy scripts carry their own `# vX.Y.Z` header for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current components: `ipv6-watchdog` **v3.9.5**, `ipv6-discord-logger` **v1.0.0** (repo release **v3.9.6**). Hotplug scripts and `init.d-ipv6-discord-logger` have no separate version headers.
 
 Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
 
@@ -1176,6 +1178,17 @@ EOF
 ---
 
 ## Changelog
+
+### v3.9.6
+
+**ipv6-discord-logger** (component v1.0.0) / **init.d-ipv6-discord-logger:**
+
+- Removed `killall logread` from init.d start/stop; procd owns the logger process without killing unrelated `logread -f` sessions.
+- Hardened Discord embed JSON: `tr -d '\n\r\t'` on message, hostname, and tag fields; resolve hostname once before the logread loop.
+
+**README:**
+
+- Clarified repo-release vs per-component versioning (Option A).
 
 ### v3.9.5
 
