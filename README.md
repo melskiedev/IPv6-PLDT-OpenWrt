@@ -5,7 +5,7 @@
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
 [![Release](https://img.shields.io/badge/Release-v3.9.6-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.6 | **Components:** `ipv6-watchdog` v3.9.5, `ipv6-discord-logger` v1.0.0
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.6 | **Components:** `ipv6-watchdog` v3.9.5, `ipv6-discord-logger` v3.9.6
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -559,7 +559,7 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below.
 
-**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Logic-heavy scripts carry their own `# vX.Y.Z` header for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current components: `ipv6-watchdog` **v3.9.5**, `ipv6-discord-logger` **v1.0.0** (repo release **v3.9.6**). Hotplug scripts and `init.d-ipv6-discord-logger` have no separate version headers.
+**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current: `ipv6-watchdog` **v3.9.5**, `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers.
 
 Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
 
@@ -1120,7 +1120,10 @@ Tails `logread -f` and forwards any line tagged with your script names to Discor
 
 ```sh
 wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6-discord-logger \
-  -O /usr/bin/ipv6-discord-logger && chmod +x /usr/bin/ipv6-discord-logger
+  -O /tmp/ipv6-discord-logger.new \
+  && sh -n /tmp/ipv6-discord-logger.new \
+  && mv /tmp/ipv6-discord-logger.new /usr/bin/ipv6-discord-logger \
+  && chmod +x /usr/bin/ipv6-discord-logger
 ```
 
 The default `WATCH_TAGS` covers this repo's scripts only. To forward logs from additional scripts (e.g. `tailscale-watchdog`, `ipv6-prefix`), add this to `/etc/ipv6-watchdog.conf`:
@@ -1139,11 +1142,14 @@ Then restart the logger to pick up the change:
 
 **File:** [`init.d-ipv6-discord-logger`](init.d-ipv6-discord-logger) → `/etc/init.d/ipv6-discord-logger`
 
-Manages the log forwarder as a procd service with automatic restart. Includes `stop_service` and `killall` guards to prevent duplicate logger instances from accumulating across restarts.
+Manages the log forwarder as a procd service with automatic restart. Deploy together with `ipv6-discord-logger` — both ship in the same repo release.
 
 ```sh
 wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/init.d-ipv6-discord-logger \
-  -O /etc/init.d/ipv6-discord-logger && chmod +x /etc/init.d/ipv6-discord-logger
+  -O /tmp/init.d-ipv6-discord-logger.new \
+  && sh -n /tmp/init.d-ipv6-discord-logger.new \
+  && mv /tmp/init.d-ipv6-discord-logger.new /etc/init.d/ipv6-discord-logger \
+  && chmod +x /etc/init.d/ipv6-discord-logger
 /etc/init.d/ipv6-discord-logger enable
 /etc/init.d/ipv6-discord-logger start
 ```
@@ -1181,7 +1187,7 @@ EOF
 
 ### v3.9.6
 
-**ipv6-discord-logger** (component v1.0.0) / **init.d-ipv6-discord-logger:**
+**ipv6-discord-logger** (component v3.9.6) / **init.d-ipv6-discord-logger:**
 
 - Removed `killall logread` from init.d start/stop; procd owns the logger process without killing unrelated `logread -f` sessions.
 - Hardened Discord embed JSON: `tr -d '\n\r\t'` on message, hostname, and tag fields; resolve hostname once before the logread loop.

@@ -1,5 +1,6 @@
 #!/bin/sh
 # /etc/hotplug.d/iface/99-ipv6-setup
+# v3.9.6
 # IPv6 route fix engine. Runs on wan6 ifup.
 # Selects the working gateway via per-candidate internet reachability testing,
 # pins its MAC, installs the default route, and removes the /128.
