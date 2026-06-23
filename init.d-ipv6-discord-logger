@@ -7,12 +7,23 @@ START=99
 STOP=10
 USE_PROCD=1
 
-stop_service() {
+# killall matches argv[0] (often "sh"); on OpenWrt the comm is truncated to
+# {ipv6-discord-lo}, so killall ipv6-discord-logger misses running loggers.
+kill_loggers() {
+    local pid
+
     killall ipv6-discord-logger 2>/dev/null
+    for pid in $(pgrep -f '/usr/bin/ipv6-discord-logger' 2>/dev/null); do
+        kill "$pid" 2>/dev/null
+    done
+}
+
+stop_service() {
+    kill_loggers
 }
 
 start_service() {
-    killall ipv6-discord-logger 2>/dev/null
+    kill_loggers
     sleep 1
 
     procd_open_instance
