@@ -5,7 +5,7 @@
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
 [![Release](https://img.shields.io/badge/Release-v3.9.6-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.6 | **Components:** `ipv6-watchdog` v3.9.5, `ipv6-discord-logger` v3.9.6
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.6 | **Components:** `ipv6-watchdog` v3.9.6, `ipv6-discord-logger` v3.9.6
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -514,31 +514,53 @@ wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/99-i
 
 **File:** [`ipv6-watchdog`](ipv6-watchdog) → `/usr/bin/ipv6-watchdog`
 
-Runs every 1 minute via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check. A Tier 0 check runs first to recover `wan6` if it is fully down before any other logic executes.
+Runs every 1 minute via cron, with jitter and `flock` to prevent overlap. Checks connectivity using layered validation (prefix, route, then reachability), fixes a broken gateway if one exists, and escalates through a controlled recovery ladder if the prefix is missing. DHCPv6 renew may recover the prefix within the same cron cycle due to the post-renew check. After boot grace and counter reads, a global same-boot recovery hold runs before Tier 0 and all disruptive paths.
+
+**Same-boot full WAN restart budget:**
+
+The watchdog allows a maximum of **3 actual full WAN restarts per router boot**. The count is cumulative for the boot, not consecutive and not per incident. If IPv6 recovers after restart #1 or #2, `WAN_RESTARTS` stays at 1 or 2 until the router reboots. A real router reboot clears `/tmp/ipv6-watchdog` and restores the three-restart budget.
+
+After `WAN_RESTARTS` reaches `WAN_RESTART_LIMIT` (default 3), the watchdog enters **global recovery hold** for the remainder of that boot. Hold mode is passive monitoring only: check `wan6` state, prefix, and connectivity; log status; send the ONT alert once; detect spontaneous recovery. All disruptive recovery is blocked, including Tier 0 soft `wan6` flaps, DHCPv6 renew, `/128` bootstrap, network reload, and further full WAN restarts. Spontaneous IPv6 recovery during hold does not restore the WAN restart budget.
+
+Hold uses two separate state flags under `/tmp/ipv6-watchdog`:
+
+| Flag | Meaning |
+|---|---|
+| `ont_notified` | Critical 3/3 ONT intervention alert already sent this boot (suppresses duplicate red alerts) |
+| `hold_recovered_notified` | Recovery during global hold already reported for the current healthy period (suppresses duplicate green alerts) |
+
+When IPv6 becomes unhealthy again during hold, `hold_recovered_notified` is cleared so a later spontaneous recovery can send one new green notice. `ont_notified` stays set for the rest of the boot.
 
 **Failure domains:**
 
 | Condition | Recovery path |
 |---|---|
-| `wan6` fully down | Tier 0: soft `wan6` restart on attempts 1–2; after 3 failures, `maybe_wan_restart()` (full WAN restart with shared limit + cooldown) |
+| `WAN_RESTARTS >= WAN_RESTART_LIMIT` (default 3/3) | Global recovery hold: passive monitoring only until router reboot clears `/tmp` state |
+| `wan6` fully down (budget remaining) | Tier 0: soft `wan6` restart on attempts 1–2; after 3 failures, `maybe_wan_restart()` (full WAN restart with shared limit + cooldown) |
 | Dead RA gateway (prefix present, connectivity broken) | `keep_gateway()` (if sticky enabled) + `fix_gateway()` with MAC pin; after 3 consecutive failures, `maybe_wan_restart()` (same limit + cooldown) |
 | Missing prefix (DHCPv6 failure) | Escalating ladder: wan6 restart, DHCPv6 renew, `/128` bootstrap, full WAN restart via `maybe_wan_restart()` |
-| Persistent prefix failure after 3 WAN restarts | Stop retrying, notify once, wait for manual ONT powercycle |
+| Persistent prefix failure after 3 WAN restarts | Enter global recovery hold; notify once, wait for manual ONT powercycle or router reboot |
 
 **Escalation timeline for persistent NoPrefixAvail:**
 
 ```
-Each tick: if wan6 is fully down, Tier 0 runs before all other checks.
+Each tick: boot grace -> read counters -> global recovery hold check -> jitter
+  If hold active (3/3 full WAN restarts used this boot):
+    passive monitoring only; no disruptive recovery until router reboot
+
+  If budget remains and wan6 is fully down, Tier 0 runs before all other checks.
   Attempts 1–2: soft ifdown/ifup wan6
   Attempt 3+:   maybe_wan_restart() (subject to WAN_RESTART_LIMIT and cooldown)
 
 Tick 1  (0 min)   No prefix. Restart wan6. Backoff 10 min.
 Tick 3  (10 min)  Still no prefix. DHCPv6 renew. Backoff 20 min.
 Tick 7  (30 min)  Still no prefix. /128 bootstrap. Backoff 30 min.
-Tick 13 (60 min)  Still no prefix. Full WAN restart. Cooldown 20 min.
-Tick 17 (80 min)  Out of cooldown. Ladder resets. Tries again.
+Tick 13 (60 min)  Still no prefix. Full WAN restart #1. Cooldown 20 min.
+Tick 17 (80 min)  Out of cooldown. Ladder continues. Budget still counts restarts used this boot.
 ...
-After 3 full WAN restarts with no recovery: stop, notify once via log and Discord (if configured).
+After 3 actual full WAN restarts this boot: global recovery hold.
+  Passive monitoring only. ONT alert once. Spontaneous recovery does not restore budget.
+  Router reboot clears /tmp/ipv6-watchdog and restores the three-restart budget.
 ```
 
 **Why backoff matters:** Rapid reconnects worsen stale lease conditions on PLDT's DHCPv6 server (see Edge Case 6). The spacing gives the ISP time between attempts.
@@ -559,7 +581,7 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below.
 
-**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current: `ipv6-watchdog` **v3.9.5**, `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers.
+**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current: `ipv6-watchdog` **v3.9.6**, `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers.
 
 Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
 
@@ -571,10 +593,10 @@ chmod 600 /etc/ipv6-watchdog.conf
 
 ```sh
 WAN_RESTART_COOLDOWN=1200   # seconds between full WAN restarts (20 minutes)
-WAN_RESTART_LIMIT=3         # full WAN restarts before ONT powercycle alert
+WAN_RESTART_LIMIT=3         # full WAN restarts per router boot before global recovery hold
 ```
 
-All full WAN restarts go through `maybe_wan_restart()`, which enforces these limits for Tier 0 escalation, no-prefix escalation, and connectivity-failure escalation.
+All full WAN restarts go through `maybe_wan_restart()`, which enforces these limits for Tier 0 escalation, no-prefix escalation, and connectivity-failure escalation. Successful IPv6 recovery does **not** reset `WAN_RESTARTS`; only a router reboot clears the same-boot budget. After `WAN_RESTART_LIMIT` is reached, the global recovery hold blocks all disruptive recovery for the remainder of the boot.
 
 ### Optional: Sticky Gateway (PLDT routers only)
 
@@ -623,6 +645,8 @@ Changes to `/etc/ipv6-watchdog.conf` take effect on the next cron tick. No watch
 | `preferred ... has no MAC, accepting verified current ...` | Preferred gateway lost MAC; current gateway passed internet test |
 | `preferred ... has no MAC, current ... not verified, keeping baseline` | Neither gateway verified; baseline unchanged |
 | `In post-restart cooldown, ... skipping Tier 0 recovery` | Tier 0 deferred during WAN restart cooldown |
+| `Recovery hold active: 3/3 full WAN restarts used this boot; passive monitoring only` | Global same-boot budget exhausted; no disruptive recovery until router reboot |
+| `Recovery hold: IPv6 spontaneously recovered; preserving WAN restart budget until reboot` | IPv6 healthy during hold, but budget remains consumed until reboot |
 
 ---
 
@@ -1186,6 +1210,11 @@ EOF
 ## Changelog
 
 ### v3.9.6
+
+**ipv6-watchdog:**
+
+- Added same-boot global recovery hold: after `WAN_RESTARTS >= WAN_RESTART_LIMIT` (`3/3` by default), the watchdog performs passive monitoring only until `/tmp/ipv6-watchdog` is cleared by a real router reboot.
+- Preserved `WAN_RESTART_FILE` on IPv6 recovery so the full WAN restart budget remains same-boot scoped; non-budget recovery counters still reset.
 
 **ipv6-discord-logger** (component v3.9.6) / **init.d-ipv6-discord-logger:**
 
