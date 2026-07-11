@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Release](https://img.shields.io/badge/Release-v3.9.6-blue)](#)
+[![Release](https://img.shields.io/badge/Release-v3.9.8-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.6 | **Components:** `ipv6-watchdog` v3.9.6, `ipv6-discord-logger` v3.9.6
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.8 | **Components:** `ipv6-watchdog` v3.9.8, `ipv6-discord-logger` v3.9.6
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -16,7 +16,7 @@ Includes root-cause analysis, startup fixes, runtime recovery, escalating failur
 
 ## TL;DR
 
-PLDT Fiber, bridge mode, IPv6 broken: apply UCI config, deploy the scripts (`98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, `97-garp`), add cron, reboot, verify with `ping6 2001:4860:4860::8888`. Full instructions below.
+PLDT Fiber, bridge mode, IPv6 broken: apply UCI config, deploy the scripts (`98-wan6-delay`, `99-ipv6-setup`, `ipv6-watchdog`, `ipv6-prefix-tracker`, `97-garp`), add cron, reboot, verify with `ping6 2001:4860:4860::8888`. The watchdog self-heals runtime failures; the prefix tracker logs prefix initialization and changes, refreshes odhcpd on change, and suppresses no-prefix spam during recovery hold. Full instructions below.
 
 ---
 
@@ -110,6 +110,43 @@ grep -n "dhcpv6_renew" /usr/bin/ipv6-watchdog
 
 Good: returns at least one line confirming the renew tier is present.
 
+**9. Prefix tracker deployed and scheduled**
+
+```sh
+sh -n /usr/bin/ipv6-prefix-tracker
+ls -l /usr/bin/ipv6-prefix-tracker
+crontab -l | grep ipv6-prefix
+grep -n ipv6-prefix-tracker /etc/sysupgrade.conf
+```
+
+Good: syntax passes, file is executable, cron entry exists every 5 minutes, sysupgrade persistence listed.
+
+**10. Prefix tracker producing logs**
+
+```sh
+logread | grep ipv6-prefix
+```
+
+Good: `Prefix initialized: <prefix>` on first run after deploy, then silent until the prefix changes.
+
+**11. Recovery hold state inspection (if hold has been triggered)**
+
+```sh
+# Check if hold latch exists
+ls -l /tmp/ipv6-watchdog/recovery_hold
+
+# Check last detected passive state
+cat /tmp/ipv6-watchdog/hold_status
+
+# Check if ONT alert was sent
+ls -l /tmp/ipv6-watchdog/ont_notified
+
+# Check WAN restart count
+cat /tmp/ipv6-watchdog/wan_restart_count
+```
+
+If none of these files exist, the hold has not been triggered this boot (normal on a healthy router).
+
 ---
 
 ## Table of Contents
@@ -128,6 +165,8 @@ Good: returns at least one line confirming the renew tier is present.
 - [Step 4 - IPv6 Watchdog](#step-4---ipv6-watchdog)
 - [Step 5 - Cron Setup](#step-5---cron-setup)
 - [Step 6 - Gratuitous ARP (Router Swap Recovery)](#step-6---gratuitous-arp-router-swap-recovery)
+- [IPv6 Prefix Tracker](#ipv6-prefix-tracker)
+- [Recovery Hold Detail](#recovery-hold-detail)
 - [Troubleshooting and Debug Commands](#troubleshooting-and-debug-commands)
 - [Validated Behavior](#validated-behavior)
 - [Final Result](#final-result)
@@ -148,7 +187,9 @@ Apply in this order, then reboot:
 4. Deploy `ipv6-watchdog`
 5. Add the watchdog cron job
 6. Deploy `97-garp`
-7. Reboot
+7. Deploy `ipv6-prefix-tracker`
+8. Add the prefix-tracker cron job
+9. Reboot
 
 The commands below deploy Steps 2 through 6. Step 1 must be completed first because the scripts read the UCI network settings at runtime.
 
@@ -194,6 +235,24 @@ grep -qxF '*/1 * * * * /usr/bin/ipv6-watchdog' /etc/crontabs/root || \
 # Step 6 - gratuitous ARP
 wget -q "$BASE/97-garp" -O /etc/hotplug.d/iface/97-garp \
   && chmod +x /etc/hotplug.d/iface/97-garp
+
+# Step 7 - IPv6 prefix tracker (safe deploy: syntax check before replacing)
+wget -q "$BASE/ipv6-prefix-tracker" -O /tmp/ipv6-prefix-tracker.new \
+  && sh -n /tmp/ipv6-prefix-tracker.new \
+  && mv /tmp/ipv6-prefix-tracker.new /usr/bin/ipv6-prefix-tracker \
+  && chmod +x /usr/bin/ipv6-prefix-tracker && echo "prefix-tracker deployed ok" \
+  || echo "syntax check failed, not deployed"
+
+# Step 8 - prefix-tracker cron (idempotent, safe to run multiple times)
+grep -qxF '*/5 * * * * /usr/bin/ipv6-prefix-tracker' /etc/crontabs/root || \
+  echo '*/5 * * * * /usr/bin/ipv6-prefix-tracker' >> /etc/crontabs/root
+
+# Restart cron once after all cron edits are done
+/etc/init.d/cron restart
+
+# Add tracker to sysupgrade persistence
+grep -qxF '/usr/bin/ipv6-prefix-tracker' /etc/sysupgrade.conf || \
+  echo '/usr/bin/ipv6-prefix-tracker' >> /etc/sysupgrade.conf
 ```
 
 > The watchdog deploy uses a temp file and `sh -n` syntax check before replacing the live script. A bad download or interrupted transfer will not overwrite a working watchdog.
@@ -349,7 +408,10 @@ WAN up -> delay (15s, clean start) -> wan6 starts -> prefix acquired -> route fi
 
 ```
 Watchdog (every 1 min) -> check connectivity -> fix route -> escalate if needed -> notify if unrecoverable
+Prefix tracker (every 5 min) -> observe prefix -> log init/change -> refresh odhcpd -> suppress spam during hold
 ```
+
+The prefix tracker is purely observational. It never restarts `wan`, `wan6`, the LAN bridge, or the router. It has no recovery logic and no interaction with the watchdog's escalation ladder. Its only write to system state is refreshing odhcpd after a prefix change so LAN clients receive updated RA without waiting for the next RA interval.
 
 **Layers:**
 
@@ -360,7 +422,8 @@ Watchdog (every 1 min) -> check connectivity -> fix route -> escalate if needed 
 | C - Route engine | `99-ipv6-setup` | Selects working gateway, pins MAC, removes /128 |
 | D - Watchdog | `ipv6-watchdog` | Self-heals runtime failures every 1 min |
 | E - Bootstrap recovery | `ipv6-watchdog` | Recovers DHCPv6 prefix failures automatically |
-| F - Notifications | `ipv6-discord-logger` | Optional Discord alerts and log forwarding |
+| F - Prefix tracker | `ipv6-prefix-tracker` | Observational: logs prefix init/change, refreshes odhcpd, suppresses no-prefix spam during hold |
+| G - Notifications | `ipv6-discord-logger` | Optional Discord alerts and log forwarding |
 
 ```text
   STEP 1          STEP 2 - FIX B        STEP 3 - FIX B       STEP 4              STEP 5 - FIX C
@@ -520,16 +583,17 @@ Runs every 1 minute via cron, with jitter and `flock` to prevent overlap. Checks
 
 The watchdog allows a maximum of **3 actual full WAN restarts per router boot**. The count is cumulative for the boot, not consecutive and not per incident. If IPv6 recovers after restart #1 or #2, `WAN_RESTARTS` stays at 1 or 2 until the router reboots. A real router reboot clears `/tmp/ipv6-watchdog` and restores the three-restart budget.
 
-After `WAN_RESTARTS` reaches `WAN_RESTART_LIMIT` (default 3), the watchdog enters **global recovery hold** for the remainder of that boot. Hold mode is passive monitoring only: check `wan6` state, prefix, and connectivity; log status; send the ONT alert once; detect spontaneous recovery. All disruptive recovery is blocked, including Tier 0 soft `wan6` flaps, DHCPv6 renew, `/128` bootstrap, network reload, and further full WAN restarts. Spontaneous IPv6 recovery during hold does not restore the WAN restart budget.
+After `WAN_RESTARTS` reaches `WAN_RESTART_LIMIT` (default 3), or the explicit `recovery_hold` latch file is touched, the watchdog enters **global recovery hold** for the remainder of that boot. Hold mode is passive monitoring only: it detects one of six states each tick, logs only on first entry or state change, sends the ONT alert once, and detects spontaneous recovery. All disruptive recovery is blocked, including Tier 0 soft `wan6` flaps, DHCPv6 renew, `/128` bootstrap, network reload, and further full WAN restarts. Spontaneous IPv6 recovery during hold does not restore the WAN restart budget.
 
-Hold uses two separate state flags under `/tmp/ipv6-watchdog`:
+Hold uses three state files under `/tmp/ipv6-watchdog`:
 
-| Flag | Meaning |
+| File | Meaning |
 |---|---|
+| `recovery_hold` | Explicit same-boot latch. Touched on first hold entry. Once set, `recovery_hold_active()` returns true even if `WAN_RESTARTS` is somehow reset. Cleared only by router reboot. |
 | `ont_notified` | Critical 3/3 ONT intervention alert already sent this boot (suppresses duplicate red alerts) |
-| `hold_recovered_notified` | Recovery during global hold already reported for the current healthy period (suppresses duplicate green alerts) |
+| `hold_status` | Last detected passive state string. Written only on first hold entry or state transition, not every tick. Values: `wan6-down`, `wan6-up-no-device`, `no-prefix`, `prefix-present-no-route`, `prefix-present-unreachable`, `recovered`. |
 
-When IPv6 becomes unhealthy again during hold, `hold_recovered_notified` is cleared so a later spontaneous recovery can send one new green notice. `ont_notified` stays set for the rest of the boot.
+See [Recovery Hold Detail](#recovery-hold-detail) for the full state machine, state-transition matrix, and expected log patterns.
 
 **Failure domains:**
 
@@ -581,7 +645,7 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below.
 
-**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current: `ipv6-watchdog` **v3.9.6**, `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers.
+**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current: `ipv6-watchdog` **v3.9.8**, `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers. `ipv6-prefix-tracker` has no separate version header.
 
 Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
 
@@ -645,7 +709,9 @@ Changes to `/etc/ipv6-watchdog.conf` take effect on the next cron tick. No watch
 | `preferred ... has no MAC, accepting verified current ...` | Preferred gateway lost MAC; current gateway passed internet test |
 | `preferred ... has no MAC, current ... not verified, keeping baseline` | Neither gateway verified; baseline unchanged |
 | `In post-restart cooldown, ... skipping Tier 0 recovery` | Tier 0 deferred during WAN restart cooldown |
-| `Recovery hold active: 3/3 full WAN restarts used this boot; passive monitoring only` | Global same-boot budget exhausted; no disruptive recovery until router reboot |
+| `Recovery hold entered: 3/3 full WAN restarts used this boot; passive monitoring only` | First hold tick: budget exhausted, hold latch set |
+| `Recovery hold passive status: wan6-down` | Initial passive state detected on first hold tick |
+| `Recovery hold state change: no-prefix -> recovered` | State transition during hold (logged once per change) |
 | `Recovery hold: IPv6 spontaneously recovered; preserving WAN restart budget until reboot` | IPv6 healthy during hold, but budget remains consumed until reboot |
 
 ---
@@ -720,6 +786,127 @@ Test manually:
 ```sh
 ACTION=ifup DEVICE=br-lan /etc/hotplug.d/iface/97-garp
 ```
+
+---
+
+## IPv6 Prefix Tracker
+
+**File:** [`ipv6-prefix-tracker`](ipv6-prefix-tracker) → `/usr/bin/ipv6-prefix-tracker`
+
+An observational component that monitors delegated IPv6 prefix changes on `wan6`. It is separate from the watchdog's disruptive recovery ladder and never restarts `wan`, `wan6`, the LAN bridge, or the router.
+
+| Property | Value |
+|---|---|
+| Repository filename | `ipv6-prefix-tracker` |
+| Router destination | `/usr/bin/ipv6-prefix-tracker` |
+| Cron schedule | Every 5 minutes (`*/5 * * * *`) |
+| Configuration file | `/etc/ipv6-watchdog.conf` (shared with watchdog; reads `DISCORD_WEBHOOK`) |
+| Persistent state file | `/etc/ipv6-prefix-current` (survives reboots; stores last seen prefix) |
+| Syslog tag | `ipv6-prefix` |
+
+**Behavior by state:**
+
+| Condition | What happens |
+|---|---|
+| First run (no state file) | Logs `Prefix initialized: <prefix>`, sends Discord notification, saves prefix to `/etc/ipv6-prefix-current` |
+| Prefix unchanged | Silent exit. No log, no notification, no write. |
+| Prefix changed | Logs `Prefix changed: <old> -> <new>`, reloads odhcpd (or sends SIGHUP as fallback), sends Discord notification, updates state file |
+| No prefix, no hold active | Logs `No delegated prefix currently available on wan6`. Repeats each invocation until prefix returns. |
+| No prefix, hold active | Silent exit. Suppresses the no-prefix log to avoid spamming every 5 minutes while the watchdog is in recovery hold. |
+| Prefix returns during hold | Prefix initialization or change behavior operates normally. Hold suppression only affects the no-prefix log path; it does not suppress prefix init/change notifications. |
+
+**odhcpd reload:** On a prefix change, the tracker runs `/etc/init.d/odhcpd reload`. If that fails, it sends `killall -HUP odhcpd` as a fallback. This refreshes LAN RA immediately so clients receive the new prefix without waiting for the next RA interval.
+
+**Hold-aware suppression:** The tracker checks for `/tmp/ipv6-watchdog/recovery_hold` before logging the no-prefix message. This file is created by the watchdog when it enters recovery hold. The tracker does not create or remove this file — it only reads it.
+
+**Deploy from repo (recommended):**
+
+```sh
+wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6-prefix-tracker \
+  -O /tmp/ipv6-prefix-tracker.new && sh -n /tmp/ipv6-prefix-tracker.new \
+  && mv /tmp/ipv6-prefix-tracker.new /usr/bin/ipv6-prefix-tracker \
+  && chmod +x /usr/bin/ipv6-prefix-tracker && echo "prefix-tracker deployed ok" \
+  || echo "syntax check failed, not deployed"
+```
+
+**Cron entry (idempotent):**
+
+```sh
+grep -qxF '*/5 * * * * /usr/bin/ipv6-prefix-tracker' /etc/crontabs/root || \
+  echo '*/5 * * * * /usr/bin/ipv6-prefix-tracker' >> /etc/crontabs/root
+/etc/init.d/cron restart
+```
+
+**Sysupgrade persistence:**
+
+```sh
+grep -qxF '/usr/bin/ipv6-prefix-tracker' /etc/sysupgrade.conf || \
+  echo '/usr/bin/ipv6-prefix-tracker' >> /etc/sysupgrade.conf
+```
+
+Optional: preserve `/etc/ipv6-prefix-current` to avoid a re-initialization log after firmware upgrade.
+
+---
+
+## Recovery Hold Detail
+
+The watchdog's global recovery hold is a same-boot safety latch that prevents disruptive recovery cycles from repeating indefinitely. Once activated, it persists until a real router reboot clears `/tmp/ipv6-watchdog`.
+
+**Activation:**
+
+The hold activates when either:
+- `WAN_RESTARTS >= WAN_RESTART_LIMIT` (default 3/3 full WAN restarts used this boot), or
+- The explicit `recovery_hold` latch file exists under `/tmp/ipv6-watchdog/`
+
+Once the latch file is touched on the first hold tick, `recovery_hold_active()` returns true even if the restart count file is somehow cleared. The latch is cleared only by router reboot (which recreates `/tmp`).
+
+**Six passive states:**
+
+Each hold tick detects exactly one state using quiet checks (no `ipv6_ok()` logging):
+
+| State | Condition | Detection method |
+|---|---|---|
+| `wan6-down` | wan6 interface not up | `ubus ... @["up"]` returns false |
+| `wan6-up-no-device` | wan6 up but no l3_device | `jsonfilter @["l3_device"]` empty |
+| `no-prefix` | wan6 up, device found, no delegated prefix | `has_prefix()` returns false |
+| `prefix-present-no-route` | prefix exists but no default route | `ip -6 route show default` empty |
+| `prefix-present-unreachable` | prefix + route exist but ping fails | `internet_ok_now()` returns false |
+| `recovered` | prefix + route + internet all pass | `internet_ok_now()` returns true |
+
+**State-change-only logging:**
+
+- **First hold tick:** Logs `Recovery hold entered: N/N full WAN restarts used this boot; passive monitoring only` and `Recovery hold passive status: <state>`. Writes `hold_status`. Sends ONT alert if state is not `recovered`.
+- **Unchanged tick:** No log output. No file write. Completely silent.
+- **State transition:** Logs `Recovery hold state change: <old> -> <new>`. Writes `hold_status`. If transitioning to `recovered`, sends one recovery Discord notification and calls `cleanup_deprecated_v6`.
+- **ONT alert:** One-shot. Sent on the first non-recovered tick where `ont_notified` does not exist. Never repeated, even across state transitions.
+
+**Spontaneous recovery during hold:**
+
+When IPv6 recovers during hold (transition to `recovered`):
+- One recovery Discord notification is sent (if `ont_notified` exists from the prior critical alert)
+- `cleanup_deprecated_v6` removes deprecated LAN addresses
+- `reset_recovery_state()` is **not** called
+- `WAN_RESTARTS` stays at the limit (budget remains exhausted)
+- `ont_notified` stays set
+- `recovery_hold` stays set
+- `hold_status` is updated to `recovered`
+
+The hold remains active. Automatic recovery remains disabled until router reboot. If IPv6 degrades again later, the state transition is logged but no new ONT alert is sent (one-shot).
+
+**ONT power cycling:**
+
+Power-cycling the ONT may restore IPv6 connectivity (the ISP clears the stale lease), but it does **not** clear the recovery hold or re-arm the WAN restart budget. Only a router reboot clears `/tmp` and restores full recovery capability. This is by design: once three full WAN restarts have been attempted this boot, the router should be rebooted to ensure a clean state.
+
+**State-transition matrix:**
+
+| Previous → New | Log output | Side effects |
+|---|---|---|
+| (empty) → any | Hold entry + initial status | ONT alert if not recovered; `hold_status` written |
+| any → same | *(silent)* | *(none)* |
+| non-recovered → non-recovered | State change logged | `hold_status` updated |
+| non-recovered → recovered | State change + recovery logged | Recovery Discord; cleanup_deprecated_v6; `hold_status` updated |
+| recovered → non-recovered | State change logged | ONT alert only if `ont_notified` not yet set; `hold_status` updated |
+| recovered → recovered | *(silent)* | *(none)* |
 
 ---
 
@@ -849,10 +1036,19 @@ cat >> /etc/sysupgrade.conf << 'EOF'
 /etc/hotplug.d/iface/98-wan6-delay
 /etc/hotplug.d/iface/99-ipv6-setup
 /usr/bin/ipv6-watchdog
+/usr/bin/ipv6-prefix-tracker
 /etc/crontabs/root
 /etc/sysctl.conf
 EOF
 ```
+
+Optional: preserve the prefix tracker's state file so it does not re-log `Prefix initialized` after a firmware upgrade (the prefix is usually the same):
+
+```sh
+echo '/etc/ipv6-prefix-current' >> /etc/sysupgrade.conf
+```
+
+Do not include `router-pulls/` or any local-only working directories.
 
 If using Discord notifications, also add:
 
@@ -1150,10 +1346,10 @@ wget -q https://raw.githubusercontent.com/melskiedev/IPv6-PLDT-OpenWrt/main/ipv6
   && chmod +x /usr/bin/ipv6-discord-logger
 ```
 
-The default `WATCH_TAGS` covers this repo's scripts only. To forward logs from additional scripts (e.g. `tailscale-watchdog`, `ipv6-prefix`), add this to `/etc/ipv6-watchdog.conf`:
+The default `WATCH_TAGS` covers this repo's scripts only, including `ipv6-prefix` for the prefix tracker. To forward logs from additional scripts (e.g. `tailscale-watchdog`), add this to `/etc/ipv6-watchdog.conf`:
 
 ```sh
-WATCH_TAGS="ipv6-setup|ipv6-watchdog|tailscale-watchdog|discord-logger|ipv6-prefix"
+WATCH_TAGS="ipv6-setup|ipv6-watchdog|ipv6-prefix|tailscale-watchdog|discord-logger"
 ```
 
 Then restart the logger to pick up the change:
@@ -1208,6 +1404,26 @@ EOF
 ---
 
 ## Changelog
+
+### v3.9.8
+
+**ipv6-watchdog:**
+
+- `recovery_hold_active()` now checks an explicit `recovery_hold` file latch in addition to `WAN_RESTARTS >= WAN_RESTART_LIMIT`, ensuring the hold persists even if the restart count is somehow reset mid-boot.
+- Hold branch replaced per-tick repeated logging with state-change-only logging: detects 6 passive states (`wan6-down`, `wan6-up-no-device`, `no-prefix`, `prefix-present-no-route`, `prefix-present-unreachable`, `recovered`) and logs only on first entry or state transition.
+- `hold_status` file written only on initialization or state change, not every tick.
+- `ipv6_ok()` no longer called from hold branch; uses `has_prefix()`, `ip -6 route show`, and `internet_ok_now()` for quiet passive detection.
+- `reset_recovery_state()` no longer called from hold mode; WAN restart budget, `ONT_FLAG`, and `recovery_hold` all preserved on spontaneous recovery until router reboot.
+- Removed `HOLD_RECOVERED_FLAG` (replaced by `hold_status` state tracking).
+
+**ipv6-prefix-tracker** (new component, added to repo):
+
+- Added as canonical baseline from live router copies (byte-for-byte identical on both routers).
+- Hold-aware suppression: when `recovery_hold` file exists, suppresses the repeated "No delegated prefix currently available" log. Does not suppress prefix initialization or change notifications.
+
+**Repository:**
+
+- Added `tests/test-recovery-hold.sh`: portable test harness that stubs router commands and exercises the actual hold logic across 10 scenarios (44 assertions).
 
 ### v3.9.6
 

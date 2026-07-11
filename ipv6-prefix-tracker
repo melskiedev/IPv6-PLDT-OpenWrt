@@ -11,6 +11,7 @@ LOGTAG="ipv6-prefix"
 CONF="/etc/ipv6-watchdog.conf"
 STATE_FILE="/etc/ipv6-prefix-current"
 WAN_IF="wan6"
+RECOVERY_HOLD_FILE="/tmp/ipv6-watchdog/recovery_hold"
 
 log() { logger -t "$LOGTAG" "$1"; }
 
@@ -20,6 +21,10 @@ PREFIX=$(ubus call network.interface.$WAN_IF status 2>/dev/null \
     | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null)
 
 [ -z "$PREFIX" ] && {
+    if [ -f "$RECOVERY_HOLD_FILE" ]; then
+        exit 0
+    fi
+
     log "No delegated prefix currently available on $WAN_IF"
     exit 0
 }
