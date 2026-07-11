@@ -1,0 +1,89 @@
+#!/bin/sh
+# /usr/bin/ipv6-prefix-tracker
+# Tracks delegated IPv6 prefix changes on wan6.
+# Logs only on first initialization or when the prefix changes.
+# On prefix change, immediately refreshes odhcpd so LAN clients
+# receive the new prefix without waiting for the next RA interval.
+# State stored in /etc so it survives reboots.
+# Runs every 5 minutes via cron.
+
+LOGTAG="ipv6-prefix"
+CONF="/etc/ipv6-watchdog.conf"
+STATE_FILE="/etc/ipv6-prefix-current"
+WAN_IF="wan6"
+
+log() { logger -t "$LOGTAG" "$1"; }
+
+[ -f "$CONF" ] && . "$CONF"
+
+PREFIX=$(ubus call network.interface.$WAN_IF status 2>/dev/null \
+    | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null)
+
+[ -z "$PREFIX" ] && {
+    log "No delegated prefix currently available on $WAN_IF"
+    exit 0
+}
+
+OLD=$(cat "$STATE_FILE" 2>/dev/null)
+
+HOST=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
+TS=$(date '+%b %d %Y %I:%M:%S %p')
+
+notify() {
+    local title="$1"
+    local msg="$2"
+    local color="$3"
+
+    [ -z "$DISCORD_WEBHOOK" ] && return 0
+
+    SAFE_MSG=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    curl -s \
+        -H "Content-Type: application/json" \
+        -X POST \
+        -d "{
+          \"embeds\": [{
+            \"title\": \"$title\",
+            \"description\": \"\`\`\`$SAFE_MSG\`\`\`\",
+            \"color\": $color,
+            \"footer\": { \"text\": \"$HOST $TS\" }
+          }]
+        }" \
+        "$DISCORD_WEBHOOK" >/dev/null 2>&1
+}
+
+push_ra() {
+    # Refresh odhcpd so LAN clients receive the current delegated prefix
+    # without restarting the LAN interface.
+    if /etc/init.d/odhcpd reload >/dev/null 2>&1; then
+        log "Reloaded odhcpd to refresh LAN RA"
+        return 0
+    fi
+
+    killall -HUP odhcpd 2>/dev/null && {
+        log "Sent SIGHUP to odhcpd to refresh LAN RA"
+        return 0
+    }
+
+    log "WARNING: failed to refresh odhcpd RA"
+    return 1
+}
+
+if [ -z "$OLD" ]; then
+    echo "$PREFIX" > "$STATE_FILE"
+    MSG="Prefix initialized: $PREFIX"
+    log "$MSG"
+    notify "IPv6 Prefix Tracker" "$MSG" 3066993
+    exit 0
+fi
+
+if [ "$PREFIX" != "$OLD" ]; then
+    echo "$PREFIX" > "$STATE_FILE"
+    MSG="Prefix changed: $OLD -> $PREFIX"
+    log "$MSG"
+    push_ra
+    notify "IPv6 Prefix Changed" "$MSG" 16744272
+    exit 0
+fi
+
+exit 0
