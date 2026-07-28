@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Release](https://img.shields.io/badge/Release-v3.9.8-blue)](#)
+[![Release](https://img.shields.io/badge/Release-v3.9.9-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.8 | **Components:** `ipv6-watchdog` v3.9.9 (unreleased, planned), `ipv6-discord-logger` v3.9.6
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.9 | **Components:** `ipv6-watchdog` v3.9.9, `ipv6-discord-logger` v3.9.6
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -645,7 +645,7 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below.
 
-**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current repo release: `ipv6-watchdog` **v3.9.8** (tagged); development header in source is **v3.9.9** (unreleased, planned). `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers. `ipv6-prefix-tracker` has no separate version header.
+**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current repo release: `ipv6-watchdog` **v3.9.9**. `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers. `ipv6-prefix-tracker` has no separate version header.
 
 Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
 
@@ -1405,7 +1405,7 @@ EOF
 
 ## Changelog
 
-### Unreleased — planned v3.9.9
+### v3.9.9
 
 **ipv6-watchdog:**
 
