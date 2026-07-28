@@ -1,7 +1,7 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
-# v3.9.8: state-change-only hold logging, recovery_hold latch, prefix-tracker hold suppression.
+# v3.9.9: reachability confirmation delay suppresses false-positive transient IPv6 alerts.
 # Runs every 1 minute via cron.
 
 LOGTAG="ipv6-watchdog"
@@ -74,6 +74,16 @@ WAN_RESTART_COOLDOWN="${WAN_RESTART_COOLDOWN:-1200}"
 # How many full WAN restarts before stopping and requiring manual ONT powercycle.
 WAN_RESTART_LIMIT="${WAN_RESTART_LIMIT:-3}"
 
+# Delay in seconds between the first and second external-reachability checks
+# inside ipv6_ok(). Suppresses false-positive alerts from transient ISP drops
+# that recover within a few seconds. Default 3; non-numeric falls back to 3;
+# capped at 30. Set to 0 to disable the delayed confirmation entirely.
+REACHABILITY_CONFIRM_DELAY="${REACHABILITY_CONFIRM_DELAY:-3}"
+case "$REACHABILITY_CONFIRM_DELAY" in
+    ''|*[!0-9]*) REACHABILITY_CONFIRM_DELAY=3 ;;
+esac
+[ "$REACHABILITY_CONFIRM_DELAY" -gt 30 ] && REACHABILITY_CONFIRM_DELAY=30
+
 # State files
 FAIL_FILE="$STATE_DIR/fail_count"
 PREFIX_FAIL_FILE="$STATE_DIR/prefix_fail_count"
@@ -108,11 +118,25 @@ ipv6_ok() {
         return 1
     fi
 
-    # Layer 3: external reachability
-    ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
-    ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    # Layer 3: external reachability with confirmation delay.
+    # Suppresses false-positive alerts from transient ISP drops that recover
+    # within a few seconds. On initial miss, wait REACHABILITY_CONFIRM_DELAY
+    # and re-test. If the confirmation succeeds, return healthy with no log
+    # (the initial miss was transient). If both checks fail, return failure
+    # without logging here; the caller logs the confirmed failure after
+    # gateway recovery has been attempted, so a gateway fix that restores
+    # connectivity does not produce a spurious reachability failure log.
+    if internet_ok_now; then
+        return 0
+    fi
 
-    log "Validation failed: prefix and route exist but internet unreachable"
+    if [ "$REACHABILITY_CONFIRM_DELAY" -gt 0 ]; then
+        sleep "$REACHABILITY_CONFIRM_DELAY"
+        if internet_ok_now; then
+            return 0
+        fi
+    fi
+
     return 1
 }
 
@@ -312,10 +336,12 @@ fix_gateway() {
     # Do not trust link-local gateway ping alone on PLDT -- the dead gateway
     # responds to direct ping6 intermittently but does not forward internet
     # traffic reliably.
+    # Silent success on this path: the initial ipv6_ok miss was transient and
+    # the current gateway now verifies. Logging here would forward a
+    # spurious "no fix needed" notice to Discord. GOOD_GW_FILE is updated so
+    # the sticky gateway baseline stays in sync.
     if [ -n "$current" ]; then
-        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
-           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-            log "Current gateway $current has internet reachability, no fix needed"
+        if internet_ok_now; then
             echo "$current" > "$GOOD_GW_FILE"
             rm -f "$route_snapshot"
             return 0
@@ -878,6 +904,16 @@ if fix_gateway; then
         cleanup_deprecated_v6
         exit 0
     fi
+fi
+
+# Confirmed Layer-3 failure: prefix and route still exist, both initial and
+# delayed external-reachability checks failed, and gateway recovery did not
+# restore connectivity. Emit one confirmed validation log before the existing
+# FAILS increment and three-consecutive-failure escalation. Missing-prefix
+# and missing-route paths already logged their specific messages above and
+# exit before reaching this point.
+if has_prefix && ip -6 route show default dev "$WAN_DEV" | grep -q default; then
+    log "Validation failed after confirmation: prefix and route exist but internet unreachable"
 fi
 
 FAILS=$((FAILS + 1))

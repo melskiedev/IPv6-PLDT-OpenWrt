@@ -5,7 +5,7 @@
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
 [![Release](https://img.shields.io/badge/Release-v3.9.8-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.8 | **Components:** `ipv6-watchdog` v3.9.8, `ipv6-discord-logger` v3.9.6
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.2 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current repo release:** v3.9.8 | **Components:** `ipv6-watchdog` v3.9.9 (unreleased, planned), `ipv6-discord-logger` v3.9.6
 
 A production-grade, self-healing IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode.
 Includes root-cause analysis, startup fixes, runtime recovery, escalating failure handling, and real-world edge cases observed in production use.
@@ -645,7 +645,7 @@ The watchdog deploy downloads to a temp file first, runs a shell syntax check (`
 
 The watchdog sources this file on every cron tick. Scripts that share behavior (`99-ipv6-setup`, `97-garp`) also read it where noted below.
 
-**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current: `ipv6-watchdog` **v3.9.8**, `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers. `ipv6-prefix-tracker` has no separate version header.
+**Versioning:** Git tags (`v3.9.x`) mark repo/deploy bundle releases. Versioned components carry `# vX.Y.Z` headers for router-side inspection (`grep -m1 '^# v' /usr/bin/ipv6-watchdog`). Current repo release: `ipv6-watchdog` **v3.9.8** (tagged); development header in source is **v3.9.9** (unreleased, planned). `ipv6-discord-logger` **v3.9.6** (paired with `init.d-ipv6-discord-logger`, no separate header), `99-ipv6-setup` **v3.9.6**. Simple glue (`97-garp`, `98-wan6-delay`) have no version headers. `ipv6-prefix-tracker` has no separate version header.
 
 Restrict permissions whenever this file exists (required if it contains Discord webhook URLs):
 
@@ -1404,6 +1404,20 @@ EOF
 ---
 
 ## Changelog
+
+### Unreleased — planned v3.9.9
+
+**ipv6-watchdog:**
+
+- Added `REACHABILITY_CONFIRM_DELAY` configuration (default 3 seconds, non-numeric falls back to 3, capped at 30). When the first external-reachability check in `ipv6_ok()` fails, the watchdog waits this delay and re-tests before declaring a Layer-3 failure. Suppresses false-positive transient IPv6 reachability alerts from brief ISP drops that recover within a few seconds.
+- `ipv6_ok()` now returns healthy with no log when the delayed confirmation succeeds (transient miss). When both checks fail, it returns failure without logging the external-reachability failure; the confirmed-failure log is emitted later in the main connectivity-failure path only after gateway recovery also fails.
+- `fix_gateway()` current-gateway-good path is now silent: when the current gateway passes the follow-up Internet test, it updates `GOOD_GW_FILE` and returns success without the previous "Current gateway ... has internet reachability, no fix needed" notice. This path represents a transient initial miss that would otherwise forward a spurious notice to Discord.
+- Main connectivity-failure path: after `fix_gateway()` and the post-fix `ipv6_ok()` validation both fail, emits one confirmed validation log "Validation failed after confirmation: prefix and route exist but internet unreachable" before the existing `FAILS` increment and three-consecutive-failure escalation. The log is gated on both prefix and route still being present, so missing-prefix and missing-route paths retain their existing specific messages without an additional confirmed-failure log.
+- The `internet_ok_now()` helper is now used consistently inside `ipv6_ok()` (replacing the previous inline `ping6` pair), keeping the dual-target Google + Cloudflare reachability test identical.
+
+**Repository:**
+
+- Added `tests/test-reachability-confirmation.sh`: dedicated test harness (28 assertions across 9 scenarios) for the reachability confirmation delay behavior, using stateful `ping6` and a recording `sleep` stub. Test 8 verifies the production sanitize/cap logic end-to-end by running the actual watchdog source with four separate configs (unset, non-numeric, 99, 0) and inspecting the recorded confirmation-delay sleep values. Does not modify the existing recovery-hold suite.
 
 ### v3.9.8
 
