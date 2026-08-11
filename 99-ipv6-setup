@@ -1,9 +1,24 @@
 #!/bin/sh
 # /etc/hotplug.d/iface/99-ipv6-setup
-# v3.9.6
-# IPv6 route fix engine. Runs on wan6 ifup.
-# Selects the working gateway via per-candidate internet reachability testing,
-# pins its MAC, installs the default route, and removes the /128.
+# v3.10.0
+#
+# Event-driven, PD-first, source-aware, NON-DISRUPTIVE route/gateway helper.
+# Runs ONLY on wan6 ifup. Ensures an EFFECTIVE kernel route for PD-derived
+# LAN traffic through a PD-source-verified gateway using the MINIMUM route
+# mutation. Health is effective routing: an explicit 'default from <PD_CIDR>'
+# rule is OPTIONAL (live evidence: generic-default-only is healthy)
+# and is only replaced/installed when one already exists (stale-rule
+# correction). Never escalates to WAN/wan6 restart, never modifies UCI,
+# never touches recovery counters, never deletes WAN /128.
+#
+# Canonical ownership:
+#   ipv6-watchdog    = sole disruptive IPv6/WAN recovery owner
+#   99-ipv6-setup    = immediate wan6-ifup route/gateway helper only
+#   98-wan6-delay    = boot timing (not touched here)
+#   ipv6-prefix-tracker = prefix history + odhcpd refresh
+#
+# If PD is absent or no gateway works, exit safely and let ipv6-watchdog handle
+# recovery on its next tick.
 
 [ "$ACTION" = "ifup" ] || exit 0
 [ "$INTERFACE" = "wan6" ] || exit 0
@@ -11,9 +26,7 @@
 LOGTAG="ipv6-setup"
 log() { logger -t "$LOGTAG" "$1"; }
 
-# Prevent overlapping executions. This script can run for 2+ minutes during
-# gateway scan and WAN recovery. Repeated wan6 hotplug events can overlap.
-# flock is preferred; mkdir is a fallback for images without flock.
+# Prevent overlapping executions.
 LOCK="/tmp/ipv6-setup.lock"
 LOCK_DIR="/tmp/ipv6-setup.lock.dir"
 if command -v flock >/dev/null 2>&1; then
@@ -29,70 +42,434 @@ fi
 
 CONF="/etc/ipv6-watchdog.conf"
 [ -f "$CONF" ] && . "$CONF"
+LAN_DEV="${LAN_DEV:-br-lan}"
 
-# Remove temporary WAN /128 addresses after connectivity is confirmed.
-# Set to 0 on routers where WAN /128 is a legitimate persistent address (e.g. Globe IA_NA mode).
-CLEANUP_WAN128="${CLEANUP_WAN128:-1}"
+# ================================================================
+# PD-first context helpers (self-contained, mirrors ipv6-watchdog)
+# ================================================================
 
-# ===== GET WAN DEVICE =====
-WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
-    | jsonfilter -e '@["l3_device"]' 2>/dev/null)
-[ -z "$WAN_DEV" ] && { log "ERROR: cannot determine WAN device"; exit 1; }
+# Read the delegated prefix address from wan6 status.
+get_pd_addr() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null
+}
+
+# Read the delegated prefix mask from wan6 status.
+get_pd_mask() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["ipv6-prefix"][0].mask' 2>/dev/null
+}
+
+# Determine the WAN L3 device from wan6 status.
+get_wan_dev() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["l3_device"]' 2>/dev/null
+}
+
+# Returns 0 (true) if the plain IPv6 address is link-local (fe80::/10).
+is_link_local() {
+    local a="$1" g1 n
+    [ -n "$a" ] || return 1
+    g1="${a%%:*}"
+    case "$g1" in
+        ''|*[!0-9A-Fa-f]*) return 1 ;;
+    esac
+    n=$((0x$g1))
+    [ "$n" -ge $((0xfe80)) ] && [ "$n" -le $((0xfebf)) ]
+}
+
+# Returns 0 (true) if the plain IPv6 address is ULA (fc00::/7).
+is_ula() {
+    local a="$1" g1 n
+    [ -n "$a" ] || return 1
+    g1="${a%%:*}"
+    case "$g1" in
+        ''|*[!0-9A-Fa-f]*) return 1 ;;
+    esac
+    n=$((0x$g1))
+    [ "$n" -ge $((0xfc00)) ] && [ "$n" -le $((0xfdff)) ]
+}
+
+# BusyBox-compatible prefix-membership check.
+# Returns 0 (true) if ADDR belongs to PREFIX/MASK, 1 otherwise.
+addr_in_prefix() {
+    local addr="$1" prefix="$2" mask="$3"
+    [ -n "$addr" ] && [ -n "$prefix" ] && [ -n "$mask" ] || return 1
+    case "$mask" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$mask" -ge 0 ] 2>/dev/null || return 1
+    [ "$mask" -le 128 ] || return 1
+
+    _expand_ipv6() {
+        local a="$1" left="" right="" out="" g i
+        local lcount=0 rcount=0 missing
+        case "$a" in
+            *::*)
+                left="${a%%::*}"
+                right="${a##*::}"
+                ;;
+            *)
+                left="$a"
+                ;;
+        esac
+        _count_groups() {
+            local s="$1" c=0 rest g
+            rest="$s"
+            while [ -n "$rest" ]; do
+                case "$rest" in
+                    *:*)
+                        g="${rest%%:*}"
+                        [ -n "$g" ] && c=$((c + 1))
+                        rest="${rest#*:}"
+                        ;;
+                    *)
+                        [ -n "$rest" ] && c=$((c + 1))
+                        break
+                        ;;
+                esac
+            done
+            echo "$c"
+        }
+        lcount=$(_count_groups "$left")
+        rcount=$(_count_groups "$right")
+        missing=$((8 - lcount - rcount))
+        [ "$missing" -lt 0 ] && missing=0
+        _emit_groups() {
+            local s="$1" rest g
+            rest="$s"
+            while [ -n "$rest" ]; do
+                case "$rest" in
+                    *:*)
+                        g="${rest%%:*}"
+                        if [ -n "$g" ]; then
+                            printf '%04x\n' "0x$g" 2>/dev/null || echo "0000"
+                        fi
+                        rest="${rest#*:}"
+                        ;;
+                    *)
+                        if [ -n "$rest" ]; then
+                            printf '%04x\n' "0x$rest" 2>/dev/null || echo "0000"
+                        fi
+                        break
+                        ;;
+                esac
+            done
+        }
+        _emit_groups "$left"
+        i=0
+        while [ "$i" -lt "$missing" ]; do
+            echo "0000"
+            i=$((i + 1))
+        done
+        _emit_groups "$right"
+    }
+
+    local a_groups p_groups
+    a_groups=$(_expand_ipv6 "$addr")
+    p_groups=$(_expand_ipv6 "$prefix")
+    [ -n "$a_groups" ] && [ -n "$p_groups" ] || return 1
+
+    local full_groups=$((mask / 16))
+    local rem_bits=$((mask % 16))
+    local i=1
+    while [ "$i" -le "$full_groups" ]; do
+        local ag pg
+        ag=$(printf '%s\n' "$a_groups" | sed -n "${i}p")
+        pg=$(printf '%s\n' "$p_groups" | sed -n "${i}p")
+        [ "$ag" = "$pg" ] || return 1
+        i=$((i + 1))
+    done
+    if [ "$rem_bits" -gt 0 ]; then
+        local ag pg amask av pv
+        ag=$(printf '%s\n' "$a_groups" | sed -n "${i}p")
+        pg=$(printf '%s\n' "$p_groups" | sed -n "${i}p")
+        amask=$((0xffff & ~((1 << (16 - rem_bits)) - 1) & 0xffff))
+        av=$((0x$ag & amask))
+        pv=$((0x$pg & amask))
+        [ "$av" = "$pv" ] || return 1
+    fi
+    return 0
+}
+
+# Determine the PD-derived global source address on LAN_DEV.
+# Prefers stable (non-temporary) addresses, falls back to temporary.
+# Returns the PLAIN address (no /suffix) on stdout, or empty.
+get_lan_pd_src() {
+    [ -n "$LAN_DEV" ] || return 0
+    [ -n "$PD_ADDR" ] && [ -n "$PD_MASK" ] || return 0
+    local line addr addr_noslash candidate
+    candidate=$(ip -6 addr show dev "$LAN_DEV" 2>/dev/null \
+        | awk '/inet6 .*scope global/ && !/deprecated/ && !/tentative/ && !/dadfailed/ && !/temporary/{print}' \
+        | while read -r line; do
+            addr=$(printf '%s\n' "$line" | awk '{print $2}')
+            [ -n "$addr" ] || continue
+            addr_noslash="${addr%%/*}"
+            [ -n "$addr_noslash" ] || continue
+            is_link_local "$addr_noslash" && continue
+            is_ula "$addr_noslash" && continue
+            if addr_in_prefix "$addr_noslash" "$PD_ADDR" "$PD_MASK"; then
+                printf '%s\n' "$addr_noslash"
+                return 0
+            fi
+        done | head -1)
+    if [ -n "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    candidate=$(ip -6 addr show dev "$LAN_DEV" 2>/dev/null \
+        | awk '/inet6 .*scope global/ && !/deprecated/ && !/tentative/ && !/dadfailed/ && /temporary/{print}' \
+        | while read -r line; do
+            addr=$(printf '%s\n' "$line" | awk '{print $2}')
+            [ -n "$addr" ] || continue
+            addr_noslash="${addr%%/*}"
+            [ -n "$addr_noslash" ] || continue
+            is_link_local "$addr_noslash" && continue
+            is_ula "$addr_noslash" && continue
+            if addr_in_prefix "$addr_noslash" "$PD_ADDR" "$PD_MASK"; then
+                printf '%s\n' "$addr_noslash"
+                return 0
+            fi
+        done | head -1)
+    if [ -n "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+}
+
+# Populate PD context variables: WAN_DEV, PD_ADDR, PD_MASK, PD_CIDR, LAN_PD_SRC.
+populate_pd_context() {
+    WAN_DEV=$(get_wan_dev)
+    PD_ADDR=$(get_pd_addr)
+    PD_MASK=$(get_pd_mask)
+    if [ -n "$PD_ADDR" ] && [ -n "$PD_MASK" ]; then
+        PD_CIDR="$PD_ADDR/$PD_MASK"
+    else
+        PD_CIDR=""
+    fi
+    if [ -n "$PD_CIDR" ]; then
+        LAN_PD_SRC=$(get_lan_pd_src)
+    else
+        LAN_PD_SRC=""
+    fi
+}
+
+# PD-source-bound external connectivity test.
+# Requires PD_CIDR and LAN_PD_SRC. Tests Google and Cloudflare IPv6 targets.
+pd_internet_ok() {
+    [ -n "$PD_CIDR" ] && [ -n "$LAN_PD_SRC" ] || return 1
+    ping6 -c 2 -W 3 -I "$LAN_PD_SRC" 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+    ping6 -c 2 -W 3 -I "$LAN_PD_SRC" 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# ================================================================
+# Effective PD-source routing (kernel truth) + coherence wrapper
+# ================================================================
+
+# Returns 0 when the KERNEL resolves a packet from LAN_PD_SRC to a public
+# IPv6 target through WAN_DEV with a usable path (`ip -6 route get`, pure
+# lookup, non-disruptive). Live evidence proves generic-default-
+# only routing is healthy, so an explicit 'default from <PD_CIDR>' rule is
+# NEVER required for health.
+#
+# No-argument form = health-truth; a `via` gateway is deliberately NOT
+# required (no forced route shape). Optional want_gw form = candidate
+# identity verification ONLY: usable `via` required and must equal want_gw.
+# Rejects: missing context, lookup failure, empty output, unreachable /
+# prohibit / blackhole / throw routes (rc is 0 for null routes -- keyword
+# rejection required), Error/Invalid/"no route" output, dev != WAN_DEV, and
+# want_gw mismatch. Literal public IPs only; no DNS.
+pd_route_effective() {
+    local want_gw="$1"
+    local out via
+    [ -n "$WAN_DEV" ] || return 1
+    [ -n "$LAN_PD_SRC" ] || return 1
+    out=$(ip -6 route get 2001:4860:4860::8888 from "$LAN_PD_SRC" 2>&1) || return 1
+    [ -n "$out" ] || return 1
+    case "$out" in
+        *unreachable*|*prohibit*|*blackhole*|*throw*) return 1 ;;
+    esac
+    case "$out" in
+        *Error*|*Invalid*|*"no route"*|*"No route"*|*"RTNETLINK answers"*) return 1 ;;
+    esac
+    case "$out" in
+        *" dev $WAN_DEV"*) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$want_gw" ]; then
+        via=$(printf '%s\n' "$out" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+        [ -n "$via" ] || return 1
+        [ "$via" = "$want_gw" ] || return 1
+    fi
+    return 0
+}
+
+# Coherence wrapper: generic default route exists on WAN_DEV AND
+# pd_route_effective [want_gw] passes. Health never requires the generic
+# default and the effective PD path to share a gateway; the want_gw form is
+# candidate-trial verification only.
+# Usage: pd_routes_ok [gateway]
+pd_routes_ok() {
+    local want_gw="$1"
+    [ -n "$WAN_DEV" ] || return 1
+    [ -n "$PD_CIDR" ] || return 1
+    ip -6 route show default dev "$WAN_DEV" 2>/dev/null | grep -q default || return 1
+    pd_route_effective "$want_gw"
+}
+
+# Capture the current default route set for WAN_DEV into a snapshot file.
+snapshot_default_routes() {
+    local out="$1"
+    : > "$out"
+    ip -6 route show default dev "$WAN_DEV" 2>/dev/null > "$out"
+    [ -s "$out" ]
+}
+
+# Replay every route line from a snapshot via `ip -6 route replace`.
+restore_route_snapshot() {
+    local snapshot="$1"
+    local line
+    [ -s "$snapshot" ] || { rm -f "$snapshot" 2>/dev/null; return 0; }
+    while read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in
+            *" dev "*)
+                ip -6 route replace $line 2>/dev/null
+                ;;
+            *)
+                ip -6 route replace $line dev "$WAN_DEV" 2>/dev/null
+                ;;
+        esac
+    done < "$snapshot"
+    rm -f "$snapshot" 2>/dev/null
+    return 0
+}
+
+# Remove only the generic and PD source-specific default routes that THIS
+# SCRIPT installed for a specific candidate gateway. Does NOT delete
+# unrelated routes, does NOT broadly flush defaults. Used when a candidate
+# fails and no snapshot exists to restore.
+remove_candidate_routes() {
+    local gw="$1"
+    [ -n "$gw" ] || return 0
+    [ -n "$WAN_DEV" ] || return 0
+    ip -6 route del default via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null
+    # Only remove a PD source-specific rule that THIS candidate trial actually
+    # installed (preexisting stale rules are never deleted here -- they survive
+    # for the next candidate to correct, and the snapshot path replays them).
+    if [ -n "$PD_CIDR" ] \
+        && ip -6 route show default from "$PD_CIDR" dev "$WAN_DEV" 2>/dev/null | grep -q "via $gw"; then
+        ip -6 route del default from "$PD_CIDR" via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null
+    fi
+    return 0
+}
+
+# Install the MINIMUM route mutation needed for gateway gw to carry PD
+# traffic: generic default via gw, and the PD source-specific default via gw
+# ONLY IF one already exists (targeted stale-rule correction -- never
+# manufactured; live evidence proves generic-only routing is effective).
+# Returns 0 only if every performed operation succeeded.
+install_gw_routes() {
+    local gw="$1"
+    [ -n "$gw" ] || return 1
+    [ -n "$WAN_DEV" ] || return 1
+    if ! ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null; then
+        return 1
+    fi
+    if [ -n "$PD_CIDR" ] && ip -6 route show default from "$PD_CIDR" dev "$WAN_DEV" 2>/dev/null | grep -q default; then
+        if ! ip -6 route replace default from "$PD_CIDR" via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Rollback invariant: AFTER EVERY FAILED CANDIDATE ATTEMPT the runtime route
+# state must equal the pre-candidate state exactly.
+#   - original snapshot exists  -> replay it verbatim, then re-snapshot for
+#     the next trial (replace never deletes unrelated routes, so unrelated
+#     routes survive)
+#   - no original snapshot      -> remove only the routes this candidate
+#     trial may have created (generic + PD source-specific via gw, metric
+#     512)
+# Do not proceed to the next candidate until rollback is complete.
+rollback_candidate() {
+    local gw="$1"
+    if [ -n "$SNAPSHOT" ] && [ -s "$SNAPSHOT" ]; then
+        restore_route_snapshot "$SNAPSHOT"
+        # Re-snapshot for the next candidate (restore consumed the file).
+        snapshot_default_routes "$SNAPSHOT" 2>/dev/null || SNAPSHOT=""
+    else
+        remove_candidate_routes "$gw"
+    fi
+}
+
+# ================================================================
+# Main
+# ================================================================
+
+# --- 1. Resolve WAN device ---
+WAN_DEV=$(get_wan_dev)
+if [ -z "$WAN_DEV" ]; then
+    log "ERROR: cannot determine WAN device"
+    exit 1
+fi
 log "WAN device: $WAN_DEV"
 
-# ===== WAIT FOR LINK-LOCAL =====
-# Using a while loop to avoid a seq fork on ash/BusyBox.
-i=0
-while [ "$i" -lt 10 ]; do
-    i=$((i + 1))
-    lla=$(ip -6 addr show dev "$WAN_DEV" | awk '/fe80.*scope link/{print $2}')
-    [ -n "$lla" ] && { log "LLA ready: $lla"; break; }
-    [ "$i" -eq 10 ] && { log "ERROR: LLA never appeared on $WAN_DEV"; exit 1; }
-    sleep 2
-done
-
-# ===== WAIT FOR PREFIX DELEGATION =====
-log "Waiting for prefix delegation..."
-PREFIX=""
-i=0
-while [ "$i" -lt 15 ]; do
-    i=$((i + 1))
-    PREFIX=$(ubus call network.interface.wan6 status 2>/dev/null \
-        | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null)
-    [ -n "$PREFIX" ] && { log "Prefix received: $PREFIX"; break; }
-    sleep 3
-done
-if [ -z "$PREFIX" ]; then
-    log "WARNING: no PD received after 45s -- deferring prefix recovery to ipv6-watchdog"
+# --- 2. Discover IA_PD ---
+log "Checking prefix delegation..."
+PD_ADDR=$(get_pd_addr)
+PD_MASK=$(get_pd_mask)
+if [ -z "$PD_ADDR" ] || [ -z "$PD_MASK" ]; then
+    log "WARNING: no IA_PD received -- deferring prefix recovery to ipv6-watchdog"
     exit 0
 fi
+PD_CIDR="$PD_ADDR/$PD_MASK"
+log "Prefix received: $PD_CIDR"
 
-# ===== TRIGGER NDP DISCOVERY =====
-# Ping all-routers multicast to trigger router responses and refresh NDP state
-# for all routers on the link before the candidate scan.
+# --- 3. Discover LAN_PD_SRC ---
+LAN_PD_SRC=$(get_lan_pd_src)
+if [ -z "$LAN_PD_SRC" ]; then
+    log "WARNING: no PD-derived LAN source on $LAN_DEV -- deferring to ipv6-watchdog"
+    exit 0
+fi
+log "LAN PD source: $LAN_PD_SRC"
+
+# --- 4. Fast path: routing already effective + PD-source Internet works ---
+# Accepts the generic-default-only state (no explicit
+# 'default from PD_CIDR') with ZERO route churn.
+if pd_routes_ok && pd_internet_ok; then
+    log "Routes already effective and PD-source Internet verified -- no action needed"
+    exit 0
+fi
+log "Route effectiveness or PD-source connectivity needs attention"
+
+# --- 5. Snapshot current routes for rollback ---
+SNAPSHOT="/tmp/ipv6-setup-route-snapshot.$$"
+snapshot_default_routes "$SNAPSHOT" || {
+    log "No existing default routes to snapshot"
+    SNAPSHOT=""
+}
+
+# --- 6. Trigger NDP discovery ---
 log "Triggering NDP discovery via all-routers multicast..."
 ping6 -c 3 -W 3 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
 sleep 3
 
-# Also send unicast probes to gateways already in the route table to refresh
-# their neighbor entries before the scan. Uses keyword-based extraction to
-# handle source-specific route formats correctly.
-ip -6 route show default dev "$WAN_DEV" | while read -r route; do
+# Also probe gateways already in the route table to refresh neighbor entries.
+ip -6 route show default dev "$WAN_DEV" 2>/dev/null | while read -r route; do
     gw=$(printf '%s\n' "$route" \
         | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
     [ -n "$gw" ] && ping6 -c 1 -W 1 -I "$WAN_DEV" "$gw" >/dev/null 2>&1
 done
 sleep 3
 
-# ===== DISCOVER WORKING GATEWAY =====
-# Combine neighbor table and existing routes for the candidate list.
-# Test internet reachability per candidate -- do not accept a gateway that
-# responds locally but does not forward internet traffic. This is the dominant
-# PLDT failure mode: the dead gateway replies to ICMPv6 echo but silently drops
-# all other traffic.
+# --- 7. Discover and test candidate gateways ---
+# Combine neighbor table and route table for the candidate list.
+# Acceptance requires PD-source-bound connectivity (not unbound, not WAN128).
 log "Scanning gateways on $WAN_DEV..."
 BEST_GW=""
-BEST_MAC=""
 
 for gw in $(
     { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
@@ -102,113 +479,62 @@ for gw in $(
 ); do
     state=$(ip -6 neigh show dev "$WAN_DEV" | awk -v g="$gw" '$1==g{print $NF}')
     mac=$(ip -6 neigh show dev "$WAN_DEV" \
-        | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
+        | awk -v g="$gw" '$1==g && /lladdr/{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}' | head -1)
     log "Gateway $gw -- state: ${state:-unknown} mac: ${mac:-unknown}"
 
-    # If MAC is not yet resolved, send a unicast probe to trigger NDP resolution.
+    # If MAC is not yet resolved, send a unicast probe.
     if [ -z "$mac" ]; then
         ping6 -c 2 -W 2 -I "$WAN_DEV" "$gw" >/dev/null 2>&1
         sleep 1
         mac=$(ip -6 neigh show dev "$WAN_DEV" \
-            | awk -v g="$gw" '$1==g && /lladdr/{print $3}' | head -1)
+            | awk -v g="$gw" '$1==g && /lladdr/{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}' | head -1)
     fi
 
     [ -z "$mac" ] && { log "Gateway $gw -- MAC not resolved, skipping"; continue; }
 
-    # Install candidate temporarily and test internet reachability.
-    # This is the same approach used by fix_gateway() in ipv6-watchdog.
-    log "Gateway $gw -- testing internet reachability (mac $mac)"
+    # Install candidate routes temporarily (MINIMUM mutation: generic via
+    # candidate; PD source-specific only if one already exists) and verify
+    # with kernel truth + PD-source connectivity.
+    log "Gateway $gw -- testing PD-source reachability (mac $mac)"
     ip -6 neigh replace "$gw" lladdr "$mac" dev "$WAN_DEV" nud stale 2>/dev/null
-    ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512
+    if ! install_gw_routes "$gw"; then
+        log "Gateway $gw -- route installation failed, rolling back"
+        rollback_candidate "$gw"
+        continue
+    fi
     sleep 2
 
-    if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
-       ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+    # Verify the kernel actually resolves LAN_PD_SRC through this candidate.
+    if ! pd_routes_ok "$gw"; then
+        log "Gateway $gw -- effective PD route does not resolve through candidate, rejecting"
+        rollback_candidate "$gw"
+        continue
+    fi
+
+    if pd_internet_ok; then
         BEST_GW="$gw"
-        BEST_MAC="$mac"
-        log "Gateway $gw -- internet reachability verified, selected"
+        log "Gateway $gw -- PD-source reachability verified, selected"
         break
     fi
 
-    log "Gateway $gw -- responds locally but no internet reachability, rejecting"
-    ip -6 route del default via "$gw" dev "$WAN_DEV" 2>/dev/null
+    log "Gateway $gw -- PD-source reachability failed, rejecting"
+    rollback_candidate "$gw"
 done
 
-# ===== NO GATEWAY FOUND -- RECOVER =====
+# --- 8. All candidates failed: restore original routes and exit ---
 if [ -z "$BEST_GW" ]; then
-    log "ERROR: no working gateway found -- restarting WAN"
-    ifdown wan6
-    ifdown wan
-    sleep 20
-    ifup wan
-    sleep 40
-    ifup wan6
+    log "ERROR: no working gateway found -- deferring recovery to ipv6-watchdog"
+    if [ -n "$SNAPSHOT" ] && [ -s "$SNAPSHOT" ]; then
+        restore_route_snapshot "$SNAPSHOT"
+    else
+        rm -f "$SNAPSHOT" 2>/dev/null
+    fi
     exit 0
 fi
 
-# ===== REMOVE COMPETING ROUTES =====
-# Remove any remaining default routes that point to other gateways.
-# The winning candidate route was already installed during discovery.
-# Uses keyword-based via/from extraction to handle source-specific route formats.
-ip -6 route show default dev "$WAN_DEV" | while read -r route; do
-    gw=$(printf '%s\n' "$route" \
-        | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-    src=$(printf '%s\n' "$route" \
-        | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
-    [ -z "$gw" ] && continue
-    # Keep the winning generic route; remove everything else.
-    [ "$gw" = "$BEST_GW" ] && [ -z "$src" ] && continue
-    if [ -n "$src" ]; then
-        ip -6 route del default from "$src" via "$gw" dev "$WAN_DEV" 2>/dev/null && \
-            log "Removed competing source-specific route: default from $src via $gw"
-    else
-        ip -6 route del default via "$gw" dev "$WAN_DEV" 2>/dev/null && \
-            log "Removed competing route via $gw"
-    fi
-done
+# --- 9. Success: routes installed by install_gw_routes during the loop ---
+# Clean up any remaining snapshot.
+[ -n "$SNAPSHOT" ] && rm -f "$SNAPSHOT" 2>/dev/null
 
-# ===== REMOVE /128 =====
-# Internet reachability was confirmed during gateway selection.
-# Remove the /128 IA_NA address now that the correct route is in place.
-# Skip removal if CLEANUP_WAN128 is 0 (e.g. Globe IA_NA mode).
-if [ "${CLEANUP_WAN128}" = "1" ]; then
-    ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
-    | while read -r addr; do
-        ip -6 addr del "$addr" dev "$WAN_DEV" 2>/dev/null && \
-            log "Removed /128 $addr after confirmed connectivity"
-    done
-fi
-
-log "IPv6 setup complete via $BEST_GW (mac $BEST_MAC)"
-
-# ===== VERIFY LAN RA CONFIG =====
-# Checks that odhcpd is configured correctly for IPv6 RA and DHCPv6 on LAN.
-# Auto-corrects and restarts odhcpd if any setting is wrong.
-# Guards against config drift after sysupgrade or manual changes.
-ra_ok=1
-for key in ra ra_slaac dhcpv6 ra_default; do
-    val=$(uci get dhcp.lan.$key 2>/dev/null)
-    case "$key" in
-        ra)         expected="server" ;;
-        ra_slaac)   expected="1" ;;
-        dhcpv6)     expected="server" ;;
-        ra_default) expected="1" ;;
-    esac
-    if [ "$val" != "$expected" ]; then
-        log "WARNING: dhcp.lan.$key is '${val:-unset}', expected '$expected' -- fixing"
-        uci set dhcp.lan.$key="$expected"
-        ra_ok=0
-    fi
-done
-
-if [ "$ra_ok" -eq 0 ]; then
-    uci commit dhcp
-    if /etc/init.d/odhcpd running 2>/dev/null; then
-        /etc/init.d/odhcpd restart
-    else
-        /etc/init.d/odhcpd start
-    fi
-    log "LAN RA config corrected and odhcpd restarted"
-else
-    log "LAN RA config OK"
-fi
+log "IPv6 setup complete via $BEST_GW -- effective PD-source routes verified"
+exit 0

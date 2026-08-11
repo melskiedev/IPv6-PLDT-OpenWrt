@@ -1,2 +1,17 @@
 # Local agent index (not shipped to routers or GitHub)
 INDEX.md
+
+# Local project-memory files (not shipped to routers or GitHub)
+AGENTS.md
+PROJECT_STATE.md
+LEARNINGS.md
+
+# Local OpenCode configuration (private project-memory setup)
+opencode.json
+
+# Repository-local Phase 2 test/debug scratch directory
+.test-tmp/
+/.claude/settings.local.json
+
+# Local agent session transcripts (never shipped to GitHub)
+/session-ses_*.md

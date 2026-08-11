@@ -1,9 +1,14 @@
 #!/bin/sh
 # tests/test-reachability-confirmation.sh
 #
-# Test harness for ipv6-watchdog v3.9.9 reachability confirmation delay.
+# Test harness for ipv6-watchdog v3.10 reachability confirmation delay.
 # Verifies that transient IPv6 reachability misses are suppressed and only
 # confirmed Layer-3 failures produce the new validation log.
+#
+# v3.10 contract: mocks emit ipv6-prefix address AND mask, a PD-derived LAN
+# global address, and both generic + source-specific default routes so
+# ipv6_ok Layers 1-4 pass and the reachability-confirmation delay (Layer 5)
+# is actually exercised.
 #
 # Tests the actual script logic via stub commands and temp state dirs.
 # Does not require a live router.
@@ -19,6 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "$TEST_SCRIPT")/.." && pwd)"
 TEST_ROOT="$(mktemp -d 2>/dev/null || { D="/tmp/rctest-$$"; mkdir -p "$D"; echo "$D"; })"
 STUB_DIR="$TEST_ROOT/stubs"
 STATE_DIR="$TEST_ROOT/state"
+SHARED_DIR="$TEST_ROOT/wan-recovery"
 CTRL_DIR="$TEST_ROOT/ctrl"
 LOG_FILE="$TEST_ROOT/log.txt"
 CONF_FILE="$TEST_ROOT/test.conf"
@@ -28,7 +34,13 @@ ORIG_PATH="$PATH"
 export RC_CTRL="$CTRL_DIR"
 export RC_LOG="$LOG_FILE"
 
-mkdir -p "$STUB_DIR" "$STATE_DIR" "$CTRL_DIR"
+mkdir -p "$STUB_DIR" "$STATE_DIR" "$CTRL_DIR" "$SHARED_DIR"
+
+# Stage C2: point the watchdog at the REAL shared coordinator (repo file) with
+# a test-local shared state dir. Exercises the real legacy-state migration and
+# the real coordinator lock/accounting/execute path in Test 5's WAN restart.
+export WAN_RECOVERY_COMMON="$SCRIPT_DIR/wan-recovery-common"
+export WAN_RECOVERY_STATE_DIR="$SHARED_DIR"
 
 # --- Cleanup on exit ---
 cleanup() {
@@ -42,7 +54,8 @@ trap 'cleanup; exit 143' TERM
 # Stub executables
 # ================================================================
 
-# ubus: outputs JSON for wan6 status based on control files
+# ubus: outputs JSON for wan6 status based on control files.
+# v3.10 contract: ipv6-prefix entries include both "address" and "mask".
 cat > "$STUB_DIR/ubus" <<'STUBEOF'
 #!/bin/sh
 CTRL="${RC_CTRL:-/tmp/rctest-ctrl}"
@@ -54,7 +67,9 @@ if [ "$1" = "call" ] && [ "$2" = "network.interface.wan6" ] && [ "$3" = "status"
         if [ -f "$CTRL/has_prefix" ]; then
             ADDR="2001:db8:1234:5678::1"
             [ -f "$CTRL/prefix_addr" ] && ADDR=$(cat "$CTRL/prefix_addr")
-            PREFIX_PART='"ipv6-prefix":[{"address":"'"$ADDR"'"}],'
+            MASK="56"
+            [ -f "$CTRL/prefix_mask" ] && MASK=$(cat "$CTRL/prefix_mask")
+            PREFIX_PART='"ipv6-prefix":[{"address":"'"$ADDR"'","mask":'"$MASK"'}],'
         fi
         printf '{"up":true,"l3_device":"%s",%s"pending":false}' "$DEV" "$PREFIX_PART"
     else
@@ -64,7 +79,8 @@ fi
 STUBEOF
 chmod +x "$STUB_DIR/ubus"
 
-# jsonfilter: extracts fields from JSON on stdin
+# jsonfilter: extracts fields from JSON on stdin.
+# v3.10 contract: distinguish .address from .mask within ipv6-prefix.
 cat > "$STUB_DIR/jsonfilter" <<'STUBEOF'
 #!/bin/sh
 INPUT=$(cat)
@@ -75,6 +91,12 @@ case "$2" in
     *'"l3_device"'*)
         printf '%s' "$INPUT" | sed -n 's/.*"l3_device":"\([^"]*\)".*/\1/p'
         ;;
+    *'"pending"'*)
+        printf '%s' "$INPUT" | sed -n 's/.*"pending":\([a-z]*\).*/\1/p'
+        ;;
+    *'"ipv6-prefix"'*'.mask'*)
+        printf '%s' "$INPUT" | sed -n 's/.*"mask":\([0-9]*\).*/\1/p'
+        ;;
     *'"ipv6-prefix"'*)
         printf '%s' "$INPUT" | sed -n 's/.*"address":"\([^"]*\)".*/\1/p'
         ;;
@@ -82,25 +104,86 @@ esac
 STUBEOF
 chmod +x "$STUB_DIR/jsonfilter"
 
-# ip: outputs default route if control flag exists.
-# Also supports neigh show and route del/replace for fix_gateway.
+# ip: outputs routes, neighbors, and addresses based on control flags.
+# v3.10 contract: supports source-specific route queries, LAN addr show,
+# and deprecated addr filtering for get_lan_pd_src / cleanup_deprecated_v6.
 cat > "$STUB_DIR/ip" <<'STUBEOF'
 #!/bin/sh
 CTRL="${RC_CTRL:-/tmp/rctest-ctrl}"
-# Default route display
-if [ "$1" = "-6" ] && [ "$2" = "route" ] && [ "$3" = "show" ] && [ "$4" = "default" ]; then
-    if [ -f "$CTRL/has_route" ]; then
-        echo "default via fe80::1 dev eth0 metric 512"
+
+# addr show dev <dev> [deprecated]
+if [ "$1" = "-6" ] && [ "$2" = "addr" ] && [ "$3" = "show" ]; then
+    DEP=""
+    DEV=""
+    PREV=""
+    for a in "$@"; do
+        [ "$a" = "deprecated" ] && DEP=1
+        if [ "$PREV" = "dev" ]; then DEV="$a"; fi
+        PREV="$a"
+    done
+    # Deprecated filter: emit nothing (no deprecated addresses in test state).
+    [ -n "$DEP" ] && exit 0
+    # Emit a LAN global address belonging to the current PD prefix.
+    LAN_SRC=$(cat "$CTRL/lan_src" 2>/dev/null)
+    if [ -n "$LAN_SRC" ] && [ -f "$CTRL/has_prefix" ]; then
+        printf 'inet6 %s/64 scope global dynamic\n' "$LAN_SRC"
+        printf '   valid_lft 86400sec preferred_lft 14400sec\n'
     fi
     exit 0
 fi
-# Neighbor show (used by gateway_mac and candidate scan)
+
+# route show default [from <src>] dev <dev>
+if [ "$1" = "-6" ] && [ "$2" = "route" ] && [ "$3" = "show" ] && [ "$4" = "default" ]; then
+    FROM=""
+    shift 4
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            from) FROM="$2"; shift ;;
+            dev) shift ;;
+        esac
+        shift
+    done
+    if [ -n "$FROM" ]; then
+        # Source-specific default route.
+        [ -f "$CTRL/has_src_route" ] && echo "default from $FROM via fe80::1 dev eth0 metric 512"
+    else
+        # Generic default route.
+        [ -f "$CTRL/has_route" ] && echo "default via fe80::1 dev eth0 metric 512"
+    fi
+    exit 0
+fi
+
+# route get <target> [from <src>] -- kernel-truth effective-route lookup.
+# Resolution model: source-specific rule wins over generic default; with
+# neither, the kernel prints "unreachable" with rc=0 (null-route behavior).
+if [ "$1" = "-6" ] && [ "$2" = "route" ] && [ "$3" = "get" ]; then
+    FROM=""
+    shift 3
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            from) FROM="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$FROM" ] || exit 1
+    if [ -f "$CTRL/has_src_route" ]; then
+        echo "$FROM via fe80::1 dev eth0 metric 512"
+    elif [ -f "$CTRL/has_route" ]; then
+        echo "$FROM via fe80::1 dev eth0 metric 512"
+    else
+        echo "unreachable $FROM dev eth0"
+    fi
+    exit 0
+fi
+
+# neigh show dev <dev>
 if [ "$1" = "-6" ] && [ "$2" = "neigh" ] && [ "$3" = "show" ]; then
     if [ -f "$CTRL/neigh_router" ]; then
         echo "fe80::1 dev eth0 lladdr 00:11:22:33:44:55 router REACHABLE"
     fi
     exit 0
 fi
+
 # neigh replace / route replace / route del: no-op success
 exit 0
 STUBEOF
@@ -315,6 +398,10 @@ assert_file_not_exists() {
 reset_state() {
     rm -rf "$STATE_DIR"/* 2>/dev/null
     rm -f "$CTRL_DIR"/* 2>/dev/null
+    # Stage C2: also clear the shared coordinator state so each test starts
+    # with a fresh same-boot budget.
+    rm -rf "$SHARED_DIR"/* 2>/dev/null
+    mkdir -p "$SHARED_DIR"
     : > "$LOG_FILE"
     mkdir -p "$STATE_DIR" "$CTRL_DIR"
 }
@@ -327,12 +414,20 @@ set_ping_seq() {
     echo "0" > "$CTRL_DIR/ping_pos"
 }
 
-# Common setup: wan6 up with device, prefix present, route present.
+# Common setup: wan6 up with device, prefix present (with mask), LAN source
+# present, generic default route, PD source-specific default route, and a
+# reachable router neighbor so fix_gateway can resolve a MAC for fe80::1.
+# v3.10 contract: ipv6_ok requires IA_PD (addr+mask), LAN_PD_SRC, generic
+# default, and PD source-specific default before reachability is even tested.
 seed_healthy_layer12() {
     touch "$CTRL_DIR/wan6_up"
     echo "eth0" > "$CTRL_DIR/wan_dev"
     touch "$CTRL_DIR/has_prefix"
+    echo "56" > "$CTRL_DIR/prefix_mask"
+    echo "2001:db8:1234:5678::abcd" > "$CTRL_DIR/lan_src"
     touch "$CTRL_DIR/has_route"
+    touch "$CTRL_DIR/has_src_route"
+    touch "$CTRL_DIR/neigh_router"
 }
 
 # ================================================================
@@ -364,12 +459,13 @@ echo "  done (pass=$PASS fail=$FAIL)"
 echo "=== Test 3: Both ipv6_ok checks fail, current gateway verifies in fix_gateway -- silent recovery, fail_count 0 ==="
 reset_state
 seed_healthy_layer12
-# ipv6_ok attempt 1: Google=fail, Cloudflare=fail.
-# ipv6_ok attempt 2 (delayed): Google=fail, Cloudflare=fail -> returns 1, no log.
-# fix_gateway STEP1 reachability: Google=fail, Cloudflare=fail (skip route del).
-# fix_gateway current gw check (internet_ok_now): Google=pass -> silent success, return 0.
-# Post-fix ipv6_ok validation: Google=pass -> healthy, reset state, exit 0.
-set_ping_seq fail fail fail fail fail fail pass pass
+# v3.10 contract: ipv6_ok uses pd_internet_ok (PD-source-bound).
+# ipv6_ok attempt 1: Google=fail, Cloudflare=fail (tokens 1,2).
+# ipv6_ok attempt 2 (delayed): Google=fail, Cloudflare=fail (tokens 3,4).
+# fix_gateway fast path: pd_routes_ok(fe80::1) passes (both routes via fe80::1),
+#   then pd_internet_ok: Google=pass (token 5) -> silent success, return 0.
+# Post-fix ipv6_ok: Google=pass (token 6) -> healthy, reset state, exit 0.
+set_ping_seq fail fail fail fail pass pass
 run_watchdog
 assert_empty_log
 assert_file_eq "$STATE_DIR/fail_count" "0"
@@ -417,17 +513,21 @@ touch "$CTRL_DIR/wan6_up"
 echo "eth0" > "$CTRL_DIR/wan_dev"
 set_ping_seq pass
 run_watchdog
-assert_contains "Validation failed: no prefix assigned"
+# v3.10 message: "no delegated prefix (IA_PD absent)" (was "no prefix assigned" in v3.9.9).
+assert_contains "Validation failed: no delegated prefix (IA_PD absent)"
 assert_not_contains "Validation failed after confirmation"
 assert_not_contains "internet unreachable"
 echo "  done (pass=$PASS fail=$FAIL)"
 
 echo "=== Test 7: Missing-route behavior unchanged ==="
 reset_state
-# wan6 up, prefix present, NO route.
+# wan6 up, prefix present (with mask) and LAN source, NO route.
 touch "$CTRL_DIR/wan6_up"
 echo "eth0" > "$CTRL_DIR/wan_dev"
 touch "$CTRL_DIR/has_prefix"
+echo "56" > "$CTRL_DIR/prefix_mask"
+echo "2001:db8:1234:5678::1" > "$CTRL_DIR/prefix_addr"
+echo "2001:db8:1234:5678::abcd" > "$CTRL_DIR/lan_src"
 set_ping_seq pass
 run_watchdog
 assert_contains "Validation failed: no default IPv6 route"
@@ -555,10 +655,13 @@ echo "  done (pass=$PASS fail=$FAIL)"
 echo "=== Test 9: fix_gateway current-gateway-good path is silent (no 'no fix needed' notice) ==="
 reset_state
 seed_healthy_layer12
-# Both ipv6_ok checks fail (4 fail), then fix_gateway STEP1 (2 fail), then
-# current gw internet_ok_now passes (1 pass) -> silent success, return 0.
-# Post-fix ipv6_ok: Google=pass -> healthy, reset state, exit 0.
-set_ping_seq fail fail fail fail fail fail pass pass
+# v3.10 contract: ipv6_ok uses pd_internet_ok (PD-source-bound).
+# Both ipv6_ok checks fail (4 fail), then fix_gateway fast path:
+#   pd_routes_ok(fe80::1) passes, pd_internet_ok: Google=pass (token 5)
+#   -> silent success, return 0. No "no fix needed" notice (v3.10 fast path
+#   is silent; it does not log "has internet reachability, no fix needed").
+# Post-fix ipv6_ok: Google=pass (token 6) -> healthy, reset state, exit 0.
+set_ping_seq fail fail fail fail pass pass
 run_watchdog
 assert_not_contains "has internet reachability, no fix needed"
 assert_empty_log

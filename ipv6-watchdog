@@ -1,6 +1,13 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
+# v3.10.0: PD-first source-aware health model. Full IPv6 health requires a delegated
+#          prefix and a PD-derived LAN source. A WAN IA_NA /128 is OPTIONAL; it never
+#          substitutes for IA_PD/LAN health and may be retained when present.
+#          Adds wan6 pending grace to avoid disrupting odhcp6c mid-acquisition.
+#          Phase 3 (try_128_bootstrap) is a NO_PD recovery HYPOTHESIS, disabled by
+#          default (BOOTSTRAP_ENABLED=0); enable only for controlled experiments on
+#          routers whose committed reqaddress policy is 'none'.
 # v3.9.9: reachability confirmation delay suppresses false-positive transient IPv6 alerts.
 # Runs every 1 minute via cron.
 
@@ -43,6 +50,10 @@ on_exit() {
         BOOTSTRAP_UCI_STAGED=0
     fi
     rm -f "$STATE_DIR"/fix_gateway_routes.* 2>/dev/null
+    # Stage C2: release shared WAN-recovery lock if this process holds it.
+    # Idempotent and safe to call without a successful begin. Guarded so it
+    # does not error if the coordinator was never sourced (function absent).
+    command -v wan_recovery_cleanup >/dev/null 2>&1 && wan_recovery_cleanup 2>/dev/null
     cleanup_lock
 }
 trap 'on_exit' EXIT
@@ -54,9 +65,36 @@ trap 'on_exit; exit 143' TERM
 # LAN bridge device. Override in /etc/ipv6-watchdog.conf if different on target router.
 LAN_DEV="${LAN_DEV:-br-lan}"
 
-# Remove temporary WAN /128 addresses after bootstrap succeeds.
-# Set to 0 on routers where WAN /128 is a legitimate persistent address assigned via IA_NA.
-CLEANUP_WAN128="${CLEANUP_WAN128:-1}"
+# Remove WAN /128 addresses after a successful bootstrap. Opt-in (default 0).
+# A healthy WAN IA_NA /128 is OPTIONAL and may be retained for router-originated
+# IPv6; it never substitutes for IA_PD/LAN health. Set to 1 to restore the legacy
+# experimental cleanup behavior (e.g. controlled bootstrap experiments).
+CLEANUP_WAN128="${CLEANUP_WAN128:-0}"
+
+# Phase 3 experimental NO_PD bootstrap recovery. Disabled by default.
+# try_128_bootstrap() is a HYPOTHESIS whose live efficacy has not been tested.
+# When enabled, it is only meaningful on routers whose committed
+# reqaddress policy is 'none' (it temporarily stages 'try' to probe whether
+# requesting IA_NA helps PLDT grant IA_PD). Set to 1 ONLY for controlled
+# experiments. Invalid values fail safe to 0.
+BOOTSTRAP_ENABLED="${BOOTSTRAP_ENABLED:-0}"
+case "$BOOTSTRAP_ENABLED" in
+    1) ;;
+    *) BOOTSTRAP_ENABLED=0 ;;
+esac
+
+# wan6 pending grace period (seconds). On OpenWrt 25.12.5, wan6 may report
+# up=false pending=true while odhcp6c is still performing native DHCPv6
+# acquisition. Restarting odhcp6c during this window disrupts the in-flight
+# exchange and can worsen stale-lease conditions. While pending duration is
+# below this grace, Tier 0 passive-waits instead of forcing ifdown/ifup and
+# does not increment the Tier 0 failure counter. Default 180s is conservative;
+# the odhcp6c -t120 retry window does not guarantee acquisition finishes in
+# exactly 120s. Override via /etc/ipv6-watchdog.conf.
+WAN6_PENDING_GRACE="${WAN6_PENDING_GRACE:-180}"
+case "$WAN6_PENDING_GRACE" in
+    ''|*[!0-9]*) WAN6_PENDING_GRACE=180 ;;
+esac
 
 # Remove deprecated global IPv6 addresses from LAN bridge after ipv6_ok passes.
 # Set to 0 to disable if stale deprecated address cleanup is not desired.
@@ -73,6 +111,78 @@ WAN_RESTART_COOLDOWN="${WAN_RESTART_COOLDOWN:-1200}"
 
 # How many full WAN restarts before stopping and requiring manual ONT powercycle.
 WAN_RESTART_LIMIT="${WAN_RESTART_LIMIT:-3}"
+
+# ===== STAGE C2: SHARED WAN-RECOVERY COORDINATOR INTEGRATION =====
+# The shared coordinator (wan-recovery-common) owns the serialization lock,
+# same-boot full-WAN disruption budget, shared disruption hold, and
+# accounting-before-ifdown for ALL disruptive WAN recovery. ipv6-watchdog
+# retains ownership of IPv6 health truth, notifications, and non-disruptive
+# route repair. A missing or unreadable coordinator MUST cause all
+# ifdown/ifup recovery to FAIL CLOSED (health monitoring and non-disruptive
+# repair may continue). There is NO compatibility fallback to uncoordinated
+# direct WAN cycling.
+#
+# Config precedence (backward-compatible):
+#   1. explicit new shared setting (WAN_DISRUPTION_LIMIT / WAN_DISRUPTION_COOLDOWN)
+#   2. otherwise existing IPv6 watchdog setting (WAN_RESTART_LIMIT / WAN_RESTART_COOLDOWN)
+#   3. otherwise safe default (3 / 1200)
+# The coordinator library reads these via its own :- defaults too, so we
+# only inject the old value when the new one is unset.
+WAN_DISRUPTION_LIMIT="${WAN_DISRUPTION_LIMIT:-${WAN_RESTART_LIMIT:-3}}"
+WAN_DISRUPTION_COOLDOWN="${WAN_DISRUPTION_COOLDOWN:-${WAN_RESTART_COOLDOWN:-1200}}"
+
+# Shared coordinator state directory. Defaults to /tmp/wan-recovery (cleared
+# by router reboot, same-boot scoped). Tests override via env before sourcing.
+WAN_RECOVERY_STATE_DIR="${WAN_RECOVERY_STATE_DIR:-/tmp/wan-recovery}"
+
+# Coordinator library path. Defaults to /usr/bin/wan-recovery-common
+# (deployment-compatible). Tests override via env before sourcing.
+WAN_RECOVERY_COMMON="${WAN_RECOVERY_COMMON:-/usr/bin/wan-recovery-common}"
+
+# Source the shared coordinator and verify the required public API.
+# If the library is missing, unreadable, or lacks required functions,
+# WAN_RECOVERY_AVAILABLE remains 0 and all disruptive recovery fails closed.
+WAN_RECOVERY_AVAILABLE=0
+if [ -f "$WAN_RECOVERY_COMMON" ] && . "$WAN_RECOVERY_COMMON" 2>/dev/null; then
+    # Verify every required public API function exists after sourcing.
+    _c2_api_ok=1
+    for _c2_fn in wan_recovery_full_begin \
+                  wan_recovery_full_execute_locked \
+                  wan_recovery_wan6_begin \
+                  wan_recovery_wan6_record_locked \
+                  wan_recovery_end \
+                  wan_recovery_cleanup; do
+        command -v "$_c2_fn" >/dev/null 2>&1 || _c2_api_ok=0
+    done
+    [ "$_c2_api_ok" = 1 ] && WAN_RECOVERY_AVAILABLE=1
+    unset _c2_fn _c2_api_ok
+fi
+
+# Resolve shared state file paths (the coordinator library sets these in
+# _wan_recovery_paths, but we need them available before any begin call for
+# recovery_hold_active / in_cooldown reads). If the library was not sourced,
+# define the paths manually so the fail-closed paths can still read empty
+# state (all reads return 0 / not-found).
+if ! command -v _wan_recovery_paths >/dev/null 2>&1; then
+    _wan_recovery_paths() {
+        DISRUPTION_COUNT_FILE="$WAN_RECOVERY_STATE_DIR/disruption_count"
+        LAST_FULL_WAN_DISRUPTION_FILE="$WAN_RECOVERY_STATE_DIR/last_full_wan_disruption"
+        LAST_WAN6_ACTION_FILE="$WAN_RECOVERY_STATE_DIR/last_wan6_action"
+        LAST_FULL_WAN_REASON_FILE="$WAN_RECOVERY_STATE_DIR/last_full_wan_reason"
+        LAST_WAN6_REASON_FILE="$WAN_RECOVERY_STATE_DIR/last_wan6_reason"
+        DISRUPTION_HOLD_FILE="$WAN_RECOVERY_STATE_DIR/disruption_hold"
+        DISRUPTION_LOCK_FILE="$WAN_RECOVERY_STATE_DIR/disruption.lock"
+        DISRUPTION_LOCK_DIR="$WAN_RECOVERY_STATE_DIR/disruption.lock.dir"
+    }
+fi
+_wan_recovery_paths
+
+# Returns 0 if the shared coordinator is available and ready for use.
+# All disruptive recovery paths MUST call this first; if it returns non-zero,
+# they must log a fail-closed message and NOT perform any ifdown/ifup.
+wan_recovery_ready() {
+    [ "$WAN_RECOVERY_AVAILABLE" = 1 ]
+}
 
 # Delay in seconds between the first and second external-reachability checks
 # inside ipv6_ok(). Suppresses false-positive alerts from transient ISP drops
@@ -95,8 +205,36 @@ RECOVERY_HOLD_FILE="$STATE_DIR/recovery_hold"
 HOLD_STATUS_FILE="$STATE_DIR/hold_status"
 GOOD_GW_FILE="$STATE_DIR/good_gateway"
 TIER0_FAIL_FILE="$STATE_DIR/tier0_fail_count"
+WAN6_PENDING_SEEN_FILE="$STATE_DIR/wan6_pending_seen"
+# v3.10.0 Phase 1C: second small marker file recording that the current
+# pending acquisition has already had its grace expire. Prevents the watchdog
+# from granting a fresh grace window to the SAME odhcp6c instance just
+# because grace expired, and prevents repeated first-pending / grace-expired
+# logs on every cron tick when Tier 0 recovery is blocked. Cleared only by
+# pending_state_reset() (new acquisition, wan6 up, or pending=false).
+ WAN6_PENDING_EXPIRED_FILE="$STATE_DIR/wan6_pending_expired"
 
-# --- Functions (all defined before any recovery branch calls them) ---
+ # v3.10.0 router source-policy cache files. ensure_router_source_policy()
+ # classifies IA_NA /128 reachability vs PD-source reachability and may
+ # install a preferred src on the generic default route ONLY when the WAN /128
+ # is present but unusable while PD-source Internet works (IA_NA-unusable case).
+ # The cache identity key changes whenever WAN128, PD_CIDR, LAN_PD_SRC, or the
+ # current default gateway changes, forcing a fresh classification. The
+ # managed_src file records which src the watchdog installed so cleanup
+ # only removes watchdog-owned preferred src, never an admin/user-created one.
+ SRC_POLICY_MODE_FILE="$STATE_DIR/src_policy_mode"
+ SRC_POLICY_KEY_FILE="$STATE_DIR/src_policy_key"
+ SRC_POLICY_TS_FILE="$STATE_DIR/src_policy_ts"
+ SRC_POLICY_MANAGED_SRC_FILE="$STATE_DIR/src_policy_managed_src"
+ # Refresh interval: after this many seconds with the SAME key, re-run WAN128
+ # probes even if the key is unchanged, so a silent WAN128-health transition
+ # is eventually caught. Default 600s (10 min).
+ SRC_POLICY_REFRESH="${SRC_POLICY_REFRESH:-600}"
+ case "$SRC_POLICY_REFRESH" in
+     ''|*[!0-9]*) SRC_POLICY_REFRESH=600 ;;
+ esac
+
+ # --- Functions (all defined before any recovery branch calls them) ---
 # BusyBox ash registers functions when their definition line is executed.
 # Tier 0 and main logic call these helpers, so every function must appear above
 # the runtime state reads and recovery branches.
@@ -104,35 +242,69 @@ TIER0_FAIL_FILE="$STATE_DIR/tier0_fail_count"
 # Layered validation: prefix, route, then reachability.
 # Checking in order gives specific failure classification in logs,
 # not just a binary pass/fail from ping alone.
+#
+# v3.10.0: full IPv6 health is PD-first. WAN /128 (IA_NA) does NOT contribute
+# to success. A router-only /128 path that pings but has no delegated prefix
+# is degraded (ROUTER_ONLY) and must NOT be reported as recovery. Health is
+# defined by EFFECTIVE ROUTING, not route-shape: usable IA_PD plus a
+# PD-derived LAN source plus a generic default route plus a kernel-effective
+# PD-source route through WAN plus pd_internet_ok success. An explicit
+# 'default from <PD_CIDR>' rule is OPTIONAL (evidence proves generic-default-
+# only routing is healthy); it is never required for health. A WAN IA_NA
+# /128 is OPTIONAL, never a fault by itself, and never a substitute for
+# IA_PD/LAN health.
 ipv6_ok() {
-    # Layer 1: prefix must exist
-    if ! ubus call network.interface.wan6 status 2>/dev/null \
-            | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .; then
-        log "Validation failed: no prefix assigned"
+    # Refresh the PD-first source-aware context for this tick.
+    populate_pd_context
+
+    # Layer 1: delegated prefix must exist (populated ipv6-prefix, not just
+    # "delegation": true).
+    if [ -z "$PD_ADDR" ] || [ -z "$PD_MASK" ]; then
+        log "Validation failed: no delegated prefix (IA_PD absent)"
         return 1
     fi
 
-    # Layer 2: default route must exist
+    # Layer 2: LAN must have a current global source derived from the
+    # delegated prefix. Absence means LAN has no usable PD address even if
+    # the prefix exists on wan6 (degraded PREFIX_WITHOUT_CONNECTIVITY or
+    # incomplete delegation).
+    if [ -z "$LAN_PD_SRC" ]; then
+        log "Validation failed: no LAN source derived from delegated prefix $PD_CIDR"
+        return 1
+    fi
+
+    # Layer 3: a generic IPv6 default route must exist.
     if ! ip -6 route show default dev "$WAN_DEV" | grep -q default; then
         log "Validation failed: no default IPv6 route"
         return 1
     fi
 
-    # Layer 3: external reachability with confirmation delay.
-    # Suppresses false-positive alerts from transient ISP drops that recover
-    # within a few seconds. On initial miss, wait REACHABILITY_CONFIRM_DELAY
-    # and re-test. If the confirmation succeeds, return healthy with no log
-    # (the initial miss was transient). If both checks fail, return failure
-    # without logging here; the caller logs the confirmed failure after
-    # gateway recovery has been attempted, so a gateway fix that restores
-    # connectivity does not produce a spurious reachability failure log.
-    if internet_ok_now; then
+    # Layer 4: kernel-effective PD-source routing through WAN must exist.
+    # pd_route_effective() asks the kernel how a packet from LAN_PD_SRC to a
+    # public target actually resolves. An explicit 'default from <PD_CIDR>'
+    # is NOT required -- generic-default-only (live-verified state) is
+    # healthy when the kernel resolves the PD source through WAN_DEV.
+    if ! pd_route_effective; then
+        log "Validation failed: no effective PD-source route from $LAN_PD_SRC via $WAN_DEV"
+        return 1
+    fi
+
+    # Layer 5: external reachability sourced from LAN_PD_SRC with confirmation
+    # delay. Suppresses false-positive alerts from transient ISP drops that
+    # recover within a few seconds. On initial miss, wait
+    # REACHABILITY_CONFIRM_DELAY and re-test. If the confirmation succeeds,
+    # return healthy with no log (the initial miss was transient). If both
+    # checks fail, return failure without logging here; the caller logs the
+    # confirmed failure after gateway recovery has been attempted, so a
+    # gateway fix that restores connectivity does not produce a spurious
+    # reachability failure log. WAN /128 is never used here.
+    if pd_internet_ok; then
         return 0
     fi
 
     if [ "$REACHABILITY_CONFIRM_DELAY" -gt 0 ]; then
         sleep "$REACHABILITY_CONFIRM_DELAY"
-        if internet_ok_now; then
+        if pd_internet_ok; then
             return 0
         fi
     fi
@@ -143,6 +315,416 @@ ipv6_ok() {
 has_prefix() {
     ubus call network.interface.wan6 status 2>/dev/null \
         | jsonfilter -e '@["ipv6-prefix"][0].address' | grep -q .
+}
+
+# ===== v3.10.0: PD-FIRST SOURCE-AWARE CONTEXT =====
+# Only a populated network.interface.wan6 ipv6-prefix entry proves IA_PD was
+# delegated. Do NOT treat "delegation": true or IA_NA /128 presence as proof
+# of IA_PD. A WAN IA_NA /128 is OPTIONAL, never a fault by itself, and never
+# a substitute for IA_PD/LAN health.
+
+# Read the delegated prefix address from wan6 status.
+# Returns empty string if no prefix is populated.
+get_pd_addr() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null
+}
+
+# Read the delegated prefix mask from wan6 status.
+# Returns empty string if no mask is populated.
+get_pd_mask() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["ipv6-prefix"][0].mask' 2>/dev/null
+}
+
+# Determine the WAN L3 device from wan6 status.
+get_wan_dev() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["l3_device"]' 2>/dev/null
+}
+
+# Return true if wan6 status reports pending=true.
+wan6_pending() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["pending"]' 2>/dev/null | grep -q true
+}
+
+# Return true if wan6 status reports up=true.
+wan6_up() {
+    ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["up"]' 2>/dev/null | grep -q true
+}
+
+# Determine the global /128 currently assigned to WAN_DEV, if any.
+# Returns the first global /128 address (without the /128 suffix) or empty.
+get_wan128() {
+    [ -n "$WAN_DEV" ] || return 0
+    ip -6 addr show dev "$WAN_DEV" 2>/dev/null \
+        | awk '/inet6 .*\/128 scope global/{print $2}' \
+        | sed 's|/128$||' | head -1
+}
+
+# BusyBox-compatible prefix-membership check.
+# Returns 0 (true) if ADDR belongs to PREFIX/MASK, 1 otherwise.
+# Compares the leading network bits using a decimal mask derived from /MASK.
+# Handles /0../128. Does not require Python or ipcalc.
+# Avoids eval: splits colon-separated groups via parameter expansion.
+# Usage: addr_in_prefix <addr> <prefix> <mask>
+addr_in_prefix() {
+    local addr="$1" prefix="$2" mask="$3"
+    [ -n "$addr" ] && [ -n "$prefix" ] && [ -n "$mask" ] || return 1
+
+    # v3.10.0 Phase 1B: reject non-numeric or out-of-range mask (valid: 0..128).
+    case "$mask" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$mask" -ge 0 ] 2>/dev/null || return 1
+    [ "$mask" -le 128 ] || return 1
+
+    # Expand an IPv6 address to 8 newline-separated 16-bit hex groups,
+    # each padded to 4 digits. Handles :: compression.
+    _expand_ipv6() {
+        local a="$1" left="" right="" out="" g i
+        local lcount=0 rcount=0 missing
+        case "$a" in
+            *::*)
+                left="${a%%::*}"
+                right="${a##*::}"
+                ;;
+            *)
+                left="$a"
+                ;;
+        esac
+        # Count non-empty colon-separated groups on each side of ::.
+        _count_groups() {
+            local s="$1" c=0 rest
+            rest="$s"
+            while [ -n "$rest" ]; do
+                case "$rest" in
+                    *:*)
+                        g="${rest%%:*}"
+                        [ -n "$g" ] && c=$((c + 1))
+                        rest="${rest#*:}"
+                        ;;
+                    *)
+                        [ -n "$rest" ] && c=$((c + 1))
+                        break
+                        ;;
+                esac
+            done
+            echo "$c"
+        }
+        lcount=$(_count_groups "$left")
+        rcount=$(_count_groups "$right")
+        missing=$((8 - lcount - rcount))
+        [ "$missing" -lt 0 ] && missing=0
+        # Emit left groups, zero-fill, then right groups.
+        _emit_groups() {
+            local s="$1" rest g
+            rest="$s"
+            while [ -n "$rest" ]; do
+                case "$rest" in
+                    *:*)
+                        g="${rest%%:*}"
+                        if [ -n "$g" ]; then
+                            printf '%04x\n' "0x$g" 2>/dev/null || echo "0000"
+                        fi
+                        rest="${rest#*:}"
+                        ;;
+                    *)
+                        if [ -n "$rest" ]; then
+                            printf '%04x\n' "0x$rest" 2>/dev/null || echo "0000"
+                        fi
+                        break
+                        ;;
+                esac
+            done
+        }
+        _emit_groups "$left"
+        i=0
+        while [ "$i" -lt "$missing" ]; do
+            echo "0000"
+            i=$((i + 1))
+        done
+        _emit_groups "$right"
+    }
+
+    local a_groups p_groups
+    a_groups=$(_expand_ipv6 "$addr")
+    p_groups=$(_expand_ipv6 "$prefix")
+    [ -n "$a_groups" ] && [ -n "$p_groups" ] || return 1
+
+    # Compare bit by bit across the /MASK boundary.
+    # Each group is 16 bits; full groups compare directly.
+    local full_groups=$((mask / 16))
+    local rem_bits=$((mask % 16))
+    local i=1
+    # Compare full 16-bit groups.
+    while [ "$i" -le "$full_groups" ]; do
+        local ag pg
+        ag=$(printf '%s\n' "$a_groups" | sed -n "${i}p")
+        pg=$(printf '%s\n' "$p_groups" | sed -n "${i}p")
+        [ "$ag" = "$pg" ] || return 1
+        i=$((i + 1))
+    done
+    # Compare remaining partial group bits.
+    if [ "$rem_bits" -gt 0 ]; then
+        local ag pg amask av pv
+        ag=$(printf '%s\n' "$a_groups" | sed -n "${i}p")
+        pg=$(printf '%s\n' "$p_groups" | sed -n "${i}p")
+        # Mask the low (16 - rem_bits) bits to zero.
+        amask=$((0xffff & ~((1 << (16 - rem_bits)) - 1) & 0xffff))
+        av=$((0x$ag & amask))
+        pv=$((0x$pg & amask))
+        [ "$av" = "$pv" ] || return 1
+    fi
+    return 0
+}
+
+# v3.10.0 Phase 1C: numeric-range (not textual) exclusion of link-local and ULA.
+# Both helpers validate the first hextet contains only hex digits, convert it
+# to a number, and compare against the prefix's numeric first-hextet range.
+# Avoids the Phase 1B 512-entry case lists; small and auditable.
+# POSIX-style [ ] arithmetic comparisons (no bash (( )) syntax). BusyBox-ash
+# [ ] does not accept hex literals on the RHS, so hex thresholds are converted
+# to decimal via $(( )) arithmetic expansion before the comparison.
+
+# Returns 0 (true) if the plain IPv6 address is link-local (fe80::/10).
+# Numeric first-hextet range: 0xfe80 (65152) through 0xfebf (65215) inclusive.
+is_link_local() {
+    local a="$1" g1 n
+    [ -n "$a" ] || return 1
+    # Extract the first group (before the first colon).
+    g1="${a%%:*}"
+    # Reject non-hex groups so $((0x$g1)) cannot silently fall back to 0 and
+    # falsely match fe80::/10 (e.g. an empty or malformed group).
+    case "$g1" in
+        ''|*[!0-9A-Fa-f]*) return 1 ;;
+    esac
+    n=$((0x$g1))
+    [ "$n" -ge $((0xfe80)) ] && [ "$n" -le $((0xfebf)) ]
+}
+
+# Returns 0 (true) if the plain IPv6 address is ULA (fc00::/7).
+# Numeric first-hextet range: 0xfc00 (64512) through 0xfdff (65023) inclusive.
+is_ula() {
+    local a="$1" g1 n
+    [ -n "$a" ] || return 1
+    g1="${a%%:*}"
+    case "$g1" in
+        ''|*[!0-9A-Fa-f]*) return 1 ;;
+    esac
+    n=$((0x$g1))
+    [ "$n" -ge $((0xfc00)) ] && [ "$n" -le $((0xfdff)) ]
+}
+
+# Determine the PD-derived global source address on LAN_DEV.
+# Requirements:
+#   - global (not fe80::/10 link-local, not fc00::/7 ULA)
+#   - non-deprecated, non-tentative, non-dadfailed
+#   - belongs to the current delegated prefix
+# Returns the PLAIN address (no /suffix) on stdout, or empty.
+# The plain form is required because callers use it as a ping6 -I source,
+# which must not contain a CIDR prefix length.
+#
+# v3.10.0 Phase 1B: deterministic stable-vs-temporary selection.
+# Pass 1: prefer a non-temporary (stable) address belonging to PD.
+# Pass 2: if none, accept a temporary (privacy) address belonging to PD.
+# This keeps router-originated and LAN-client tests bound to a stable source
+# when both stable and privacy addresses exist on the same prefix.
+get_lan_pd_src() {
+    [ -n "$LAN_DEV" ] || return 0
+    [ -n "$PD_ADDR" ] && [ -n "$PD_MASK" ] || return 0
+    local line addr addr_noslash candidate
+    # Pass 1: non-temporary stable address. The while-read loop runs in a
+    # subshell due to the pipe, so capture the first match via head -1.
+    candidate=$(ip -6 addr show dev "$LAN_DEV" 2>/dev/null \
+        | awk '/inet6 .*scope global/ && !/deprecated/ && !/tentative/ && !/dadfailed/ && !/temporary/{print}' \
+        | while read -r line; do
+            addr=$(printf '%s\n' "$line" | awk '{print $2}')
+            [ -n "$addr" ] || continue
+            addr_noslash="${addr%%/*}"
+            [ -n "$addr_noslash" ] || continue
+            is_link_local "$addr_noslash" && continue
+            is_ula "$addr_noslash" && continue
+            if addr_in_prefix "$addr_noslash" "$PD_ADDR" "$PD_MASK"; then
+                printf '%s\n' "$addr_noslash"
+                return 0
+            fi
+        done | head -1)
+    if [ -n "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    # Pass 2: temporary/privacy address (only if no stable address was found).
+    candidate=$(ip -6 addr show dev "$LAN_DEV" 2>/dev/null \
+        | awk '/inet6 .*scope global/ && !/deprecated/ && !/tentative/ && !/dadfailed/ && /temporary/{print}' \
+        | while read -r line; do
+            addr=$(printf '%s\n' "$line" | awk '{print $2}')
+            [ -n "$addr" ] || continue
+            addr_noslash="${addr%%/*}"
+            [ -n "$addr_noslash" ] || continue
+            is_link_local "$addr_noslash" && continue
+            is_ula "$addr_noslash" && continue
+            if addr_in_prefix "$addr_noslash" "$PD_ADDR" "$PD_MASK"; then
+                printf '%s\n' "$addr_noslash"
+                return 0
+            fi
+        done | head -1)
+    if [ -n "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+}
+
+# ===== v3.10.0 Phase 1C: PRODUCTION PENDING-STATE HELPER =====
+# Single source of truth for the wan6 pending-grace decision. Production Tier 0
+# and tests/test-prefix-helpers.sh both call this helper so the algorithm is
+# not duplicated. The helper only manages pending state files and returns a
+# decision; it never calls ifdown/ifup. Tier 0 remains responsible for the
+# actual recovery.
+#
+# State files (both under STATE_DIR):
+#   WAN6_PENDING_SEEN_FILE    epoch timestamp when the current pending
+#                             acquisition was first observed
+#   WAN6_PENDING_EXPIRED_FILE marker that the current acquisition's grace
+#                             has already expired (prevents re-granting grace
+#                             to the same odhcp6c instance and prevents
+#                             repeated first-pending / grace-expired logs)
+#
+# Lifecycle:
+#   A. First transition into pending:
+#        - create timestamp
+#        - log "first-pending" ONCE
+#        - return 0 (passive wait)
+#   B. Same acquisition below grace:
+#        - silent (no repeated log, no counter increment)
+#        - return 0 (passive wait)
+#   C. Grace expires:
+#        - log "grace-expired" ONCE
+#        - write the expiry marker (timestamp is NOT removed)
+#        - return 1 (recovery allowed)
+#   D. Same acquisition already expired (recovery blocked upstream):
+#        - silent (no repeated log, no fresh grace)
+#        - return 1 (recovery remains allowed)
+#   E. pending_state_reset() is called by Tier 0 immediately before it
+#      actually starts a new ifdown/ifup acquisition, and also when wan6
+#      becomes up or pending becomes false. This removes both files so the
+#      next pending odhcp6c instance receives a fresh grace.
+#
+# Return codes:
+#   0 = pending and still inside grace, passive wait (caller must NOT recover
+#       and must NOT increment any failure counter)
+#   1 = grace expired OR already-expired acquisition, recovery allowed
+#       (caller may proceed to recovery; caller is responsible for calling
+#       pending_state_reset() immediately before starting the new
+#       ifdown/ifup acquisition)
+#   2 = not pending (no pending state to manage; caller should clear state)
+#
+# Arguments:
+#   $1 = pending (true/false) -- from wan6 status "pending"
+#   $2 = NOW (epoch seconds)
+# Logs via the global log() function; BusyBox ash compatible.
+pending_state_tick() {
+    local pending="$1" now="$2" seen elapsed
+    [ "$pending" = "true" ] || return 2
+
+    if [ -f "$WAN6_PENDING_EXPIRED_FILE" ]; then
+        # Same acquisition whose grace already expired. Do NOT re-grant grace
+        # and do NOT repeat logs. Tier 0 may still be blocked by cooldown /
+        # recovery hold / restart limits; that is upstream's decision.
+        return 1
+    fi
+
+    if [ ! -s "$WAN6_PENDING_SEEN_FILE" ]; then
+        # First transition into pending for this acquisition.
+        echo "$now" > "$WAN6_PENDING_SEEN_FILE"
+        log "Tier 0: wan6 is pending (odhcp6c acquiring), grace ${WAN6_PENDING_GRACE}s -- passive wait"
+        return 0
+    fi
+
+    seen=$(cat "$WAN6_PENDING_SEEN_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$seen" in
+        ''|*[!0-9]*) seen="$now" ;;
+    esac
+    elapsed=$((now - seen))
+    if [ "$elapsed" -lt "$WAN6_PENDING_GRACE" ]; then
+        # Below grace: silent.
+        return 0
+    fi
+
+    # Grace expired for this acquisition. Log ONCE, write the expiry marker,
+    # and KEEP the original timestamp so the same acquisition is not given a
+    # fresh grace window. Tier 0 decides whether to actually restart; if it
+    # is blocked, the next tick returns 1 directly via the expired-marker
+    # branch above without re-logging.
+    log "Tier 0: wan6 pending grace expired (${elapsed}s >= ${WAN6_PENDING_GRACE}s) -- proceeding to recovery"
+    : > "$WAN6_PENDING_EXPIRED_FILE"
+    return 1
+}
+
+# Clear all pending state. Called by Tier 0 immediately before it actually
+# starts a new ifdown/ifup acquisition, and when wan6 becomes up or pending
+# becomes false. Removing both files lets the next pending odhcp6c instance
+# receive a fresh WAN6_PENDING_GRACE.
+pending_state_reset() {
+    rm -f "$WAN6_PENDING_SEEN_FILE" 2>/dev/null
+    rm -f "$WAN6_PENDING_EXPIRED_FILE" 2>/dev/null
+}
+
+# Populate the PD-first source-aware context variables.
+# Sets: WAN_DEV, PD_ADDR, PD_MASK, PD_CIDR, LAN_PD_SRC, WAN128
+# Safe to call multiple times; returns 0 if PD context is usable.
+populate_pd_context() {
+    WAN_DEV=$(get_wan_dev)
+    PD_ADDR=$(get_pd_addr)
+    PD_MASK=$(get_pd_mask)
+    if [ -n "$PD_ADDR" ] && [ -n "$PD_MASK" ]; then
+        PD_CIDR="$PD_ADDR/$PD_MASK"
+    else
+        PD_CIDR=""
+    fi
+    if [ -n "$PD_CIDR" ]; then
+        LAN_PD_SRC=$(get_lan_pd_src)
+    else
+        LAN_PD_SRC=""
+    fi
+    WAN128=$(get_wan128)
+}
+
+# Source-aware external connectivity test using the PD-derived LAN source.
+# Requires PD_CIDR and LAN_PD_SRC. Tests Google and Cloudflare IPv6 targets.
+# Every external ping is explicitly bound to LAN_PD_SRC so the test reflects
+# LAN health through the delegated-prefix path, not the WAN /128.
+pd_internet_ok() {
+    [ -n "$PD_CIDR" ] && [ -n "$LAN_PD_SRC" ] || return 1
+    ping6 -c 2 -W 3 -I "$LAN_PD_SRC" 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+    ping6 -c 2 -W 3 -I "$LAN_PD_SRC" 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# Diagnostic-only connectivity test using the WAN /128.
+# Requires WAN128. Its result MUST NEVER define full IPv6 health, never
+# selects the LAN gateway, and never resets recovery counters. The helper
+# being diagnostic does NOT mean the WAN IA_NA /128 address itself is
+# diagnostic-only or temporary -- a healthy /128 may be retained for
+# router-originated IPv6. This helper simply never gates household health,
+# which is defined by IA_PD + LAN_PD_SRC + pd_internet_ok.
+#
+# The router source-policy layer (ensure_router_source_policy) calls this
+# helper to classify IA_NA reachability for the router-local preferred-src
+# decision. Two valid deployment modes:
+#   IA_NA usable: /128 present and reachable (wan128_internet_ok passes).
+#           Linux naturally selects it. Native source policy; no src mutation.
+#   IA_NA unusable: /128 present but unusable through the verified working
+#           gateway (wan128_internet_ok fails while pd_internet_ok passes).
+#           PD-preferred source policy; src=LAN_PD_SRC installed on the
+#           generic default route. Do NOT claim IA_NA is globally broken.
+wan128_internet_ok() {
+    [ -n "$WAN128" ] || return 1
+    ping6 -c 2 -W 3 -I "$WAN128" 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+    ping6 -c 2 -W 3 -I "$WAN128" 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    return 1
 }
 
 # Attempt a DHCPv6 renew before resorting to full interface restart.
@@ -217,16 +799,211 @@ internet_ok_now() {
     return 1
 }
 
+# ===== v3.10.0 Phase 2: EFFECTIVE PD-SOURCE ROUTING (kernel truth) =====
+# Returns 0 when the KERNEL resolves a packet from LAN_PD_SRC to a public
+# IPv6 target through WAN_DEV with a usable path. Uses `ip -6 route get`,
+# a pure lookup that never mutates the table (non-disruptive, safe every
+# tick). This replaces the old route-SHAPE requirement (an explicit
+# 'default from <PD_CIDR>' rule): live evidence proves generic-
+# default-only routing is healthy, so presence of a source-specific rule is
+# NEVER required for health.
+#
+# No-argument form = health-truth: LAN_PD_SRC must resolve through WAN_DEV.
+# A `via`/gateway is deliberately NOT required here (a usable resolved path
+# through WAN dev is enough; no forced route shape).
+#
+# Optional want_gw form = candidate-identity verification ONLY (fix_gateway
+# candidate trials, sticky restore): the resolved path must have a usable
+# `via` gateway AND that gateway must equal want_gw. Never a health rule.
+#
+# Failure rejects (first match wins):
+#   - missing WAN_DEV / LAN_PD_SRC
+#   - lookup command failure (rc != 0)
+#   - empty output
+#   - route types: unreachable / prohibit / blackhole / throw
+#     (NOTE: a null/unreachable route prints with rc=0, so keyword
+#     rejection is required, never rc alone)
+#   - obvious error text (Error / Invalid / "no route")
+#   - resolved device != WAN_DEV
+#   - want_gw supplied and no via, or via != want_gw
+#
+# Literal public IPs only. No DNS.
+pd_route_effective() {
+    local want_gw="$1"
+    local out via
+    [ -n "$WAN_DEV" ] || return 1
+    [ -n "$LAN_PD_SRC" ] || return 1
+    out=$(ip -6 route get 2001:4860:4860::8888 from "$LAN_PD_SRC" 2>&1) || return 1
+    [ -n "$out" ] || return 1
+    case "$out" in
+        *unreachable*|*prohibit*|*blackhole*|*throw*) return 1 ;;
+    esac
+    case "$out" in
+        *Error*|*Invalid*|*"no route"*|*"No route"*|*"RTNETLINK answers"*) return 1 ;;
+    esac
+    case "$out" in
+        *" dev $WAN_DEV"*) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$want_gw" ]; then
+        via=$(printf '%s\n' "$out" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+        [ -n "$via" ] || return 1
+        [ "$via" = "$want_gw" ] || return 1
+    fi
+    return 0
+}
+
+# ===== v3.10.0 Phase 2: ROUTE COHERENCE WRAPPER =====
+# Optional wrapper around the effective-routing truth. Returns 0 when:
+#   - a generic default route exists on WAN_DEV (Layer 3), AND
+#   - pd_route_effective [want_gw] passes (Layer 4, optionally verified
+#     against a specific candidate gateway).
+# NEVER a universal health primitive on its own; health is ipv6_ok (Layers
+# 1-5). The want_gw form is candidate-identity verification only and never
+# requires the generic default and the effective path to share a gateway
+# for health purposes.
+#
+# Usage: pd_routes_ok [gateway]
+#   no gateway -> health-style check: generic default + effective PD route
+#   with gateway -> generic default + effective PD route specifically via
+#                  that gateway (candidate trial verification)
+pd_routes_ok() {
+    local want_gw="$1"
+    [ -n "$WAN_DEV" ] || return 1
+    [ -n "$PD_CIDR" ] || return 1
+    ip -6 route show default dev "$WAN_DEV" 2>/dev/null | grep -q default || return 1
+    pd_route_effective "$want_gw"
+}
+
+# ===== v3.10.0 Phase 2: ROUTE SNAPSHOT / ROLLBACK =====
+# Snapshot preserves the COMPLETE raw IPv6 default route lines for WAN_DEV as
+# emitted by `ip -6 route show default dev WAN_DEV`. Each stored line is the
+# exact route specification (gateway, source, metric, preferred-source, etc.)
+# and is replayed verbatim via `ip -6 route replace <line>` so no attributes
+# are lost to hand-parsing. The leading "default" keyword is preserved.
+#
+# Files:
+#   ROUTE_SNAPSHOT_FILE  current snapshot path (one per fix_gateway invocation)
+# ROUTE_SNAPSHOT_FILE is exported by fix_gateway() before calling helpers
+# that may need to roll back.
+ROUTE_SNAPSHOT_FILE=""
+
+# Capture the current default route set for WAN_DEV into a snapshot file.
+# Returns 1 if no routes were captured (empty snapshot).
+snapshot_default_routes() {
+    local out="$1"
+    : > "$out"
+    ip -6 route show default dev "$WAN_DEV" 2>/dev/null > "$out"
+    [ -s "$out" ]
+}
+
+# Replay every route line from a snapshot via `ip -6 route replace` so the
+# original default route set is restored exactly. Removes the snapshot file.
+# Each line is the raw `ip -6 route show` output minus the leading
+# "dev WAN_DEV" which `ip route show` includes; we re-add dev WAN_DEV to keep
+# the route bound to the right L3 device. Lines that already contain an
+# explicit dev are left alone.
+restore_route_snapshot() {
+    local snapshot="$1"
+    local line dev_present
+    [ -s "$snapshot" ] || { rm -f "$snapshot" 2>/dev/null; return 0; }
+    while read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in
+            *" dev "*)
+                # Line already specifies a device; restore verbatim.
+                ip -6 route replace $line 2>/dev/null
+                ;;
+            *)
+                # Add the WAN_DEV device qualifier.
+                ip -6 route replace $line dev "$WAN_DEV" 2>/dev/null
+                ;;
+        esac
+    done < "$snapshot"
+    rm -f "$snapshot" 2>/dev/null
+    return 0
+}
+
+# Remove every default route currently installed for WAN_DEV (generic and
+# source-specific). Used to clear candidate routes before snapshot restore
+# so no partial candidate state remains.
+clear_default_routes() {
+    ip -6 route show default dev "$WAN_DEV" 2>/dev/null \
+        | while read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in
+                *" dev "*)
+                    ip -6 route del $line 2>/dev/null
+                    ;;
+                *)
+                    ip -6 route del $line dev "$WAN_DEV" 2>/dev/null
+                    ;;
+            esac
+        done
+}
+
+# ===== v3.10.0 Phase 2: MINIMAL-MUTATION ROUTE INSTALL =====
+# Install the MINIMUM route mutation needed for gateway gw to carry PD
+# traffic, never a preferred route SHAPE:
+#   1. generic default via gw (required).
+#   2. PD source-specific default via gw ONLY IF one already exists in the
+#      table (targeted stale-rule correction). Presence of a source-specific
+#      rule is never manufactured; live evidence proves the generic
+#      default alone is sufficient for effective PD routing.
+# This function intentionally does NOT install a preferred src (src=LAN_PD_SRC)
+# on the generic default. Gateway selection and router-local source policy
+# are kept logically separate: ensure_router_source_policy() runs AFTER this
+# and after keep_gateway() to classify IA_NA vs PD reachability and install
+# src only when needed. Returns 1 if any performed operation fails. Preserves
+# the existing metric-512 behavior.
+install_gw_routes() {
+    local gw="$1"
+    [ -n "$gw" ] || return 1
+    [ -n "$WAN_DEV" ] || return 1
+    ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null || return 1
+    if [ -n "$PD_CIDR" ] && ip -6 route show default from "$PD_CIDR" dev "$WAN_DEV" 2>/dev/null | grep -q default; then
+        ip -6 route replace default from "$PD_CIDR" via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null || return 1
+    fi
+    return 0
+}
+
+# Remove exactly the routes a candidate trial may have created/replaced for
+# gateway gw (generic + PD source-specific, metric 512). Used only when NO
+# original snapshot exists to restore. Never touches unrelated routes.
+remove_candidate_routes() {
+    local gw="$1"
+    [ -n "$gw" ] || return 0
+    [ -n "$WAN_DEV" ] || return 0
+    ip -6 route del default via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null
+    if [ -n "$PD_CIDR" ]; then
+        ip -6 route del default from "$PD_CIDR" via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null
+    fi
+    return 0
+}
+
 # Optional sticky gateway enforcement.
-# When STICKY_GATEWAY=1 and the current default gateway differs from the last
-# known-good gateway, attempts to restore the preferred gateway. If the preferred
-# gateway fails internet reachability, accepts the current gateway as the new
-# known-good. Safe to call on every happy-path tick.
+# v3.10.0 Phase 2: PD-source-aware. The sticky baseline may only be recorded
+# when PD context is usable (PD_CIDR + LAN_PD_SRC present), the generic
+# default exists, the kernel-effective PD route resolves through the current
+# gateway, and pd_internet_ok succeeds. Restoration of GOOD_GW performs the
+# MINIMUM route mutation (generic default via GOOD_GW; PD source-specific
+# rule only if one already exists) and is validated with
+# pd_route_effective "$good_gw" + pd_internet_ok (never WAN128 or unbound
+# router ping). If sticky restore fails, prior route state is restored so a
+# broken sticky route does not remain installed; the caller (fix_gateway)
+# handles recovery. Safe to call on every happy-path tick.
 keep_gateway() {
     [ "$STICKY_GATEWAY" = "1" ] || return 0
     has_prefix || return 0
 
-    local good_gw current_gw mac
+    # Phase 2: require PD context for any sticky decision.
+    populate_pd_context
+    if [ -z "$PD_CIDR" ] || [ -z "$LAN_PD_SRC" ]; then
+        log "Sticky gateway: no PD context, deferring"
+        return 0
+    fi
+
+    local good_gw current_gw mac snap
 
     current_gw=$(current_default_gw)
     [ -z "$current_gw" ] && return 0
@@ -234,11 +1011,13 @@ keep_gateway() {
     good_gw=$(cat "$GOOD_GW_FILE" 2>/dev/null)
 
     if [ -z "$good_gw" ]; then
-        if internet_ok_now; then
+        # No baseline yet: only record one when the current gateway is
+        # fully coherent AND pd_internet_ok succeeds.
+        if pd_routes_ok "$current_gw" && pd_internet_ok; then
             echo "$current_gw" > "$GOOD_GW_FILE"
-            log "Sticky gateway baseline set: $current_gw"
+            log "Sticky gateway baseline set: $current_gw (PD-source verified)"
         else
-            log "Sticky gateway baseline not set: current gateway $current_gw has no internet reachability"
+            log "Sticky gateway baseline not set: current gateway $current_gw not PD-source verified"
         fi
         return 0
     fi
@@ -249,120 +1028,130 @@ keep_gateway() {
 
     mac=$(gateway_mac "$good_gw")
     if [ -z "$mac" ]; then
-        if internet_ok_now; then
-            log "Sticky gateway check: preferred $good_gw has no MAC, accepting verified current $current_gw"
+        # Cannot pin preferred gateway. Verify the current gateway via PD
+        # source and accept it as the new baseline if coherent.
+        if pd_routes_ok "$current_gw" && pd_internet_ok; then
+            log "Sticky gateway check: preferred $good_gw has no MAC, accepting PD-verified current $current_gw"
             echo "$current_gw" > "$GOOD_GW_FILE"
         else
-            log "Sticky gateway check: preferred $good_gw has no MAC, current $current_gw not verified, keeping baseline"
+            log "Sticky gateway check: preferred $good_gw has no MAC, current $current_gw not PD-verified, keeping baseline"
         fi
         return 0
     fi
 
+    # Snapshot current routes so a failed sticky restore can be rolled back.
+    snap="$STATE_DIR/keep_gateway_routes.$$"
+    snapshot_default_routes "$snap"
+
     ip -6 neigh replace "$good_gw" lladdr "$mac" dev "$WAN_DEV" nud stale 2>/dev/null
-    ip -6 route replace default via "$good_gw" dev "$WAN_DEV" metric 512 2>/dev/null
+    install_gw_routes "$good_gw" || {
+        log "Sticky gateway preferred $good_gw route install failed, rolling back routes"
+        clear_default_routes
+        restore_route_snapshot "$snap"
+        sleep 3
+        return 0
+    }
     sleep 2
 
-    if internet_ok_now; then
-        log "Sticky gateway restored: $good_gw (mac $mac, internet verified)"
+    # Verify the PD-source path actually resolves through the preferred
+    # gateway before trusting it, then confirm external PD connectivity.
+    if pd_route_effective "$good_gw" && pd_internet_ok; then
+        log "Sticky gateway restored: $good_gw (mac $mac, PD-source verified)"
         echo "$good_gw" > "$GOOD_GW_FILE"
+        rm -f "$snap" 2>/dev/null
         sleep 3
         return 0
     fi
 
-    log "Sticky gateway preferred $good_gw failed internet test, restoring current $current_gw"
-    mac=$(gateway_mac "$current_gw")
-    if [ -n "$mac" ]; then
-        ip -6 neigh replace "$current_gw" lladdr "$mac" dev "$WAN_DEV" nud stale 2>/dev/null
-    fi
-    ip -6 route replace default via "$current_gw" dev "$WAN_DEV" metric 512 2>/dev/null
-    if internet_ok_now; then
-        echo "$current_gw" > "$GOOD_GW_FILE"
-    fi
+    # Sticky restore failed: roll back to the snapshot so the broken sticky
+    # route does not remain installed. Hand off to fix_gateway() for further
+    # recovery.
+    log "Sticky gateway preferred $good_gw failed PD-source test, rolling back routes"
+    clear_default_routes
+    restore_route_snapshot "$snap"
     sleep 3
     return 0
 }
 
-# Replay every default route line saved before fix_gateway() modified the table.
-restore_route_snapshot() {
-    local snapshot="$1"
-    local route gw src metric
-
-    [ -s "$snapshot" ] || return 0
-    while read -r route; do
-        [ -z "$route" ] && continue
-        gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-        src=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
-        metric=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="metric"){print $(i+1); exit}}')
-        [ -z "$metric" ] && metric=512
-        if [ -n "$src" ] && [ -n "$gw" ]; then
-            ip -6 route replace default from "$src" via "$gw" dev "$WAN_DEV" metric "$metric" 2>/dev/null
-        elif [ -n "$gw" ]; then
-            ip -6 route replace default via "$gw" dev "$WAN_DEV" metric "$metric" 2>/dev/null
-        fi
-    done < "$snapshot"
-    rm -f "$snapshot"
-}
-
 fix_gateway() {
-    local route_snapshot
+    local route_snapshot current mac gw
 
-    # Snapshot the full default route set before any deletes or candidate installs.
+    # v3.10.0 Phase 2: source-aware PLDT gateway selection. The decisive
+    # test is PD/LAN sourced internet reachability (pd_internet_ok), never
+    # WAN128 or unbound router-originated ping. Link-local/NDP discovery
+    # pings to ff02::2 / link-local gateways remain permitted.
+    #
+    # HEALTH vs GATEWAY COHERENCE are separate: health requires only an
+    # effective PD-source route through WAN (no gateway equality); candidate
+    # trials require pd_route_effective "$candidate" (gateway identity).
+
+    # Require PD context for any source-aware gateway decision.
+    populate_pd_context
+    if [ -z "$PD_CIDR" ] || [ -z "$LAN_PD_SRC" ]; then
+        log "fix_gateway: no PD context (PD_CIDR/LAN_PD_SRC), deferring source-aware gateway selection"
+        return 1
+    fi
+
+    # Snapshot the full default route set before any candidate installs so a
+    # failed scan can be rolled back exactly. Each stored line is the raw
+    # `ip -6 route show` output and is replayed verbatim via
+    # `ip -6 route replace`.
     route_snapshot="$STATE_DIR/fix_gateway_routes.$$"
-    ip -6 route show default dev "$WAN_DEV" 2>/dev/null > "$route_snapshot"
-
-    # ===== STEP 1: Remove dead prefix-specific routes =====
-    # Remove prefix-specific default routes only when external IPv6 reachability is already broken.
-    # PLDT installs a source-based route: 'default from <prefix>/56 via <gateway>'
-    # which takes priority over the generic default for LAN client traffic.
-    # If it points at the dead gateway, LAN clients have no IPv6 even when
-    # the generic default route is healthy.
-    # Reachability is checked once here and reused for all matching routes to
-    # avoid redundant slow pings per route entry.
-    if ! ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && \
-       ! ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-        ip -6 route show default dev "$WAN_DEV" | grep 'from' | while read -r route; do
-            gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
-            src=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
-            if [ -n "$gw" ] && [ -n "$src" ]; then
-                ip -6 route del default from "$src" via "$gw" dev "$WAN_DEV" 2>/dev/null && \
-                    log "Removed dead prefix-specific route: default from $src via $gw"
-            fi
-        done
+    if ! snapshot_default_routes "$route_snapshot"; then
+        log "fix_gateway: no default routes to snapshot; nothing to repair"
+        rm -f "$route_snapshot" 2>/dev/null
+        return 1
     fi
+    ROUTE_SNAPSHOT_FILE="$route_snapshot"
 
-    current=$(current_default_gw)
-
-    # Current gateway is only considered good if internet reachability works.
-    # Do not trust link-local gateway ping alone on PLDT -- the dead gateway
-    # responds to direct ping6 intermittently but does not forward internet
-    # traffic reliably.
-    # Silent success on this path: the initial ipv6_ok miss was transient and
-    # the current gateway now verifies. Logging here would forward a
-    # spurious "no fix needed" notice to Discord. GOOD_GW_FILE is updated so
-    # the sticky gateway baseline stays in sync.
-    if [ -n "$current" ]; then
-        if internet_ok_now; then
-            echo "$current" > "$GOOD_GW_FILE"
-            rm -f "$route_snapshot"
-            return 0
+    # Per-candidate rollback invariant: AFTER EVERY FAILED CANDIDATE attempt
+    # the runtime route state must equal the pre-candidate state exactly.
+    # With a snapshot: clear (drops any trial-created generic/src rule) and
+    # replay the snapshot verbatim, then re-snapshot for the next trial.
+    # Without a snapshot: remove only the routes this trial created.
+    rollback_gw_trial() {
+        local gw="$1"
+        if [ -s "$route_snapshot" ]; then
+            clear_default_routes
+            restore_route_snapshot "$route_snapshot"
+            snapshot_default_routes "$route_snapshot" 2>/dev/null || route_snapshot=""
+        else
+            remove_candidate_routes "$gw"
         fi
-        log "Current gateway $current has no internet reachability, scanning alternatives"
+    }
+
+    # ===== FAST PATH: effective PD routing + PD connectivity already good =====
+    # Generic-default-only routing is accepted with ZERO route
+    # churn. Health here is pd_routes_ok (no gateway equality): generic
+    # default + kernel-effective PD route through WAN. Good gateways are
+    # never replaced just to match a preferred route shape. Silent success
+    # to avoid spurious Discord logs; GOOD_GW_FILE is updated so the sticky
+    # baseline stays in sync.
+    current=$(current_default_gw)
+    if pd_routes_ok && pd_internet_ok; then
+        if [ -n "$current" ]; then
+            echo "$current" > "$GOOD_GW_FILE"
+        fi
+        rm -f "$route_snapshot" 2>/dev/null
+        ROUTE_SNAPSHOT_FILE=""
+        return 0
     fi
 
+    if [ -n "$current" ]; then
+        log "fix_gateway: current gateway $current not effective or not PD-verified, scanning alternatives"
+    else
+        log "fix_gateway: no current gateway, scanning candidates"
+    fi
+
+    # ===== CANDIDATE SCAN =====
     # Trigger an all-routers multicast probe before scanning candidates.
-    # ping6 ff02::2 sends ICMPv6 echo to the all-routers multicast address,
-    # prompting routers to respond and refreshing NDP/MAC state in the
-    # neighbor table. Without this, gateways may be present in the table
-    # but have no MAC yet (INCOMPLETE state), causing the loop to skip all
-    # candidates and fall through to no-fix. Mirrors 99-ipv6-setup behavior.
+    # ping6 ff02::2 is a link-local/NDP discovery ping (explicitly exempt from
+    # the no-unbound-ping rule) and prompts routers to refresh NDP/MAC state.
     log "Triggering NDP all-routers probe before gateway scan"
     ping6 -c 1 -W 3 -I "$WAN_DEV" ff02::2 >/dev/null 2>&1
     sleep 2
 
     # Combine neighbor table and existing route table for the candidate list.
-    # The neighbor table alone can miss gateways if NDP was incomplete at the
-    # time of the scan. Using both sources matches 99-ipv6-setup behavior and
-    # ensures no known gateway is overlooked.
     for gw in $(
         { ip -6 neigh show dev "$WAN_DEV" | awk '/router/{print $1}'
           ip -6 route show default dev "$WAN_DEV" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1)}}'
@@ -375,64 +1164,710 @@ fix_gateway() {
             continue
         }
 
-        # Install candidate temporarily and test internet reachability.
-        # Do not accept a candidate just because it replies to local ping.
+        # Minimum-mutation trial: generic default via candidate; PD
+        # source-specific rule is replaced ONLY if one already exists
+        # (targeted stale-rule correction -- never manufactured).
+        # Do not accept a candidate just because NDP works or it replies to
+        # local ping; the decisive tests are pd_route_effective "$gw"
+        # (kernel path through THIS candidate) and pd_internet_ok.
         ip -6 neigh replace "$gw" lladdr "$mac" dev "$WAN_DEV" nud stale 2>/dev/null
-        ip -6 route replace default via "$gw" dev "$WAN_DEV" metric 512 2>/dev/null
-        sleep 2
+        if ! install_gw_routes "$gw"; then
+            log "Gateway $gw route install failed, rolling back"
+            rollback_gw_trial "$gw"
+            continue
+        fi
+        sleep 1
 
-        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
-           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-            log "Gateway replaced with $gw (mac $mac pinned, internet verified)"
-            echo "$gw" > "$GOOD_GW_FILE"
-            rm -f "$route_snapshot"
-            return 0
+        if ! pd_route_effective "$gw"; then
+            log "Gateway $gw does not carry the effective PD route, rejecting"
+            rollback_gw_trial "$gw"
+            continue
+        fi
+        sleep 1
+
+        if ! pd_internet_ok; then
+            log "Gateway $gw responds locally but PD-source internet test fails, rejecting"
+            rollback_gw_trial "$gw"
+            continue
         fi
 
-        log "Gateway $gw responds locally but has no internet reachability, rejecting"
+        log "Gateway replaced with $gw (mac $mac pinned, PD-source verified)"
+        echo "$gw" > "$GOOD_GW_FILE"
+        rm -f "$route_snapshot" 2>/dev/null
+        ROUTE_SNAPSHOT_FILE=""
+        return 0
     done
 
-    log "No gateway candidate passed internet reachability test"
+    # ===== ROLLBACK: no candidate succeeded =====
+    log "No gateway candidate passed effective-route and PD-source internet tests"
     if [ -s "$route_snapshot" ]; then
+        clear_default_routes
         restore_route_snapshot "$route_snapshot"
         log "Restored pre-scan default route set"
     else
-        ip -6 route del default dev "$WAN_DEV" metric 512 2>/dev/null
-        rm -f "$route_snapshot"
-        log "Removed trial default route (no pre-scan routes)"
+        remove_candidate_routes "$gw"
+        rm -f "$route_snapshot" 2>/dev/null
+        log "Removed candidate default routes (no pre-scan routes to restore)"
     fi
+    ROUTE_SNAPSHOT_FILE=""
     return 1
 }
 
+# ===== v3.10.0 ROUTER SOURCE POLICY LAYER =====
+# Separate from gateway selection. This helper classifies whether the WAN
+# IA_NA /128 is usable for ordinary router-originated IPv6 and, ONLY when it
+# is present but unusable while PD-source Internet works, installs a
+# preferred src (LAN_PD_SRC) on the generic default route so the Linux kernel
+# uses the PD-derived LAN source for unbound router-originated traffic.
+#
+# IMPORTANT: This is a ROUTER-LOCAL source policy, NOT a household health
+# input. WAN128 success/failure MUST NEVER:
+#   - define ipv6_ok()
+#   - increment recovery failures
+#   - reset recovery state
+#   - trigger wan6/full-WAN recovery
+#   - consume shared disruption budget
+#   - trigger recovery hold
+#
+# Two valid deployment modes observed in live evidence:
+#   IA_NA usable: /128 present and usable. Linux naturally selects it.
+#           Ordinary router IPv6 passes. This helper classifies NATIVE and
+#           performs NO src mutation.
+#   IA_NA unusable: /128 present but unusable through the verified working
+#           gateway. Linux selects /128 for unbound traffic. Router-originated
+#           IPv6 fails. Explicit PD-derived src succeeds. This helper
+#           classifies PD-PREFERRED and installs src=LAN_PD_SRC on the generic
+#           default route.
+#
+# Classification:
+#   A. WAN128 absent                     -> NATIVE (no src requirement)
+#   B. WAN128 present + WAN128 Internet OK -> NATIVE (preserve Linux selection)
+#   C. WAN128 present + WAN128 Internet FAIL + PD Internet OK -> PD-PREFERRED
+#   D. PD Internet NOT OK               -> no policy-driven mutation; leave
+#                                           recovery to the existing PD-first
+#                                           flow. Do NOT treat WAN128 result
+#                                           as household recovery input.
+#
+# Cache: classification is cached under STATE_DIR. The cache identity key
+# includes WAN128, PD_CIDR, LAN_PD_SRC, and the current default gateway. When
+# any of these change, classification is rerun immediately. Otherwise, the
+# cache is reused until SRC_POLICY_REFRESH seconds elapse, at which point
+# WAN128 probes are rerun. When the cached mode is PD-PREFERRED and the key is
+# unchanged, the helper does NOT rerun WAN128 probes; it only verifies that
+# the generic default route still has src=LAN_PD_SRC and restores it if
+# netifd/RA/another route refresh silently removed it.
+#
+# Route ownership: when installing PD-PREFERRED, the helper mutates ONLY the
+# generic default route through the current verified WAN gateway, preserving
+# metric-512. It does NOT create/delete PD source-specific defaults for this
+# feature. When returning to NATIVE, it removes preferred src ONLY if the
+# watchdog previously installed/manages it (tracked in
+# SRC_POLICY_MANAGED_SRC_FILE), never stripping an admin/user-created src.
+
+# Build the cache identity key from current context variables. Any change
+# in these values invalidates the cache and forces reclassification.
+_src_policy_key() {
+    printf '%s|%s|%s|%s' "$WAN128" "$PD_CIDR" "$LAN_PD_SRC" "$_SP_CURRENT_GW"
+}
+
+# Read the cached mode (native/pd-preferred) or empty if no cache.
+_src_policy_cached_mode() {
+    [ -f "$SRC_POLICY_MODE_FILE" ] && cat "$SRC_POLICY_MODE_FILE" 2>/dev/null
+}
+
+# Read the cached key or empty.
+_src_policy_cached_key() {
+    [ -f "$SRC_POLICY_KEY_FILE" ] && cat "$SRC_POLICY_KEY_FILE" 2>/dev/null
+}
+
+# Read the cached timestamp or 0.
+_src_policy_cached_ts() {
+    [ -f "$SRC_POLICY_TS_FILE" ] && sanitize_int "$(cat "$SRC_POLICY_TS_FILE" 2>/dev/null)" || echo 0
+}
+
+# Read the watchdog's recorded managed src (ownership record) or empty.
+# MANAGED_SRC means: "this watchdog successfully installed this preferred src
+# on the generic default route via _install_preferred_src." It is NOT written
+# merely because pd-preferred was classified; only after a successful route
+# mutation by the watchdog.
+_src_policy_managed_src() {
+    [ -f "$SRC_POLICY_MANAGED_SRC_FILE" ] && cat "$SRC_POLICY_MANAGED_SRC_FILE" 2>/dev/null
+}
+
+# Write the POLICY CACHE only (mode, key, timestamp). Does NOT touch
+# managed_src. Ownership is recorded separately by _install_preferred_src
+# after a successful route mutation, and cleared by _remove_managed_src
+# / _relinquish_managed_src after a verified removal or ownership loss.
+_src_policy_write_cache() {
+    _spm_mode="$1"; _spm_key="$2"
+    echo "$_spm_mode" > "$SRC_POLICY_MODE_FILE"
+    echo "$_spm_key" > "$SRC_POLICY_KEY_FILE"
+    echo "$NOW" > "$SRC_POLICY_TS_FILE"
+}
+
+# Print the raw generic default route line (no `from` clause) from the
+# kernel route table. Returns the first generic default whose `dev` token
+# equals WAN_DEV, or empty if none.
+#
+# IMPORTANT: We use `ip -6 route show default` WITHOUT a `dev` selector.
+# On real OpenWrt/iproute2, `ip -6 route show default dev eth1` OMITS the
+# `dev eth1` token from the output (the selector is implied). If the raw
+# line is later replayed via `ip -6 route replace <line>`, the missing
+# `dev` causes the route replace to fail for link-local next hops (which
+# require interface context). By querying without the selector and
+# filtering in awk, the returned line always includes the `dev` token.
+_generic_default_raw_line() {
+    ip -6 route show default 2>/dev/null \
+        | awk -v d="$WAN_DEV" '
+            $1 == "default" && $2 != "from" {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "dev" && $(i + 1) == d) {
+                        print
+                        exit
+                    }
+                }
+            }
+        '
+}
+
+# Check whether the current generic default route has a src attribute.
+# Returns 0 (true) and prints the src value if present; returns 1 (false) if
+# no src on the generic default. Only inspects the first generic default
+# route (no `from` clause) on WAN_DEV.
+_generic_default_src() {
+    _generic_default_raw_line \
+        | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+# Install preferred src on the generic default route. Preserves all existing
+# route attributes (proto, pref, metric, etc.) by reading the current raw
+# generic default line and replaying it with only the src token
+# added/replaced. Only mutates the generic default (no `from` clause); never
+# touches source-specific defaults. Records ownership (managed_src) ONLY
+# after the route replace succeeds. If the route already has src=LAN_PD_SRC,
+# the route is not mutated, and ownership is NOT claimed (the src may have
+# been installed by an admin). Returns 0 on successful watchdog-installed
+# mutation, 1 on failure or no-op (already had the src, or route replace
+# failed).
+_install_preferred_src() {
+    local gw="$1"
+    [ -n "$gw" ] || return 1
+    [ -n "$WAN_DEV" ] || return 1
+    [ -n "$LAN_PD_SRC" ] || return 1
+    local raw cur_src new_line
+    raw=$(_generic_default_raw_line)
+    [ -n "$raw" ] || return 1
+    cur_src=$(printf '%s\n' "$raw" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    # If the route already has src=LAN_PD_SRC, do NOT claim ownership
+    # (an admin may have installed it; the watchdog did not). Return 1
+    # so the caller knows no mutation occurred.
+    if [ "$cur_src" = "$LAN_PD_SRC" ]; then
+        return 1
+    fi
+    # Build the new line: take the raw line, remove any existing src token
+    # and its value, then append "src LAN_PD_SRC". This preserves all other
+    # attributes (via, dev, proto, pref, metric, etc.).
+    new_line=$(printf '%s\n' "$raw" | awk -v s="$LAN_PD_SRC" '
+        { for(i=1;i<=NF;i++) if($i=="src"){ $i=""; $(i+1)=""; break } }
+        { sub(/  +$/, ""); printf "%s src %s\n", $0, s }
+    ')
+    # Perform the route replace. Only record ownership on success.
+    if ip -6 route replace $new_line 2>/dev/null; then
+        echo "$LAN_PD_SRC" > "$SRC_POLICY_MANAGED_SRC_FILE"
+        return 0
+    fi
+    log "Router source policy: preferred-src route install failed"
+    return 1
+}
+
+# Remove the watchdog's managed preferred src from the generic default
+# route. This verifies BOTH:
+#   1. managed_src (ownership record) is non-empty and matches the current
+#      LAN_PD_SRC (the watchdog installed it for THIS PD context).
+#   2. the current generic default route src == managed_src (the route still
+#      has the watchdog's src; it has not been overridden by an admin).
+# If either check fails, the route is NOT touched and ownership is either
+# preserved (if the route was overridden) or relinquished (if ownership is
+# stale). Never strips an admin/user-created src.
+_remove_managed_preferred_src() {
+    local gw="$1"
+    [ -n "$gw" ] || return 0
+    [ -n "$WAN_DEV" ] || return 0
+    local managed_src cur_src raw new_line
+    managed_src=$(_src_policy_managed_src)
+    [ -n "$managed_src" ] || return 0
+    # Only remove if the managed src matches the current LAN_PD_SRC (the
+    # watchdog installed it for THIS PD context).
+    [ "$managed_src" = "$LAN_PD_SRC" ] || return 0
+    # Verify the current route src == managed_src. If the route was
+    # overridden by an admin (src differs), do NOT strip it; relinquish
+    # ownership instead.
+    cur_src=$(_generic_default_src)
+    if [ "$cur_src" != "$managed_src" ]; then
+        # Route src was changed by someone else. Relinquish ownership
+        # without touching the route.
+        : > "$SRC_POLICY_MANAGED_SRC_FILE"
+        return 0
+    fi
+    # The current route has the watchdog's src. Remove it by replaying the
+    # raw line without the src token, preserving all other attributes.
+    raw=$(_generic_default_raw_line)
+    [ -n "$raw" ] || return 0
+    new_line=$(printf '%s\n' "$raw" | awk '
+        { for(i=1;i<=NF;i++) if($i=="src"){ $i=""; $(i+1)=""; break } }
+        { sub(/  +$/, ""); print }
+    ')
+    ip -6 route replace $new_line 2>/dev/null
+    : > "$SRC_POLICY_MANAGED_SRC_FILE"
+}
+
+# Relinquish watchdog ownership without touching the route. Used when
+# ownership is stale (e.g. PD changed and the old managed_src no longer
+# applies) but the current route may have been overridden by an admin.
+# If the current route still has the old managed_src, remove it safely
+# (preserving attributes). If the route src differs, just clear ownership.
+_relinquish_stale_managed_src() {
+    local old_managed="$1"
+    [ -n "$old_managed" ] || return 0
+    [ -n "$WAN_DEV" ] || return 0
+    local cur_src raw new_line
+    cur_src=$(_generic_default_src)
+    if [ "$cur_src" = "$old_managed" ]; then
+        # The route still has the watchdog's old src. Remove it safely
+        # (preserve attributes), then clear ownership.
+        raw=$(_generic_default_raw_line)
+        [ -n "$raw" ] || { : > "$SRC_POLICY_MANAGED_SRC_FILE"; return 0; }
+        new_line=$(printf '%s\n' "$raw" | awk '
+            { for(i=1;i<=NF;i++) if($i=="src"){ $i=""; $(i+1)=""; break } }
+            { sub(/  +$/, ""); print }
+        ')
+        ip -6 route replace $new_line 2>/dev/null
+    fi
+    # If cur_src != old_managed, someone else changed the route. Do NOT
+    # touch it. Just clear ownership.
+    : > "$SRC_POLICY_MANAGED_SRC_FILE"
+}
+
+ensure_router_source_policy() {
+    # Requires PD context. If PD is not healthy, do NOT use WAN128 result as
+    # a household recovery input. Leave recovery to the existing PD-first flow.
+    populate_pd_context
+    [ -n "$PD_CIDR" ] || return 0
+    [ -n "$LAN_PD_SRC" ] || return 0
+    [ -n "$WAN_DEV" ] || return 0
+
+    local _SP_CURRENT_GW
+    _SP_CURRENT_GW=$(current_default_gw)
+    # No current gateway: cannot install/remove preferred src. Defer.
+    [ -n "$_SP_CURRENT_GW" ] || return 0
+
+    # Fast path: WAN128 absent and no cached pd-preferred mode -> native with
+    # zero probes. No WAN128 to classify, no need to probe PD health. This
+    # avoids consuming a ping6 token on every healthy cron tick when the
+    # router has no IA_NA /128. However, if the watchdog owns a managed src
+    # (managed_src is set and matches LAN_PD_SRC), it must be cleaned up
+    # even if the cached mode is not pd-preferred (e.g. mode file was
+    # corrupted, fast path wrote native on a prior tick, but the route
+    # still has the watchdog's src). The ownership record (managed_src +
+    # current route src) is the ground truth, not the cached mode.
+    local _SP_CACHED_MODE_Q _SP_KEY_Q _SP_CACHED_KEY_Q _SP_MANAGED_Q
+    _SP_CACHED_MODE_Q=$(_src_policy_cached_mode)
+    _SP_MANAGED_Q=$(_src_policy_managed_src)
+    if [ -z "$WAN128" ] && [ "$_SP_CACHED_MODE_Q" != "pd-preferred" ]; then
+        # If the watchdog owns a src on the route, clean it up before
+        # writing native. This handles the case where the mode file was
+        # corrupted and the fast path previously wrote native without
+        # cleaning up.
+        if [ -n "$_SP_MANAGED_Q" ] && [ "$_SP_MANAGED_Q" = "$LAN_PD_SRC" ]; then
+            _remove_managed_preferred_src "$_SP_CURRENT_GW"
+        fi
+        # WAN128 absent, no prior pd-preferred (or cleanup done) -> native.
+        _SP_KEY_Q=$(_src_policy_key)
+        _SP_CACHED_KEY_Q=$(_src_policy_cached_key)
+        [ "$_SP_KEY_Q" = "$_SP_CACHED_KEY_Q" ] && return 0
+        _src_policy_write_cache "native" "$_SP_KEY_Q"
+        return 0
+    fi
+
+    # PD health gate: if PD-source Internet does not pass, classification D
+    # applies. No policy-driven route mutation. Do NOT treat WAN128 as bad
+    # or mutate the route based on that comparison. This gate only runs when
+    # WAN128 is present (or cached pd-preferred needs cleanup), so it does
+    # not consume a ping6 token on every healthy tick.
+    if ! pd_internet_ok; then
+        return 0
+    fi
+
+    local key cached_mode cached_key cached_ts cached_src
+    key=$(_src_policy_key)
+    cached_mode=$(_src_policy_cached_mode)
+    cached_key=$(_src_policy_cached_key)
+    cached_ts=$(_src_policy_cached_ts)
+    cached_src=$(_src_policy_managed_src)
+
+    # ---- Cache key changed: reclassify immediately ----
+    if [ "$key" != "$cached_key" ]; then
+        # Key invalidation: if the managed src is stale (belongs to a prior
+        # PD context), relinquish it safely. The new key includes the new
+        # LAN_PD_SRC; if it differs from the old managed_src, the old
+        # preferred src is stale. Use _relinquish_stale_managed_src which
+        # verifies the current route src before touching anything.
+        if [ -n "$cached_src" ] && [ "$cached_src" != "$LAN_PD_SRC" ]; then
+            _relinquish_stale_managed_src "$cached_src"
+        fi
+
+        # Classify.
+        if [ -z "$WAN128" ]; then
+            # A: WAN128 absent -> native
+            # Clean up watchdog-owned src regardless of cached_mode. The
+            # ownership record (managed_src + route src) is the ground
+            # truth, not the cached mode (which may have been corrupted).
+            if [ -n "$cached_src" ] && [ "$cached_src" = "$LAN_PD_SRC" ]; then
+                if [ "$cached_mode" = "pd-preferred" ]; then
+                    log "Router source policy: pd-preferred -> native (WAN128 absent)"
+                fi
+                _remove_managed_preferred_src "$_SP_CURRENT_GW"
+            elif [ "$cached_mode" = "pd-preferred" ]; then
+                log "Router source policy: pd-preferred -> native (WAN128 absent)"
+                _remove_managed_preferred_src "$_SP_CURRENT_GW"
+            fi
+            _src_policy_write_cache "native" "$key"
+            return 0
+        fi
+
+        # WAN128 present: probe WAN128 reachability (only on reclassification).
+        if wan128_internet_ok; then
+            # B: WAN128 present + WAN128 Internet OK -> native
+            # Clean up watchdog-owned src regardless of cached_mode.
+            if [ -n "$cached_src" ] && [ "$cached_src" = "$LAN_PD_SRC" ]; then
+                if [ "$cached_mode" = "pd-preferred" ]; then
+                    log "Router source policy: pd-preferred -> native (WAN128 Internet OK)"
+                fi
+                _remove_managed_preferred_src "$_SP_CURRENT_GW"
+            elif [ "$cached_mode" = "pd-preferred" ]; then
+                log "Router source policy: pd-preferred -> native (WAN128 Internet OK)"
+                _remove_managed_preferred_src "$_SP_CURRENT_GW"
+            fi
+            _src_policy_write_cache "native" "$key"
+            return 0
+        fi
+
+        # C: WAN128 present + WAN128 Internet FAIL + PD Internet OK -> pd-preferred
+        if [ "$cached_mode" != "pd-preferred" ]; then
+            log "Router source policy: native -> pd-preferred (WAN128 Internet failed, PD Internet OK)"
+        fi
+        _src_policy_write_cache "pd-preferred" "$key"
+        # Install preferred src on the generic default route. Ownership is
+        # recorded ONLY by _install_preferred_src on success. If the route
+        # already has src=LAN_PD_SRC (e.g. admin-installed), the function
+        # returns 1 and ownership is NOT claimed.
+        local cur_src
+        cur_src=$(_generic_default_src)
+        if [ -z "$cur_src" ]; then
+            # No src on generic default: install it.
+            if _install_preferred_src "$_SP_CURRENT_GW"; then
+                log "Router source policy: installed preferred src $LAN_PD_SRC on default via $_SP_CURRENT_GW"
+            fi
+        elif [ "$cur_src" = "$LAN_PD_SRC" ]; then
+            # Route already has src=LAN_PD_SRC. Do NOT claim ownership
+            # (may be admin-installed). No mutation needed.
+            :
+        else
+            # A different src is present. Do NOT strip an admin/user-created
+            # src. Only install if the current src matches our managed_src
+            # (we are replacing our own previous install that was lost).
+            if [ -n "$cached_src" ] && [ "$cur_src" = "$cached_src" ]; then
+                if _install_preferred_src "$_SP_CURRENT_GW"; then
+                    log "Router source policy: restored preferred src $LAN_PD_SRC on default via $_SP_CURRENT_GW"
+                fi
+            fi
+        fi
+        return 0
+    fi
+
+    # ---- Cache key unchanged ----
+    case "$cached_mode" in
+        native)
+            # Native mode: check if refresh interval has elapsed. If so,
+            # rerun WAN128 probes to catch silent transitions. Otherwise,
+            # no action (no src requirement).
+            # Also check for orphaned watchdog-owned src: if managed_src
+            # is set and matches LAN_PD_SRC, the route may still have a
+            # watchdog-installed src that was not cleaned up (e.g. due to
+            # prior mode-file corruption). Clean it up regardless of
+            # refresh timing.
+            if [ -n "$cached_src" ] && [ "$cached_src" = "$LAN_PD_SRC" ]; then
+                local _orphan_cur
+                _orphan_cur=$(_generic_default_src)
+                if [ "$_orphan_cur" = "$cached_src" ]; then
+                    # Route still has watchdog-owned src. Remove it.
+                    _remove_managed_preferred_src "$_SP_CURRENT_GW"
+                elif [ -n "$_orphan_cur" ] && [ "$_orphan_cur" != "$cached_src" ]; then
+                    # Route was overridden by admin. Relinquish ownership.
+                    : > "$SRC_POLICY_MANAGED_SRC_FILE"
+                fi
+            fi
+            if [ $((NOW - cached_ts)) -ge "$SRC_POLICY_REFRESH" ]; then
+                # Refresh: rerun classification probes.
+                if [ -z "$WAN128" ]; then
+                    _src_policy_write_cache "native" "$key"
+                    return 0
+                fi
+                if wan128_internet_ok; then
+                    _src_policy_write_cache "native" "$key"
+                    return 0
+                fi
+                # WAN128 now fails + PD OK -> transition to pd-preferred.
+                log "Router source policy: native -> pd-preferred (WAN128 Internet failed, PD Internet OK)"
+                _src_policy_write_cache "pd-preferred" "$key"
+                local cur_src
+                cur_src=$(_generic_default_src)
+                if [ -z "$cur_src" ]; then
+                    if _install_preferred_src "$_SP_CURRENT_GW"; then
+                        log "Router source policy: installed preferred src $LAN_PD_SRC on default via $_SP_CURRENT_GW"
+                    fi
+                elif [ "$cur_src" = "$LAN_PD_SRC" ]; then
+                    : # Already has the right src; do not claim ownership.
+                elif [ -n "$cached_src" ] && [ "$cur_src" = "$cached_src" ]; then
+                    if _install_preferred_src "$_SP_CURRENT_GW"; then
+                        log "Router source policy: restored preferred src $LAN_PD_SRC on default via $_SP_CURRENT_GW"
+                    fi
+                fi
+            fi
+            return 0
+            ;;
+        pd-preferred)
+            # PD-preferred cached: do NOT rerun WAN128 probes. Only verify
+            # that the generic default route still has src=LAN_PD_SRC. If
+            # netifd/RA/another route refresh removed src while leaving the
+            # gateway unchanged, restore it immediately. But only if the
+            # watchdog owns the src (managed_src is recorded). If the route
+            # has a different src (admin override), do NOT touch it.
+            local cur_src
+            cur_src=$(_generic_default_src)
+            if [ -z "$cur_src" ] && [ -n "$cached_src" ]; then
+                # src was removed silently: restore it (watchdog owns it).
+                if _install_preferred_src "$_SP_CURRENT_GW"; then
+                    log "Router source policy: restored preferred src $LAN_PD_SRC (silently removed by route refresh)"
+                fi
+            elif [ -n "$cur_src" ] && [ "$cur_src" != "$LAN_PD_SRC" ]; then
+                # A different src is present. Only restore if the current
+                # src matches our managed_src (the watchdog's own install
+                # was overwritten). Never strip an admin/user-created src.
+                if [ -n "$cached_src" ] && [ "$cur_src" = "$cached_src" ]; then
+                    if _install_preferred_src "$_SP_CURRENT_GW"; then
+                        log "Router source policy: restored preferred src $LAN_PD_SRC (overwritten by route refresh)"
+                    fi
+                fi
+            fi
+            # Periodically refresh classification even in pd-preferred mode.
+            if [ $((NOW - cached_ts)) -ge "$SRC_POLICY_REFRESH" ]; then
+                # Force a fresh classification on the next tick by invalidating
+                # the cache key. This ensures WAN128 transitions (e.g. WAN128
+                # becomes usable again) are eventually caught.
+                : > "$SRC_POLICY_KEY_FILE"
+            fi
+            return 0
+            ;;
+        *)
+            # No cache or invalid mode: force reclassification on next tick.
+            : > "$SRC_POLICY_KEY_FILE"
+            return 0
+            ;;
+    esac
+}
+
+# ===== STAGE C2: SHARED COORDINATOR HELPERS =====
+# These helpers bridge ipv6-watchdog's health/notifications to the shared
+# wan-recovery-common coordinator. They are defined BEFORE in_cooldown /
+# recovery_hold_active / do_wan_restart / maybe_wan_restart so those
+# functions can call them.
+
+# Idempotent one-time legacy-state migration. Merges pre-C2 IPv6 watchdog
+# state files (wan_restart_count, last_wan_restart, recovery_hold) into the
+# shared coordinator state (disruption_count, last_full_wan_disruption,
+# disruption_hold) using max semantics so a running router's same-boot
+# disruption budget is NOT silently reset to zero on upgrade.
+#
+# Rules:
+#   - Runs at most once per boot (guarded by $STATE_DIR/c2_migrated marker).
+#   - count: shared result = max(existing shared count, legacy count).
+#   - timestamp: shared result = max(existing shared ts, legacy ts).
+#   - hold: set shared disruption_hold if shared hold exists, OR legacy
+#     recovery_hold exists, OR resulting count >= WAN_DISRUPTION_LIMIT.
+#   - Legacy files are preserved for rollback/forensics (NOT deleted).
+#   - If any write fails, return 1 (fail-closed for disruptive actions).
+migrate_legacy_recovery_state() {
+    [ -f "$STATE_DIR/c2_migrated" ] && return 0
+
+    # Ensure the shared coordinator state directory exists before any write.
+    # On a fresh-boot router /tmp/wan-recovery may not exist yet (the
+    # coordinator library only creates it inside _wan_recovery_lock_acquire,
+    # which has not run at migration time). Without this guard, every write
+    # below fails, migration returns 1, and WAN_RECOVERY_AVAILABLE is forced
+    # to 0 (fail-closed) permanently -- a fresh-boot deadlock. Fail closed
+    # if the directory cannot be created.
+    mkdir -p "$WAN_RECOVERY_STATE_DIR" 2>/dev/null || return 1
+
+    # Sanitized legacy values.
+    local legacy_count legacy_ts
+    legacy_count=$(sanitize_int "$(cat "$WAN_RESTART_FILE" 2>/dev/null)")
+    legacy_ts=$(sanitize_int "$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null)")
+
+    # Sanitized shared values.
+    local shared_count shared_ts
+    shared_count=$(cat "$DISRUPTION_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$shared_count" in ''|*[!0-9]*) shared_count=0 ;; esac
+    shared_ts=$(cat "$LAST_FULL_WAN_DISRUPTION_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$shared_ts" in ''|*[!0-9]*) shared_ts=0 ;; esac
+
+    # Max semantics: never decrease existing shared state.
+    local result_count result_ts
+    [ "$legacy_count" -gt "$shared_count" ] && result_count="$legacy_count" || result_count="$shared_count"
+    [ "$legacy_ts" -gt "$shared_ts" ] && result_ts="$legacy_ts" || result_ts="$shared_ts"
+
+    # Write merged count.
+    echo "$result_count" > "$DISRUPTION_COUNT_FILE" 2>/dev/null || return 1
+
+    # Write merged timestamp (only if nonzero).
+    if [ "$result_ts" -gt 0 ]; then
+        echo "$result_ts" > "$LAST_FULL_WAN_DISRUPTION_FILE" 2>/dev/null || return 1
+    fi
+
+    # Hold preservation: set shared hold if any of the three conditions hold.
+    if [ -f "$DISRUPTION_HOLD_FILE" ] || [ -f "$RECOVERY_HOLD_FILE" ] || \
+       [ "$result_count" -ge "$WAN_DISRUPTION_LIMIT" ]; then
+        : > "$DISRUPTION_HOLD_FILE" 2>/dev/null || return 1
+    fi
+
+    # Mark migration successful. Do NOT mark if any prior write failed (the
+    # return-1 paths above exit before reaching here).
+    : > "$STATE_DIR/c2_migrated" 2>/dev/null || return 1
+
+    if [ "$result_count" -gt 0 ] || [ -f "$RECOVERY_HOLD_FILE" ]; then
+        log "Stage C2: migrated legacy recovery state (count=$legacy_count->shared=$result_count, hold_preserved=$([ -f "$DISRUPTION_HOLD_FILE" ] && echo yes || echo no))"
+    fi
+    return 0
+}
+
+# Mirror shared coordinator state -> legacy state files. Called after any
+# coordinated action to keep legacy files consistent for external tools
+# (ipv6-prefix-tracker reads $RECOVERY_HOLD_FILE) and forensics. Legacy
+# files are NOT authoritative after C2; the shared state is.
+sync_legacy_state() {
+    if [ -f "$DISRUPTION_HOLD_FILE" ]; then
+        touch "$RECOVERY_HOLD_FILE" 2>/dev/null
+    fi
+    local count ts
+    count=$(cat "$DISRUPTION_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    [ "$count" -gt 0 ] && echo "$count" > "$WAN_RESTART_FILE" 2>/dev/null
+    ts=$(cat "$LAST_FULL_WAN_DISRUPTION_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+    if [ "$ts" -gt 0 ]; then
+        echo "$ts" > "$LAST_WAN_RESTART_FILE" 2>/dev/null
+    else
+        : > "$LAST_WAN_RESTART_FILE" 2>/dev/null
+    fi
+}
+
+# Coordinated wan6-only cycle: begin. Acquires the shared lock, performs
+# the post-lock IPv6 health recheck, and records the wan6 action. Returns:
+#   0 = lock held + record written; caller MUST perform its existing wan6
+#       lifecycle (ifdown wan6; sleep; ifup wan6) and then call
+#       coordinated_wan6_end.
+#   1 = skip lifecycle (coordinator unavailable / blocked by hold or
+#       cooldown / lock busy / recovered while waiting for the lock).
+#       The lock is NOT held on return 1.
+# Arguments: $1 = reason string, $2 = recheck type (ipv6_ok or has_prefix).
+coordinated_wan6_begin() {
+    local reason="$1" recheck="$2"
+
+    wan_recovery_ready || {
+        log "$reason: shared coordinator unavailable, fail-closed (no wan6 cycle)"
+        return 1
+    }
+    if recovery_hold_active; then
+        log "$reason: shared disruption hold active, passive monitoring only"
+        return 1
+    fi
+
+    wan_recovery_wan6_begin
+    local rc=$?
+    case "$rc" in
+        0) ;;
+        1) log "$reason: blocked by shared cooldown, no wan6 cycle"; return 1 ;;
+        2) log "$reason: blocked by shared disruption hold/budget, no wan6 cycle"; return 1 ;;
+        3) log "$reason: shared lock busy, no wan6 cycle"; return 1 ;;
+    esac
+
+    # Post-lock IPv6 health recheck (closes TOCTOU window).
+    case "$recheck" in
+        ipv6_ok)
+            if ipv6_ok; then
+                log "$reason: IPv6 recovered while waiting for shared lock, no wan6 cycle"
+                wan_recovery_end
+                return 1
+            fi
+            ;;
+        has_prefix)
+            if has_prefix; then
+                log "$reason: prefix appeared while waiting for shared lock, no wan6 cycle"
+                wan_recovery_end
+                return 1
+            fi
+            ;;
+    esac
+
+    wan_recovery_wan6_record_locked "$reason"
+    return 0
+}
+
+# Coordinated wan6-only cycle: end. Releases the shared lock and syncs
+# legacy state. MUST be called after coordinated_wan6_begin returns 0 and
+# the caller's wan6 lifecycle has completed.
+coordinated_wan6_end() {
+    wan_recovery_end
+    sync_legacy_state
+}
+
 in_cooldown() {
-    # Use -s to guard against empty file (written as empty on state reset).
-    # Re-read the value here so arithmetic is never performed on an empty string.
-    [ -s "$LAST_WAN_RESTART_FILE" ] || return 1
+    # Stage C2: cooldown is now measured from the shared coordinator's
+    # last_full_wan_disruption timestamp, not the legacy last_wan_restart
+    # file. The shared cooldown is NOT cleared on IPv6 recovery (it is a
+    # shared resource that spaces disruptions across protocols).
+    [ -s "$LAST_FULL_WAN_DISRUPTION_FILE" ] || return 1
     local last
-    last=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null | tr -d '[:space:]')
+    last=$(cat "$LAST_FULL_WAN_DISRUPTION_FILE" 2>/dev/null | tr -d '[:space:]')
 
     case "$last" in
         ''|*[!0-9]*) return 1 ;;
     esac
 
     [ "$last" -gt 0 ] || return 1
-    [ "$((NOW - last))" -lt "$WAN_RESTART_COOLDOWN" ]
+    [ "$((NOW - last))" -lt "$WAN_DISRUPTION_COOLDOWN" ]
 }
 
-# Same-boot disruptive recovery latch. Once activated, persists until router
-# reboot clears /tmp. Triggered by either the explicit recovery_hold file
-# or WAN_RESTARTS reaching the budget limit.
+# Same-boot shared disruption hold. Once activated, persists until router
+# reboot clears /tmp. After Stage C2, this checks the SHARED coordinator
+# state: the explicit disruption_hold latch file OR disruption_count
+# reaching the WAN_DISRUPTION_LIMIT budget. The legacy RECOVERY_HOLD_FILE
+# is preserved on disk for forensics/external tools but is no longer
+# authoritative.
 recovery_hold_active() {
-    [ -f "$RECOVERY_HOLD_FILE" ] || \
-        [ "$WAN_RESTARTS" -ge "$WAN_RESTART_LIMIT" ]
+    [ -f "$DISRUPTION_HOLD_FILE" ] && return 0
+    [ "$WAN_RESTARTS" -ge "$WAN_RESTART_LIMIT" ]
 }
 
 # Centralized state reset called on recovery success paths.
 # Resets non-budget recovery counters and removes transient flag files.
-# LAST_WAN_RESTART_FILE is written as empty (not 0) so in_cooldown() can
-# distinguish "never restarted" from a real timestamp via -s check.
-# WAN_RESTART_FILE is intentionally NOT cleared; WAN_RESTARTS is a same-boot
-# disruptive recovery budget and resets only when /tmp is cleared by reboot.
+# Stage C2: the shared coordinator's last_full_wan_disruption (cooldown
+# timestamp) and disruption_count (budget) are NOT cleared here -- they
+# are same-boot shared resources managed by the coordinator. The legacy
+# LAST_WAN_RESTART_FILE is cleared for forensics consistency but is no
+# longer read by in_cooldown (which reads the shared timestamp).
+# WAN_RESTART_FILE is intentionally NOT cleared; the shared disruption
+# count is same-boot scoped and resets only when /tmp is cleared by reboot.
 # GOOD_GW_FILE is intentionally NOT cleared so the sticky gateway baseline
 # survives across recoveries.
 reset_recovery_state() {
@@ -448,24 +1883,26 @@ reset_recovery_state() {
     rm -f "$PREFIX_BACKOFF_FILE"
 }
 
+# Stage C2: do_wan_restart is now a thin helper that performs the IPv6-
+# specific counter resets after the coordinator has executed the full-WAN
+# lifecycle and accounting. The actual ifdown/ifup lifecycle is owned by
+# wan_recovery_full_execute_locked. This function is called from
+# maybe_wan_restart after a successful coordinator execute.
 do_wan_restart() {
-    if recovery_hold_active; then
-        log "Recovery hold active: $WAN_RESTARTS/$WAN_RESTART_LIMIT full WAN restarts used this boot; passive monitoring only"
-        return 0
-    fi
+    # Read back the shared disruption count for display/logging.
+    WAN_RESTARTS=$(cat "$DISRUPTION_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$WAN_RESTARTS" in ''|*[!0-9]*) WAN_RESTARTS=0 ;; esac
 
-    WAN_RESTARTS=$((WAN_RESTARTS + 1))
-    echo "$WAN_RESTARTS" > "$WAN_RESTART_FILE"
-    echo "$NOW" > "$LAST_WAN_RESTART_FILE"
+    log "Full WAN restart #$WAN_RESTARTS of $WAN_RESTART_LIMIT"
+
+    # IPv6-specific counter resets (the coordinator does NOT touch these).
     echo 0 > "$PREFIX_FAIL_FILE"
     echo 0 > "$FAIL_FILE"
     echo 0 > "$TIER0_FAIL_FILE"
     rm -f "$PREFIX_BACKOFF_FILE"
 
-    log "Full WAN restart #$WAN_RESTARTS of $WAN_RESTART_LIMIT"
-    ifdown wan6; ifdown wan
-    sleep 30
-    ifup wan; sleep 20; ifup wan6
+    # Mirror shared state -> legacy for external tools/forensics.
+    sync_legacy_state
 }
 
 notify_ont_powercycle() {
@@ -573,11 +2010,14 @@ RECPAYLOAD
     fi
 }
 
-# Centralized WAN restart escalation. Enforces WAN_RESTART_LIMIT, post-restart
-# cooldown, and ONT notification before calling do_wan_restart().
+# Stage C2: Centralized WAN restart escalation via the shared coordinator.
+# The coordinator owns the serialization lock, same-boot disruption budget,
+# shared hold, accounting-before-ifdown, and the actual ifdown/ifup lifecycle.
+# This function owns: hold check + ONT notification, cooldown check, post-lock
+# IPv6 health recheck, and IPv6-specific counter resets after execute.
 maybe_wan_restart() {
     local reason="$1"
-    local last_restart remaining
+    local last_restart remaining rc
 
     if recovery_hold_active; then
         if [ ! -f "$ONT_FLAG" ]; then
@@ -590,35 +2030,109 @@ maybe_wan_restart() {
     fi
 
     if in_cooldown; then
-        last_restart=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null | tr -d '[:space:]')
-        remaining=$((WAN_RESTART_COOLDOWN - (NOW - last_restart)))
+        last_restart=$(cat "$LAST_FULL_WAN_DISRUPTION_FILE" 2>/dev/null | tr -d '[:space:]')
+        case "$last_restart" in ''|*[!0-9]*) last_restart=0 ;; esac
+        remaining=$((WAN_DISRUPTION_COOLDOWN - (NOW - last_restart)))
         [ "$remaining" -lt 0 ] && remaining=0
         log "$reason: in post-restart cooldown, ${remaining}s remaining, skipping WAN restart"
         return 0
     fi
 
+    # Fail-closed: no coordinator, no disruptive recovery.
+    wan_recovery_ready || {
+        log "$reason: shared coordinator unavailable, fail-closed (no WAN restart)"
+        return 0
+    }
+
     log "$reason: escalating to full WAN restart"
+    wan_recovery_full_begin
+    rc=$?
+    case "$rc" in
+        0) ;;
+        1) log "$reason: blocked by shared cooldown, no WAN restart"; return 0 ;;
+        2) log "$reason: blocked by shared disruption hold/budget, no WAN restart"; return 0 ;;
+        3) log "$reason: shared lock busy, no WAN restart"; return 0 ;;
+    esac
+
+    # Post-lock IPv6 health recheck (closes TOCTOU window).
+    if ipv6_ok; then
+        log "$reason: IPv6 recovered while waiting for shared lock, no WAN restart"
+        wan_recovery_end
+        return 0
+    fi
+
+    # Coordinator owns accounting + lifecycle. No double-counting: the
+    # coordinator writes disruption_count/last_full_wan_disruption/hold.
+    # do_wan_restart reads back the shared count for display + resets IPv6
+    # counters + syncs legacy state.
+    wan_recovery_full_execute_locked "$reason"
     do_wan_restart
+    wan_recovery_end
 }
 
 try_128_bootstrap() {
+    # Defensive gate: this is an experimental NO_PD recovery hypothesis, disabled
+    # by default. Even when the no-prefix ladder selects this stage, it checks
+    # BOOTSTRAP_ENABLED and refuses (returning 1) when disabled. This protects
+    # against future alternate call sites. When disabled: zero UCI mutation,
+    # zero ifdown/ifup, zero route mutation, zero counter reset.
+    if [ "$BOOTSTRAP_ENABLED" != "1" ]; then
+        log "Phase 3 bootstrap disabled (BOOTSTRAP_ENABLED!=1), skipping"
+        return 1
+    fi
+
     if recovery_hold_active; then
         log "Recovery hold active: $WAN_RESTARTS/$WAN_RESTART_LIMIT full WAN restarts used this boot; passive monitoring only"
         return 1
     fi
 
-    log "Attempting /128 bootstrap to recover prefix delegation"
+    # B1: Only proceed when production configuration is reqaddress='none'.
+    # The mechanism temporarily stages 'try' and reverts via uci revert, which
+    # restores the preexisting COMMITTED value. It is only meaningful when the
+    # committed policy is 'none' (staging 'try' on a router already committed to
+    # 'try' is a no-op). If the committed value is something else, do not mutate
+    # UCI. This is an experimental scope, not a universal policy statement.
+    local committed_reqaddress
+    committed_reqaddress=$(uci get network.wan6.reqaddress 2>/dev/null)
+    if [ "$committed_reqaddress" != "none" ]; then
+        log "Bootstrap refusing: production reqaddress is '${committed_reqaddress:-unset}', expected 'none' (experimental scope)"
+        return 1
+    fi
 
-    # Stage 'try' without committing so it never persists across reboots.
+    log "Attempting bounded temporary IA_NA-assisted DHCPv6 recovery stage"
+
+    # B2: Stage 'try' without committing so it never persists across reboots.
     # BOOTSTRAP_UCI_STAGED lets on_exit revert if this function is killed mid-run.
+    # Set the flag BEFORE any operation that can exit or receive a signal.
     BOOTSTRAP_UCI_STAGED=1
     uci set network.wan6.reqaddress='try'
     ubus call network reload >/dev/null 2>&1
-    ifdown wan6; sleep 5; ifup wan6
 
-    # Wait for prefix while 'try' is still active.
+    # B3: One controlled wan6 acquisition. Do NOT restart wan, LAN, or network.
+    # Clear pending state so the new odhcp6c instance gets a fresh grace period.
+    # Stage C2: the wan6 cycle is coordinated through the shared coordinator
+    # (serialization lock + post-lock recheck + record). If the coordinator is
+    # unavailable or blocked, fail closed (no uncoordinated wan6 cycle). If
+    # a prefix appeared while waiting for the lock, skip the cycle.
+    pending_state_reset
+    if coordinated_wan6_begin "Bootstrap B3: controlled wan6 acquisition" has_prefix; then
+        ifdown wan6; sleep 5; ifup wan6
+        coordinated_wan6_end
+    else
+        # Coordinator unavailable/blocked/recovered-while-waiting. If the
+        # prefix is already present (recheck succeeded), the wait loop below
+        # will find it. If the coordinator is unavailable, fail closed.
+        if ! wan_recovery_ready && ! has_prefix; then
+            uci revert network.wan6.reqaddress 2>/dev/null
+            BOOTSTRAP_UCI_STAGED=0
+            ubus call network reload >/dev/null 2>&1
+            log "Bootstrap: coordinator unavailable and no prefix, fail-closed"
+            return 1
+        fi
+    fi
+
+    # Wait for DHCPv6 exchange while 'try' is still active.
     # Check before reverting so the prefix acquisition window is not wasted.
-    # Using a while loop avoids a fork-per-iteration from seq on ash/BusyBox.
     local i prefix
     i=0
     while [ "$i" -lt 15 ]; do
@@ -629,73 +2143,154 @@ try_128_bootstrap() {
         sleep 4
     done
 
-    # Always revert regardless of outcome. Never let 'try' persist past this function.
-    # uci revert discards the staged value and returns to the committed 'none'
-    # without committing from within the watchdog.
-    # ubus call network reload applies the revert; no second ifdown/ifup is needed.
-    # A second interface flap here would disrupt a prefix that was just acquired.
+    # B4: Observe IA_NA and IA_PD independently.
+    # IA_NA-only (WAN128 present, no PD) is NOT recovery.
+    # IA_PD without WAN128 is valid and proves /128 is not prerequisite.
+    # Do not assume IA_NA and IA_PD success are coupled; validate IA_PD independently.
+    if [ -z "$prefix" ]; then
+        # No IA_PD obtained. Revert temporary reqaddress and fail.
+        # IA_NA-only is always a failure: no recovery counter reset.
+        uci revert network.wan6.reqaddress
+        BOOTSTRAP_UCI_STAGED=0
+        ubus call network reload >/dev/null 2>&1
+        log "Bootstrap failed: no IA_PD acquired (IA_NA-only or neither)"
+        return 1
+    fi
+
+    # B5: IA_PD exists while temporary 'try' is staged.
+    # Validate the PD path BEFORE reverting to production reqaddress='none'.
+    # Refresh PD context so fix_gateway and pd_internet_ok use current data.
+    populate_pd_context
+    if [ -z "$PD_CIDR" ] || [ -z "$LAN_PD_SRC" ]; then
+        uci revert network.wan6.reqaddress
+        BOOTSTRAP_UCI_STAGED=0
+        ubus call network reload >/dev/null 2>&1
+        log "Bootstrap: IA_PD present but no LAN_PD_SRC or PD_CIDR, will retry next cycle"
+        return 1
+    fi
+
+    # Use the Phase 2 source-aware gateway repair to establish coherent routes.
+    fix_gateway
+    # pd_internet_ok is the decisive health test: never WAN128 or unbound ping.
+    if ! pd_internet_ok; then
+        uci revert network.wan6.reqaddress
+        BOOTSTRAP_UCI_STAGED=0
+        ubus call network reload >/dev/null 2>&1
+        log "Bootstrap: IA_PD present but pd_internet_ok failed, will retry next cycle"
+        return 1
+    fi
+
+    # B6: PD health confirmed while temporary 'try' is staged.
+    # Now revert to production reqaddress='none'.
     uci revert network.wan6.reqaddress
     BOOTSTRAP_UCI_STAGED=0
     ubus call network reload >/dev/null 2>&1
 
-    # Brief settle delay to let the revert reload stabilize before re-checking.
-    [ -n "$prefix" ] && sleep 10
+    # B7: Post-revert health gate. Wait for wan6 to settle, then require
+    # ALL PD conditions to survive the return to production mode.
+    # PD existing only while reqaddress='try' is staged is NOT success.
+    sleep 10
 
-    # Confirm the prefix survived the revert. On PLDT, PD is independent of IA_NA,
-    # so reverting reqaddress to 'none' should not withdraw the prefix. But since
-    # PLDT DHCPv6 behavior is non-standard, an explicit check is cheap insurance.
-    if [ -n "$prefix" ]; then
-        local post_revert_prefix
-        post_revert_prefix=$(ubus call network.interface.wan6 status 2>/dev/null \
-            | jsonfilter -e '@["ipv6-prefix"][0].address')
-        if [ -z "$post_revert_prefix" ]; then
-            log "Bootstrap prefix lost after reverting reqaddress, will retry next cycle"
-            return 1
-        fi
-    fi
-
-    if [ -n "$prefix" ]; then
-        log "Prefix acquired via bootstrap: $prefix, verifying connectivity"
-        if ping6 -c 2 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 || \
-           ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
-            if [ "$CLEANUP_WAN128" = "1" ]; then
-                ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
-                | while read -r addr; do
-                    ip -6 addr del "$addr" dev "$WAN_DEV" 2>/dev/null && \
-                        log "Removed temporary /128: $addr"
-                done
-            else
-                log "CLEANUP_WAN128 disabled, keeping WAN /128 addresses on $WAN_DEV"
-            fi
-            return 0
-        else
-            log "Prefix present after bootstrap revert but connectivity failed, will retry next cycle"
-            return 1
-        fi
-    else
-        log "Bootstrap failed, no prefix acquired"
+    # Re-check IA_PD after revert.
+    local post_revert_prefix
+    post_revert_prefix=$(ubus call network.interface.wan6 status 2>/dev/null \
+        | jsonfilter -e '@["ipv6-prefix"][0].address')
+    if [ -z "$post_revert_prefix" ]; then
+        log "Bootstrap: IA_PD lost after reverting reqaddress to 'none', will retry next cycle"
         return 1
     fi
+
+    # Rebuild PD context from post-revert state.
+    populate_pd_context
+    if [ -z "$PD_CIDR" ] || [ -z "$LAN_PD_SRC" ]; then
+        log "Bootstrap: post-revert PD_CIDR or LAN_PD_SRC absent, will retry next cycle"
+        return 1
+    fi
+
+    # Require effective generic + PD-source routing (no gateway equality;
+    # an explicit PD source-specific rule is optional, never required).
+    if ! pd_routes_ok; then
+        # Attempt source-aware gateway repair in production mode.
+        fix_gateway
+        if ! pd_routes_ok; then
+            log "Bootstrap: post-revert PD routing ineffective and fix_gateway did not repair, will retry next cycle"
+            return 1
+        fi
+    fi
+
+    # Require PD-sourced external connectivity in production mode.
+    if ! pd_internet_ok; then
+        log "Bootstrap: post-revert pd_internet_ok failed, will retry next cycle"
+        return 1
+    fi
+
+    # B8: WAN /128 cleanup is OPT-IN (default CLEANUP_WAN128=0). A healthy
+    # IA_NA /128 is OPTIONAL and may be retained for router-originated IPv6;
+    # it never substitutes for IA_PD/LAN health. Cleanup only runs when an
+    # operator has explicitly enabled the legacy experimental behavior, and
+    # only after PD health is confirmed in production mode.
+    if [ "$CLEANUP_WAN128" = "1" ]; then
+        ip -6 addr show dev "$WAN_DEV" | awk '/\/128 scope global/{print $2}' \
+        | while read -r addr; do
+            ip -6 addr del "$addr" dev "$WAN_DEV" 2>/dev/null && \
+                log "Removed WAN /128 (CLEANUP_WAN128=1): $addr"
+        done
+    else
+        log "CLEANUP_WAN128=0, retaining WAN /128 addresses on $WAN_DEV"
+    fi
+
+    # B9: Final success gate. When CLEANUP_WAN128=1, PD connectivity must still
+    # succeed after /128 removal. When CLEANUP_WAN128=0, this is a redundant
+    # re-confirmation that PD health survived the reqaddress revert.
+    if ! pd_internet_ok; then
+        log "Bootstrap: pd_internet_ok failed after WAN128 cleanup step, will retry next cycle"
+        return 1
+    fi
+
+    log "Bootstrap succeeded: IA_PD survived production reqaddress='none', PD-sourced connectivity verified"
+    return 0
 }
 
 # --- Runtime state (read after all functions are defined) ---
 
 FAILS=$(sanitize_int "$(cat "$FAIL_FILE" 2>/dev/null)")
 PREFIX_FAILS=$(sanitize_int "$(cat "$PREFIX_FAIL_FILE" 2>/dev/null)")
-WAN_RESTARTS=$(sanitize_int "$(cat "$WAN_RESTART_FILE" 2>/dev/null)")
+# Stage C2: WAN_RESTARTS is now read from the shared coordinator's
+# disruption_count (the authoritative same-boot budget). The legacy
+# WAN_RESTART_FILE is preserved on disk for forensics only.
+WAN_RESTARTS=$(cat "$DISRUPTION_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')
+case "$WAN_RESTARTS" in ''|*[!0-9]*) WAN_RESTARTS=0 ;; esac
 PREFIX_NEXT=$(sanitize_int "$(cat "$PREFIX_BACKOFF_FILE" 2>/dev/null)")
 TIER0_FAILS=$(sanitize_int "$(cat "$TIER0_FAIL_FILE" 2>/dev/null)")
 NOW=$(date +%s)
 
 # ===== BOOT GRACE PERIOD =====
-# If the system just booted, exit immediately and let 98-wan6-delay and
-# 99-ipv6-setup complete before this watchdog takes any action.
-# Without this, cron fires within seconds of boot and Tier 0 can pull
-# wan6 back down while it is still initializing, creating a restart loop.
+# If the system just booted, exit immediately and allow native network/wan6
+# initialization and event-driven helpers to settle before this watchdog takes
+# any action. Without this, cron fires within seconds of boot and Tier 0 can
+# pull wan6 back down while it is still initializing, creating a restart loop.
 UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999)
 if [ "$UPTIME_SECS" -lt 120 ]; then
     log "Boot grace period active (uptime ${UPTIME_SECS}s < 120s), exiting"
     exit 0
+fi
+
+# ===== STAGE C2: LEGACY STATE MIGRATION =====
+# Idempotent one-time merge of legacy IPv6 watchdog recovery state into the
+# shared coordinator state. Runs AFTER the per-script lock is held (the flock
+# at script entry) and AFTER the boot-grace exit, but BEFORE any recovery
+# decision (global hold check, Tier 0, no-prefix ladder). This ensures a
+# running router upgraded to C2 does NOT silently reset its same-boot
+# disruption budget to zero. If migration fails, disruptive actions fail
+# closed (WAN_RECOVERY_AVAILABLE is set to 0 below).
+if [ "$WAN_RECOVERY_AVAILABLE" = 1 ]; then
+    if ! migrate_legacy_recovery_state; then
+        log "Stage C2: legacy state migration FAILED -- coordinator set to fail-closed"
+        WAN_RECOVERY_AVAILABLE=0
+    fi
+    # Re-read WAN_RESTARTS from shared state after migration.
+    WAN_RESTARTS=$(cat "$DISRUPTION_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$WAN_RESTARTS" in ''|*[!0-9]*) WAN_RESTARTS=0 ;; esac
 fi
 
 # ===== GLOBAL RECOVERY HOLD =====
@@ -703,11 +2298,18 @@ fi
 # monitoring until a real reboot clears /tmp/ipv6-watchdog.
 # State-change-only logging: logs only when the detected state differs from
 # the saved hold_status, preventing identical hold messages every minute.
+#
+# v3.10.0 hold classifier: PD-first, source-aware, matching normal ipv6_ok()
+# Layers 1-5. "recovered" requires usable IA_PD + current LAN_PD_SRC + generic
+# default + a kernel-effective PD-source path through WAN (an explicit
+# 'default from <PD_CIDR>' rule is OPTIONAL -- generic-default-
+# only routing is recovered) + pd_internet_ok. WAN /128 or generic unbound
+# reachability must NEVER classify as recovered.
 if recovery_hold_active; then
     # Explicit same-boot latch. Persists until router reboot clears /tmp.
     [ -f "$RECOVERY_HOLD_FILE" ] || touch "$RECOVERY_HOLD_FILE"
 
-    # --- Passive state detection (no noisy ipv6_ok calls) ---
+    # --- Passive PD-first state detection (no noisy ipv6_ok calls) ---
     hold_state=""
     if ! ubus call network.interface.wan6 status 2>/dev/null \
             | jsonfilter -e '@["up"]' | grep -q true; then
@@ -719,12 +2321,29 @@ if recovery_hold_active; then
             hold_state="wan6-up-no-device"
         elif ! has_prefix; then
             hold_state="no-prefix"
-        elif ! ip -6 route show default dev "$WAN_DEV" | grep -q default; then
-            hold_state="prefix-present-no-route"
-        elif ! internet_ok_now; then
-            hold_state="prefix-present-unreachable"
         else
-            hold_state="recovered"
+            # Layer 1 passed: IA_PD exists. Now check the LAN and routing
+            # layers using the same populate_pd_context() as ipv6_ok().
+            populate_pd_context
+            if [ -z "$LAN_PD_SRC" ]; then
+                # Layer 2: no current PD-derived LAN source.
+                hold_state="prefix-no-lan-src"
+            elif ! ip -6 route show default dev "$WAN_DEV" 2>/dev/null | grep -q default; then
+                # Layer 3: no generic default route.
+                hold_state="prefix-present-no-route"
+            elif ! pd_route_effective; then
+                # Layer 4: no kernel-effective PD-source route through WAN
+                # (e.g. stale source-specific rule via a dead gateway, or a
+                # lookup that resolves out of WAN). An explicit
+                # 'default from <PD_CIDR>' rule is NOT required for health --
+                # Generic-default-only routing is recovered.
+                hold_state="prefix-present-no-effective-route"
+            elif ! pd_internet_ok; then
+                # Layer 5: PD-source-bound external reachability failed.
+                hold_state="prefix-present-unreachable"
+            else
+                hold_state="recovered"
+            fi
         fi
     fi
 
@@ -767,13 +2386,57 @@ sleep $((RANDOM % 5 + 5))
 # Handles the case where wan6 never came up after boot or a link event.
 # This runs before all other checks since WAN_DEV cannot be determined
 # when wan6 is down, which would otherwise cause an early exit.
+#
+# v3.10.0 pending grace: on OpenWrt 25.12.5, wan6 may report up=false
+# pending=true while odhcp6c is still performing native DHCPv6 acquisition.
+# Restarting odhcp6c in this window disrupts the in-flight exchange. While
+# the pending duration is below WAN6_PENDING_GRACE, Tier 0 passive-waits and
+# does NOT ifdown/ifup and does NOT increment the Tier 0 failure counter.
+# After grace expires, the existing Tier 0 behavior runs unchanged.
+#
+# v3.10.0 Phase 1C: the pending-grace decision lives in pending_state_tick()
+# (single source of truth shared with the test harness). Pending state is
+# NOT reset merely because grace expired; it is reset only by
+# pending_state_reset(), called immediately before a genuinely new
+# ifdown/ifup acquisition, when wan6 becomes up, or when pending becomes
+# false. This prevents the same odhcp6c instance from being granted a fresh
+# grace window (and prevents repeated first-pending / grace-expired logs)
+# when Tier 0 recovery is blocked by cooldown, recovery hold, or restart
+# limits.
 if ! ubus call network.interface.wan6 status 2>/dev/null \
         | jsonfilter -e '@["up"]' | grep -q true; then
+
+    # Determine whether wan6 is pending (odhcp6c still acquiring).
+    _pending=false
+    if ubus call network.interface.wan6 status 2>/dev/null \
+            | jsonfilter -e '@["pending"]' 2>/dev/null | grep -q true; then
+        _pending=true
+    fi
+
+    pending_state_tick "$_pending" "$NOW"
+    case "$?" in
+        0)
+            # Passive wait (below grace): no recovery, no counter increment.
+            exit 0
+            ;;
+        2)
+            # wan6 is down and not pending: clear any stale pending state.
+            pending_state_reset
+            ;;
+        1)
+            # Grace expired / recovery allowed: fall through to the existing
+            # Tier 0 recovery path. pending_state_tick() wrote the expiry
+            # marker; the timestamp is intentionally preserved so the same
+            # acquisition is not re-granted grace if recovery is blocked below.
+            ;;
+    esac
+
     log "Tier 0: wan6 is DOWN -- evaluating recovery"
 
     if in_cooldown; then
-        last_restart=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null | tr -d '[:space:]')
-        REMAINING=$((WAN_RESTART_COOLDOWN - (NOW - last_restart)))
+        last_restart=$(cat "$LAST_FULL_WAN_DISRUPTION_FILE" 2>/dev/null | tr -d '[:space:]')
+        case "$last_restart" in ''|*[!0-9]*) last_restart=0 ;; esac
+        REMAINING=$((WAN_DISRUPTION_COOLDOWN - (NOW - last_restart)))
         [ "$REMAINING" -lt 0 ] && REMAINING=0
         log "In post-restart cooldown, ${REMAINING}s remaining, skipping Tier 0 recovery"
         exit 0
@@ -792,19 +2455,36 @@ if ! ubus call network.interface.wan6 status 2>/dev/null \
         exit 0
     fi
 
-    ifdown wan6
-    sleep 5
-    ifup wan6
-    sleep 15
+    # v3.10.0 Phase 1C: clear pending state immediately before starting a
+    # genuinely new wan6 acquisition so the new odhcp6c instance gets a fresh
+    # WAN6_PENDING_GRACE period if it reports pending=true on the next tick.
+    pending_state_reset
+
+    # Stage C2: the wan6 cycle is coordinated through the shared coordinator.
+    # If the coordinator is unavailable/blocked/busy, fail closed (no
+    # uncoordinated wan6 cycle). If IPv6 recovered while waiting for the lock,
+    # skip the cycle and proceed to the success check.
+    if coordinated_wan6_begin "Tier 0: wan6 recovery" ipv6_ok; then
+        ifdown wan6
+        sleep 5
+        ifup wan6
+        sleep 15
+        coordinated_wan6_end
+    fi
+
     if ubus call network.interface.wan6 status 2>/dev/null \
             | jsonfilter -e '@["up"]' | grep -q true; then
         log "Tier 0: wan6 recovery SUCCESS"
         echo 0 > "$TIER0_FAIL_FILE"
+        pending_state_reset
     else
         log "Tier 0: wan6 recovery FAILED -- will retry on next cycle"
     fi
     exit 0
 fi
+
+# wan6 is up: clear any stale pending state from a prior pending window.
+pending_state_reset
 
 WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
     | jsonfilter -e '@["l3_device"]')
@@ -818,6 +2498,15 @@ WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
 # is needed. If keep_gateway fails or is disabled, the normal ipv6_ok and
 # fix_gateway paths handle recovery as before.
 keep_gateway
+
+# v3.10.0 router source policy: runs after keep_gateway (which may have
+# rewritten the generic default route via install_gw_routes, dropping any
+# preferred src) and before ipv6_ok so the validation ping reflects the
+# corrected source policy. If the gateway is already GOOD_GW, keep_gateway
+# returns early, but netifd/RA may still have silently removed src; this
+# call covers both cases. Non-disruptive: only mutates the generic default
+# route's src attribute when classification requires it.
+ensure_router_source_policy
 
 # Happy path: reset non-budget recovery state.
 if ipv6_ok; then
@@ -843,8 +2532,9 @@ if ! has_prefix; then
     fi
 
     if in_cooldown; then
-        last_restart=$(cat "$LAST_WAN_RESTART_FILE" 2>/dev/null | tr -d '[:space:]')
-        REMAINING=$((WAN_RESTART_COOLDOWN - (NOW - last_restart)))
+        last_restart=$(cat "$LAST_FULL_WAN_DISRUPTION_FILE" 2>/dev/null | tr -d '[:space:]')
+        case "$last_restart" in ''|*[!0-9]*) last_restart=0 ;; esac
+        REMAINING=$((WAN_DISRUPTION_COOLDOWN - (NOW - last_restart)))
         [ "$REMAINING" -lt 0 ] && REMAINING=0
         log "In post-restart cooldown, ${REMAINING}s remaining, skipping"
         exit 0
@@ -875,17 +2565,33 @@ if ! has_prefix; then
 
     if [ "$PREFIX_FAILS" -eq 1 ]; then
         log "No prefix (attempt $PREFIX_FAILS), restarting wan6, backoff ${BACKOFF_SECS}s"
-        ifdown wan6; sleep 10; ifup wan6
+        # Stage C2: coordinated wan6 cycle through the shared coordinator.
+        if coordinated_wan6_begin "No prefix attempt 1: wan6 restart" ipv6_ok; then
+            ifdown wan6; sleep 10; ifup wan6
+            coordinated_wan6_end
+        fi
 
     elif [ "$PREFIX_FAILS" -eq 2 ]; then
         log "No prefix (attempt $PREFIX_FAILS), attempting DHCPv6 renew, backoff ${BACKOFF_SECS}s"
         dhcpv6_renew
 
     elif [ "$PREFIX_FAILS" -eq 3 ]; then
-        log "No prefix (attempt $PREFIX_FAILS), trying /128 bootstrap, backoff ${BACKOFF_SECS}s"
-        if try_128_bootstrap; then
-            reset_recovery_state
-            cleanup_deprecated_v6
+        # Phase 3 experimental NO_PD bootstrap. Disabled by default
+        # (BOOTSTRAP_ENABLED=0): try_128_bootstrap() refuses and returns 1
+        # immediately (zero UCI/ifdown/ifup/route/counter mutation), so this
+        # stage escalates directly to maybe_wan_restart. When enabled, it
+        # stages a temporary reqaddress='try' acquisition and validates PD
+        # health before/after revert. The function itself also guards on
+        # BOOTSTRAP_ENABLED, so alternate call sites stay safe.
+        if [ "$BOOTSTRAP_ENABLED" = "1" ]; then
+            log "No prefix (attempt $PREFIX_FAILS), attempting bounded IA_NA-assisted bootstrap, backoff ${BACKOFF_SECS}s"
+            if try_128_bootstrap; then
+                reset_recovery_state
+                cleanup_deprecated_v6
+            fi
+        else
+            log "No prefix (attempt $PREFIX_FAILS), Phase 3 bootstrap disabled -- escalating to full WAN restart"
+            maybe_wan_restart "No prefix after recovery attempts (bootstrap disabled)"
         fi
 
     else
@@ -899,6 +2605,11 @@ fi
 # Has prefix but connectivity is broken: try gateway fix first.
 if fix_gateway; then
     sleep 5
+    # v3.10.0 router source policy: after a successful gateway fix, the new
+    # gateway's generic default route was installed by install_gw_routes which
+    # does not preserve preferred src. Apply the source policy before the
+    # post-fix ipv6_ok validation so the ping reflects the corrected source.
+    ensure_router_source_policy
     if ipv6_ok; then
         reset_recovery_state
         cleanup_deprecated_v6

@@ -6,6 +6,7 @@ ipv6-watchdog text eol=lf
 ipv6-discord-logger text eol=lf
 init.d-ipv6-discord-logger text eol=lf
 ipv6-prefix-tracker text eol=lf
+wan-recovery-common text eol=lf
 
 README.md text eol=lf
 

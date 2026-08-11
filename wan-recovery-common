@@ -1,0 +1,620 @@
+# wan-recovery-common
+#
+# Protocol-neutral shared coordinator for disruptive WAN recovery actions.
+#
+# This library owns ONLY the coordination of disruptive interface actions
+# (ifdown/ifup wan and wan6). It is deliberately protocol-neutral:
+#   - NO IPv4 health logic
+#   - NO IPv6 health logic
+#   - NO notifications
+#   - NO router-specific identities
+#   - NO protocol-specific counters
+#
+# Callers (ipv6-watchdog, a future IPv4 watchdog) own health truth. The
+# shared library provides the mechanics for:
+#   - a single shared serialization lock across all ifdown/ifup recovery
+#   - a same-boot full-WAN disruption budget
+#   - a shared disruption hold that blocks ALL disruptive actions after the
+#     budget is exhausted (passive monitoring only, until reboot)
+#   - accounting that is written BEFORE the first destructive command so a
+#     crash mid-lifecycle still leaves the disruption recorded
+#   - a fail-closed integration contract: a migrated caller must NOT silently
+#     fall back to uncoordinated WAN cycling if this coordinator is missing
+#     or unreadable
+#
+# Compatibility: POSIX / BusyBox ash. No bash arrays. No bash-isms.
+#
+# Lock ordering invariant (future callers MUST respect this):
+#   1. Acquire the caller's PER-SCRIPT execution lock first.
+#   2. Then acquire this shared WAN-recovery lock via a *_begin() call.
+#   Never reverse this order. A caller must never hold the shared lock while
+#   waiting on its per-script lock.
+#
+# Integration invariant (not enforceable by this library alone until callers
+# are migrated):
+#   Once a caller is migrated to depend on wan-recovery-common, a missing or
+#   unreadable coordinator MUST cause ifdown/ifup recovery to FAIL CLOSED.
+#   Health monitoring, diagnostics, and non-disruptive route repair may
+#   continue, but there must be NO silent fallback to uncoordinated WAN
+#   cycling. Deployment order MUST be: install coordinator FIRST, then the
+#   migrated watchdog.
+#
+# Same-boot state migration (NOT implemented here; recorded as a requirement):
+#   Existing live routers may already have /tmp/ipv6-watchdog/wan_restart_count,
+#   /tmp/ipv6-watchdog/last_wan_restart, /tmp/ipv6-watchdog/recovery_hold. When
+#   migrating a running router, the same-boot disruption budget MUST NOT be
+#   silently reset to zero. Before production deployment, choose either a
+#   one-time state migration to the shared files, OR a controlled reboot/
+#   deployment procedure that deliberately starts a fresh same-boot budget.
+#   This neutral library does NOT perform migration during Stage C1.
+#
+# Repository filename is authoritative for tests. The eventual router
+# filesystem installation path is NOT finalized in Stage C1.
+
+# ============================================================
+# Configuration (defensive: invalid values fail safe to defaults)
+# ============================================================
+
+WAN_RECOVERY_STATE_DIR="${WAN_RECOVERY_STATE_DIR:-/tmp/wan-recovery}"
+
+# Same-boot full-WAN disruption budget. After this many full WAN cycles in a
+# single boot, the shared disruption hold latches and blocks ALL disruptive
+# recovery until /tmp is cleared by a real router reboot.
+WAN_DISRUPTION_LIMIT="${WAN_DISRUPTION_LIMIT:-3}"
+
+# Minimum seconds between full-WAN disruptions (cooldown / spacing).
+WAN_DISRUPTION_COOLDOWN="${WAN_DISRUPTION_COOLDOWN:-1200}"
+
+# After a wan6-only disruptive action, wait at least this many seconds before
+# a full-WAN disruption is allowed. Prevents a wan6 flap from being immediately
+# followed by a full WAN cycle.
+WAN6_TO_FULL_WAN_GRACE="${WAN6_TO_FULL_WAN_GRACE:-60}"
+
+# A fallback lock directory older than this many seconds is considered stale
+# and may be removed to recover from a crashed/killed process that never
+# released the mkdir fallback lock.
+WAN_RECOVERY_STALE_LOCK_AGE="${WAN_RECOVERY_STALE_LOCK_AGE:-600}"
+
+# Full-WAN lifecycle delays. Defaults match the current ipv6-watchdog
+# full-WAN restart sequence (ifdown wan6; ifdown wan; sleep 30; ifup wan;
+# sleep 20; ifup wan6). Neutral names so a future IPv4 watchdog can use the
+# same coordinator without IPv6-specific terminology.
+WAN_DOWN_SLEEP="${WAN_DOWN_SLEEP:-30}"
+WAN_UP_SLEEP="${WAN_UP_SLEEP:-20}"
+
+# Defensive numeric validation. Invalid values fail safe to the documented
+# defaults. Non-numeric, empty, or negative values are rejected.
+_wan_recovery_sanitize_config() {
+    case "$WAN_DISRUPTION_LIMIT" in
+        ''|*[!0-9]*) WAN_DISRUPTION_LIMIT=3 ;;
+    esac
+    case "$WAN_DISRUPTION_COOLDOWN" in
+        ''|*[!0-9]*) WAN_DISRUPTION_COOLDOWN=1200 ;;
+    esac
+    case "$WAN6_TO_FULL_WAN_GRACE" in
+        ''|*[!0-9]*) WAN6_TO_FULL_WAN_GRACE=60 ;;
+    esac
+    case "$WAN_RECOVERY_STALE_LOCK_AGE" in
+        ''|*[!0-9]*) WAN_RECOVERY_STALE_LOCK_AGE=600 ;;
+    esac
+    case "$WAN_DOWN_SLEEP" in
+        ''|*[!0-9]*) WAN_DOWN_SLEEP=30 ;;
+    esac
+    case "$WAN_UP_SLEEP" in
+        ''|*[!0-9]*) WAN_UP_SLEEP=20 ;;
+    esac
+}
+
+# ============================================================
+# Internal state (not part of the public API)
+# ============================================================
+
+# Tracks whether THIS process holds the shared lock. Set on acquire, cleared
+# on release. Used so wan_recovery_end / wan_recovery_cleanup are idempotent
+# and only release if this process actually acquired the lock.
+_WAN_RECOVERY_LOCK_HELD=0
+
+# File descriptor for flock, if flock is in use. Kept so the caller does not
+# need to know the fd.
+_WAN_RECOVERY_LOCK_FD=""
+
+# Marks whether the mkdir fallback lock was created by THIS process (so we
+# only remove our own fallback lock dir, never a fresh one owned by another
+# process).
+_WAN_RECOVERY_OWN_FALLBACK=0
+
+# State file paths (resolved lazily so state dir can be overridden before a
+# begin call).
+_wan_recovery_paths() {
+    DISRUPTION_COUNT_FILE="$WAN_RECOVERY_STATE_DIR/disruption_count"
+    LAST_FULL_WAN_DISRUPTION_FILE="$WAN_RECOVERY_STATE_DIR/last_full_wan_disruption"
+    LAST_WAN6_ACTION_FILE="$WAN_RECOVERY_STATE_DIR/last_wan6_action"
+    LAST_FULL_WAN_REASON_FILE="$WAN_RECOVERY_STATE_DIR/last_full_wan_reason"
+    LAST_WAN6_REASON_FILE="$WAN_RECOVERY_STATE_DIR/last_wan6_reason"
+    DISRUPTION_HOLD_FILE="$WAN_RECOVERY_STATE_DIR/disruption_hold"
+    DISRUPTION_LOCK_FILE="$WAN_RECOVERY_STATE_DIR/disruption.lock"
+    DISRUPTION_LOCK_DIR="$WAN_RECOVERY_STATE_DIR/disruption.lock.dir"
+}
+
+# ============================================================
+# Sanitized state readers
+# ============================================================
+
+# Read disruption_count defensively. Returns 0 on missing/empty/non-numeric.
+_wan_recovery_read_count() {
+    [ -s "$DISRUPTION_COUNT_FILE" ] || { echo 0; return; }
+    local v
+    v=$(cat "$DISRUPTION_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$v" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$v" ;;
+    esac
+}
+
+# Read a timestamp file defensively. Returns 0 on missing/empty/non-numeric.
+# A real epoch timestamp is always > 0, so 0 is a safe "never recorded" sentinel.
+_wan_recovery_read_ts() {
+    local f="$1"
+    [ -s "$f" ] || { echo 0; return; }
+    local v
+    v=$(cat "$f" 2>/dev/null | tr -d '[:space:]')
+    case "$v" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$v" ;;
+    esac
+}
+
+# Current epoch. Centralized so tests can mock by redefining this function or
+# by setting _WAN_RECOVERY_NOW before sourcing. Production callers must NOT
+# set _WAN_RECOVERY_NOW; it exists for testability.
+_wan_recovery_now() {
+    if [ -n "${_WAN_RECOVERY_NOW:-}" ]; then
+        echo "$_WAN_RECOVERY_NOW"
+    else
+        date +%s
+    fi
+}
+
+# ============================================================
+# Shared serialization lock
+# ============================================================
+
+# Acquire the shared WAN-recovery lock. Prefers flock; falls back to a mkdir
+# directory lock if flock is unavailable.
+#
+# Returns:
+#   0 = lock acquired (this process owns it)
+#   3 = busy (another process holds the lock), no lock held
+#
+# Stale fallback handling: if the fallback lock dir exists and its age exceeds
+# WAN_RECOVERY_STALE_LOCK_AGE, it is removed (only the exact expected dir) and
+# acquisition is retried. A fresh fallback dir is NEVER removed.
+_wan_recovery_lock_acquire() {
+    mkdir -p "$WAN_RECOVERY_STATE_DIR" 2>/dev/null || return 3
+
+    # Try flock first. Use an fd >= 9 to avoid clashing with caller fds.
+    _flock_unavailable=0
+    if command -v flock >/dev/null 2>&1; then
+        # exec opens the fd; flock locks it. Keep the fd open until release.
+        for _fd in 9 10 11 12; do
+            if (eval "exec $_fd>'$DISRUPTION_LOCK_FILE'") 2>/dev/null; then
+                flock -n "$_fd" 2>/dev/null
+                _flock_rc=$?
+                if [ "$_flock_rc" -eq 0 ]; then
+                    _WAN_RECOVERY_LOCK_FD="$_fd"
+                    _WAN_RECOVERY_LOCK_HELD=1
+                    _WAN_RECOVERY_OWN_FALLBACK=0
+                    return 0
+                fi
+                # Close the fd before deciding what to do next.
+                eval "exec $_fd>&-" 2>/dev/null
+                # 127 = command not found / a broken flock on PATH. Do NOT
+                # treat this as "busy"; fall back to the mkdir lock instead.
+                # Other non-zero (e.g. 1 = lock held by another process) means
+                # genuinely busy; try the next fd.
+                if [ "$_flock_rc" -eq 127 ]; then
+                    _flock_unavailable=1
+                    break
+                fi
+            fi
+        done
+        # If flock was available and genuinely held on all tried fds, busy.
+        # If flock was broken (127), fall through to the mkdir fallback.
+        if [ "$_flock_unavailable" -ne 1 ]; then
+            return 3
+        fi
+    fi
+
+    # mkdir fallback. mkdir is atomic on POSIX filesystems: it either creates
+    # the dir (success) or fails because it exists (busy).
+    if mkdir "$DISRUPTION_LOCK_DIR" 2>/dev/null; then
+        _WAN_RECOVERY_LOCK_HELD=1
+        _WAN_RECOVERY_OWN_FALLBACK=1
+        _WAN_RECOVERY_LOCK_FD=""
+        return 0
+    fi
+
+    # Dir exists. Is it stale?
+    # BusyBox find does not support -newermt or -mmin reliably across builds,
+    # so use stat with a fallback to find. We compute age by comparing the
+    # directory mtime to the current time.
+    local stale_at
+    stale_at=$(( $(_wan_recovery_now) - WAN_RECOVERY_STALE_LOCK_AGE ))
+    local mtime
+    mtime=""
+
+    # Try stat first ( BusyBox stat -c %Y <dir> gives mtime epoch).
+    if command -v stat >/dev/null 2>&1; then
+        mtime=$(stat -c %Y "$DISRUPTION_LOCK_DIR" 2>/dev/null)
+    fi
+
+    # Fallback: find -newer with a reference file whose mtime is the stale
+    # threshold. If the lock dir is NOT newer than the threshold ref, it is
+    # stale.
+    if [ -z "$mtime" ]; then
+        local ref
+        ref="$WAN_RECOVERY_STATE_DIR/.stale_ref_$$"
+        # Touch the ref with the threshold mtime. BusyBox touch supports
+        # -d but not always epoch; use a portable approach: create the file
+        # now, then set its mtime via touch -d if supported, else skip.
+        : > "$ref" 2>/dev/null
+        if touch -d "@$stale_at" "$ref" 2>/dev/null; then
+            # If the lock dir is older than (not newer than) the ref, it is stale.
+            if ! find "$DISRUPTION_LOCK_DIR" -newer "$ref" >/dev/null 2>&1; then
+                # Older than threshold -> stale.
+                mtime=0
+            else
+                mtime=$(_wan_recovery_now)
+            fi
+        fi
+        rm -f "$ref" 2>/dev/null
+    fi
+
+    case "$mtime" in
+        ''|*[!0-9]*) mtime=$(_wan_recovery_now) ;;
+    esac
+
+    if [ "$mtime" -gt 0 ] && [ "$mtime" -lt "$stale_at" ]; then
+        # Stale: remove ONLY the exact expected lock dir. Never a broad rm -rf.
+        rmdir "$DISRUPTION_LOCK_DIR" 2>/dev/null || \
+            rm -rf "$DISRUPTION_LOCK_DIR" 2>/dev/null
+        # Retry acquisition once.
+        if mkdir "$DISRUPTION_LOCK_DIR" 2>/dev/null; then
+            _WAN_RECOVERY_LOCK_HELD=1
+            _WAN_RECOVERY_OWN_FALLBACK=1
+            _WAN_RECOVERY_LOCK_FD=""
+            return 0
+        fi
+    fi
+
+    return 3
+}
+
+# Release the shared lock. Only acts if THIS process holds it. Idempotent.
+_wan_recovery_lock_release() {
+    [ "$_WAN_RECOVERY_LOCK_HELD" = 1 ] || return 0
+    if [ -n "$_WAN_RECOVERY_LOCK_FD" ]; then
+        flock -u "$_WAN_RECOVERY_LOCK_FD" 2>/dev/null
+        eval "exec $_WAN_RECOVERY_LOCK_FD>&-" 2>/dev/null
+        _WAN_RECOVERY_LOCK_FD=""
+    fi
+    if [ "$_WAN_RECOVERY_OWN_FALLBACK" = 1 ]; then
+        rmdir "$DISRUPTION_LOCK_DIR" 2>/dev/null
+        _WAN_RECOVERY_OWN_FALLBACK=0
+    fi
+    _WAN_RECOVERY_LOCK_HELD=0
+}
+
+# ============================================================
+# Hold evaluation (MUST be called while holding the shared lock)
+# ============================================================
+
+# Returns 0 if the shared disruption hold is active. The hold is active if:
+#   - the explicit disruption_hold latch file exists, OR
+#   - disruption_count >= WAN_DISRUPTION_LIMIT (budget exhausted)
+#
+# If the count has reached the limit but the latch file is missing (e.g. a
+# prior process incremented the count but crashed before latching), this
+# function RECONCILES state by creating the latch while still holding the
+# lock. This prevents a crashed mid-budget-exhaustion process from leaving
+# the system in an inconsistent "count at limit but hold not latched" state.
+_wan_recovery_hold_active_locked() {
+    [ -f "$DISRUPTION_HOLD_FILE" ] && return 0
+    local count
+    count=$(_wan_recovery_read_count)
+    if [ "$count" -ge "$WAN_DISRUPTION_LIMIT" ]; then
+        # Reconcile: latch the hold so future begin calls short-circuit on the
+        # file test without needing to re-read the count. Safe because we hold
+        # the lock.
+        : > "$DISRUPTION_HOLD_FILE"
+        return 0
+    fi
+    return 1
+}
+
+# ============================================================
+# Public API: full-WAN begin
+# ============================================================
+
+# wan_recovery_full_begin
+#
+# Acquire the shared lock and decide whether a full-WAN disruption is allowed.
+#
+# CRITICAL: cooldown / hold / spacing decisions are made WHILE HOLDING THE
+# LOCK. The caller must NOT check cooldown before calling this function,
+# because another process may disrupt between an unlocked check and the
+# locked action.
+#
+# Return codes:
+#   0 = ALLOWED.   The shared lock remains HELD. The caller MUST perform its
+#                  protocol-specific health recheck now; if recovered, call
+#                  wan_recovery_end (no accounting). If still failing, call
+#                  wan_recovery_full_execute_locked <reason> to record and
+#                  execute the lifecycle.
+#   1 = BLOCKED by cooldown or recent wan6 spacing. Lock RELEASED.
+#   2 = BLOCKED by shared disruption hold / budget exhaustion. Lock RELEASED.
+#   3 = BUSY.     The shared lock could not be acquired. No lock held.
+#
+# This function does NOT perform protocol health rechecks. The caller owns
+# health truth.
+wan_recovery_full_begin() {
+    _wan_recovery_sanitize_config
+    _wan_recovery_paths
+
+    _wan_recovery_lock_acquire
+    case $? in
+        0) : ;;  # lock held, continue
+        *) return 3 ;;
+    esac
+
+    # ----- ALL decisions below are made while holding the lock -----
+
+    # 1. Shared disruption hold / budget exhaustion.
+    if _wan_recovery_hold_active_locked; then
+        _wan_recovery_lock_release
+        return 2
+    fi
+
+    # 2. Full-WAN cooldown (spacing between full-WAN disruptions).
+    local last_full
+    last_full=$(_wan_recovery_read_ts "$LAST_FULL_WAN_DISRUPTION_FILE")
+    if [ "$last_full" -gt 0 ]; then
+        local now
+        now=$(_wan_recovery_now)
+        if [ "$((now - last_full))" -lt "$WAN_DISRUPTION_COOLDOWN" ]; then
+            _wan_recovery_lock_release
+            return 1
+        fi
+    fi
+
+    # 3. Wan6-to-full-WAN grace. If a wan6-only disruption happened recently,
+    #    wait at least WAN6_TO_FULL_WAN_GRACE seconds before a full-WAN cycle.
+    local last_wan6
+    last_wan6=$(_wan_recovery_read_ts "$LAST_WAN6_ACTION_FILE")
+    if [ "$last_wan6" -gt 0 ]; then
+        local now
+        now=$(_wan_recovery_now)
+        if [ "$((now - last_wan6))" -lt "$WAN6_TO_FULL_WAN_GRACE" ]; then
+            _wan_recovery_lock_release
+            return 1
+        fi
+    fi
+
+    # Allowed. Lock remains held. Caller performs health recheck, then either
+    # wan_recovery_end (recovered) or wan_recovery_full_execute_locked (still
+    # failing).
+    return 0
+}
+
+# ============================================================
+# Public API: full-WAN execute (accounting BEFORE lifecycle)
+# ============================================================
+
+# wan_recovery_full_execute_locked <reason>
+#
+# Precondition: shared lock is held (caller got rc=0 from
+# wan_recovery_full_begin and the post-begin health recheck still fails).
+#
+# CRITICAL ORDERING: ALL accounting is written BEFORE the first destructive
+# command. If the process crashes or is killed mid-lifecycle, the disruption
+# is already recorded. We do NOT wait until successful completion.
+#
+# Steps:
+#   1. Read+sanitize disruption_count
+#   2. Increment disruption_count and write it
+#   3. Write last_full_wan_disruption = current epoch
+#   4. Write last_full_wan_reason = provided neutral reason
+#   5. If new count >= WAN_DISRUPTION_LIMIT, latch disruption_hold
+#   6. ONLY THEN begin: ifdown wan6; ifdown wan; sleep WAN_DOWN_SLEEP;
+#      ifup wan; sleep WAN_UP_SLEEP; ifup wan6
+#
+# The third allowed disruption (count 2 -> 3) latches the hold AND still
+# executes the current lifecycle. Future begin calls are blocked.
+#
+# The entire recovery sequence is attempted even if an individual command
+# returns nonzero. A nonzero return indicates at least one lifecycle command
+# failed. The disruption remains counted and timestamped because it was
+# attempted. No internal retry.
+#
+# Returns:
+#   0 = lifecycle completed without command failure
+#   1 = at least one lifecycle command returned nonzero (accounting still done)
+#   2 = precondition violated (lock not held) -- no mutation performed
+wan_recovery_full_execute_locked() {
+    if [ "$_WAN_RECOVERY_LOCK_HELD" != 1 ]; then
+        return 2
+    fi
+
+    _wan_recovery_sanitize_config
+    local reason="${1:-unspecified}"
+    local now
+    now=$(_wan_recovery_now)
+
+    # ---- ACCOUNTING FIRST (before any ifdown) ----
+    local count
+    count=$(_wan_recovery_read_count)
+    count=$((count + 1))
+
+    # Write the incremented count.
+    echo "$count" > "$DISRUPTION_COUNT_FILE"
+    # Write the full-WAN disruption timestamp.
+    echo "$now" > "$LAST_FULL_WAN_DISRUPTION_FILE"
+    # Write the neutral reason for observability.
+    echo "$reason" > "$LAST_FULL_WAN_REASON_FILE"
+
+    # Latch the hold if the budget is now exhausted.
+    if [ "$count" -ge "$WAN_DISRUPTION_LIMIT" ]; then
+        : > "$DISRUPTION_HOLD_FILE"
+    fi
+
+    # ---- LIFECYCLE (accounting already recorded) ----
+    # Preserve the existing explicit sequence. Do NOT attempt to prove or
+    # remove explicit wan6 lifecycle handling in Stage C1.
+    local lifecycle_failed=0
+
+    ifdown wan6 || lifecycle_failed=1
+    ifdown wan  || lifecycle_failed=1
+    sleep "$WAN_DOWN_SLEEP"
+    ifup wan    || lifecycle_failed=1
+    sleep "$WAN_UP_SLEEP"
+    ifup wan6   || lifecycle_failed=1
+
+    return $lifecycle_failed
+}
+
+# ============================================================
+# Public API: wan6-only begin
+# ============================================================
+
+# wan_recovery_wan6_begin
+#
+# Acquire the shared lock and decide whether a wan6-only disruption is
+# allowed. Uses the SAME shared lock as wan_recovery_full_begin.
+#
+# Return codes:
+#   0 = ALLOWED. Shared lock HELD. Caller performs health recheck; if
+#        recovered, call wan_recovery_end (no accounting). If still failing,
+#        call wan_recovery_wan6_record_locked <reason> then perform the
+#        caller-owned wan6 lifecycle (the caller retains control of its own
+#        wan6 sleep/recovery sequence because current Tier0/no-prefix/
+#        bootstrap timings differ).
+#   1 = BLOCKED by recent full-WAN cooldown. Lock RELEASED.
+#   2 = BLOCKED by shared disruption hold. Lock RELEASED.
+#   3 = BUSY. Shared lock could not be acquired. No lock held.
+#
+# Shared-hold semantics: a wan6-only action IS blocked by the shared
+# disruption hold, but it does NOT consume the full-WAN budget, does NOT
+# latch the hold, and does NOT write last_full_wan_disruption. This preserves
+# the existing behavior that once disruptive recovery is exhausted, watchdogs
+# monitor passively until reboot / spontaneous recovery.
+wan_recovery_wan6_begin() {
+    _wan_recovery_sanitize_config
+    _wan_recovery_paths
+
+    _wan_recovery_lock_acquire
+    case $? in
+        0) : ;;
+        *) return 3 ;;
+    esac
+
+    # ----- ALL decisions below are made while holding the lock -----
+
+    # 1. Shared disruption hold blocks ALL disruptive actions, including
+    #    wan6-only.
+    if _wan_recovery_hold_active_locked; then
+        _wan_recovery_lock_release
+        return 2
+    fi
+
+    # 2. Full-WAN cooldown also blocks wan6-only actions. A recent full-WAN
+    #    disruption should not be immediately followed by a wan6 flap.
+    local last_full
+    last_full=$(_wan_recovery_read_ts "$LAST_FULL_WAN_DISRUPTION_FILE")
+    if [ "$last_full" -gt 0 ]; then
+        local now
+        now=$(_wan_recovery_now)
+        if [ "$((now - last_full))" -lt "$WAN_DISRUPTION_COOLDOWN" ]; then
+            _wan_recovery_lock_release
+            return 1
+        fi
+    fi
+
+    # Allowed. Lock remains held. Note: wan6-only does NOT check the
+    # wan6-to-full-WAN grace in reverse (a wan6 action following another wan6
+    # action is governed by the caller's own Tier0/no-prefix timers, not by
+    # this coordinator).
+    return 0
+}
+
+# ============================================================
+# Public API: wan6-only accounting (record BEFORE ifdown)
+# ============================================================
+
+# wan_recovery_wan6_record_locked <reason>
+#
+# Precondition: shared lock is held (caller got rc=0 from
+# wan_recovery_wan6_begin and the post-begin health recheck still fails).
+#
+# Call this IMMEDIATELY BEFORE the caller's first ifdown wan6. A crash during
+# the wan6 lifecycle must still leave evidence that a disruptive wan6 action
+# was attempted.
+#
+# Writes:
+#   last_wan6_action = current epoch
+#   last_wan6_reason = provided neutral reason (observability only)
+#
+# Does NOT:
+#   - modify disruption_count
+#   - write last_full_wan_disruption
+#   - latch disruption_hold
+#
+# Returns:
+#   0 = recorded
+#   2 = precondition violated (lock not held) -- no mutation performed
+wan_recovery_wan6_record_locked() {
+    if [ "$_WAN_RECOVERY_LOCK_HELD" != 1 ]; then
+        return 2
+    fi
+
+    local reason="${1:-unspecified}"
+    local now
+    now=$(_wan_recovery_now)
+
+    echo "$now" > "$LAST_WAN6_ACTION_FILE"
+    echo "$reason" > "$LAST_WAN6_REASON_FILE"
+    return 0
+}
+
+# ============================================================
+# Public API: end / cleanup
+# ============================================================
+
+# wan_recovery_end
+#
+# Release the shared lock if this process holds it. Idempotent. Safe to call
+# without a successful begin.
+#
+# Use this after a caller's post-begin health recheck SUCCEEDS (recovered):
+# no accounting is written, no timestamp is recorded, the budget is not
+# consumed. The lock is simply released so other watchdogs may proceed.
+wan_recovery_end() {
+    _wan_recovery_lock_release
+    return 0
+}
+
+# wan_recovery_cleanup
+#
+# Idempotent cleanup helper. Future callers invoke this from THEIR existing
+# on_exit / INT / TERM trap. This library does NOT install its own trap (a
+# sourced library installing a trap could replace caller cleanup such as
+# ipv6-watchdog's on_exit which handles staged UCI revert and its own
+# fallback lock).
+#
+# Safe to call:
+#   - without a successful begin
+#   - after wan_recovery_end (double-cleanup is a no-op)
+#   - from a trap context
+wan_recovery_cleanup() {
+    _wan_recovery_lock_release
+    return 0
+}
