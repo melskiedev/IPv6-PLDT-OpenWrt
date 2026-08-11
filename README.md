@@ -3,20 +3,13 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Release](https://img.shields.io/badge/Release-v3.9.9-blue)](#)
+[![Version](https://img.shields.io/badge/Version-v3.10.0-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Current published release:** v3.9.9 | **Architecture documented here:** v3.10.0
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.0
 
 A production-grade IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode, with bounded self-healing: it recovers from transient faults on its own, and stops rather than looping when a fault is not on the router.
 
 Includes root-cause analysis, startup fixes, runtime route and gateway repair, router source selection policy, coordinated recovery, and real-world edge cases observed in production use.
-
-> **Version status.** The v3.10.0 architecture described in the architecture
-> sections below is implemented and committed, but has **not** been pushed,
-> tagged, or released. The published release remains v3.9.9. Installation and
-> verification sections in this document still describe the published version
-> and are being updated separately. Read the architecture sections as the
-> design reference, not as a download pointer.
 
 > **Personal use, shared openly.** This is my own home network fix that I'm sharing in case it helps someone else. I run this on my own routers daily. Use it at your own risk, adapt it as needed, and always take a sysupgrade backup before applying anything.
 
@@ -513,14 +506,6 @@ into an unhealthy one, and never rescues an unhealthy one.
 
 ## Quick Deploy (Core v3.10)
 
-> **Availability note.** The v3.10.0 stack described in the architecture
-> sections is committed on a development branch. It has **not** been pushed,
-> tagged, or released, so the files below are **not yet downloadable** from
-> `main`. The commands are the intended installation procedure and are
-> published here for review. Until v3.10.0 is published, `main` still serves
-> the previous release, which does not include `wan-recovery-common`. Do not
-> assume a `v3.10.0` tag exists.
-
 Installing files is non-disruptive. Nothing in this section restarts WAN,
 `wan6`, or the network, and nothing reboots the router. Bringing the new
 behavior into effect is covered by verification later on.
@@ -555,18 +540,19 @@ Define these once per shell session. Every block below reuses them.
 OWNER="melskiedev"
 REPO="IPv6-PLDT-OpenWrt"
 
-# Latest published code:
+# main tracks the latest published code:
 REF="main"
 
-# Or pin to a published release tag for a reproducible install:
+# Or pin to an existing release tag for a reproducible install:
 # REF="<release-tag>"
 
 BASE="https://raw.githubusercontent.com/$OWNER/$REPO/$REF"
 echo "$BASE"
 ```
 
-Pinning `REF` to a release tag is preferable for anything you intend to
-reproduce later. Do not install from a feature branch.
+`main` tracks the latest published code. For a reproducible deployment, set
+`REF` to an existing release tag instead, so the same files can be installed
+again later. Do not install from a development or feature branch.
 
 ### Install order, and why it matters
 
@@ -1221,12 +1207,6 @@ one.
 ---
 
 ## Architecture Overview (v3.10.0)
-
-> **Status:** the v3.10.0 architecture described in this section is implemented
-> and committed on a development branch. It has not been pushed, tagged, or
-> released yet. Installation instructions elsewhere in this document still
-> describe the previously published version. Treat this section as the
-> architecture reference, not as a download pointer.
 
 Three core components divide the work. The split exists so that health
 decisions, non-disruptive repair, and disruptive recovery never sit in the same
@@ -3477,11 +3457,7 @@ EOF
 
 ## Changelog
 
-### v3.10.0 (development, not released)
-
-> **Status: committed on a development branch. Not pushed, not tagged, not
-> released.** The published release remains v3.9.9. There is no `v3.10.0` tag
-> and these files are not yet downloadable from `main`.
+### v3.10.0
 
 Architecture change rather than a set of fixes. The health model, the recovery
 model, and the router's own source selection were all reworked.
