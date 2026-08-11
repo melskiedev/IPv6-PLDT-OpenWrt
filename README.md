@@ -17,7 +17,7 @@ Includes root-cause analysis, startup fixes, runtime route and gateway repair, r
 
 ## TL;DR
 
-Fibre in bridge mode, IPv6 unstable or broken: apply UCI config, deploy the core scripts, add cron, reboot, verify.
+Fiber in bridge mode, IPv6 unstable or broken: apply UCI config, deploy the core scripts, add cron, reboot, verify.
 
 Health is decided by the delegated prefix (`IA_PD`), not by the WAN `/128`. A WAN `/128` is optional and its presence is not a fault. Where the router picks an unusable `/128` as its own source address, source policy corrects the source instead of deleting the address.
 
@@ -1040,7 +1040,7 @@ Tested on:
   DIAGRAM 1 - SUPPORTED TOPOLOGY
 
   +---------------+
-  | Provider      |   fibre
+  | Provider      |   fiber
   | IPv6 via      |
   | RA + DHCPv6   |
   +-------+-------+
@@ -1133,7 +1133,7 @@ If you have a **third-party router behind the main OpenWrt router** (double NAT)
 
 ## Root Causes
 
-IPv6 on a bridged fibre connection can fail in several independent ways. This
+IPv6 on a bridged fiber connection can fail in several independent ways. This
 project targets the combination below, observed in production over an extended
 period. Not every deployment sees every failure.
 
