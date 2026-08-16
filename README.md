@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Version](https://img.shields.io/badge/Version-v3.10.0-blue)](#)
+[![Version](https://img.shields.io/badge/Version-v3.10.1-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.0
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.1
 
 A production-grade IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode, with bounded self-healing: it recovers from transient faults on its own, and stops rather than looping when a fault is not on the router.
 
@@ -3456,6 +3456,82 @@ EOF
 ---
 
 ## Changelog
+
+### v3.10.1
+
+Closes a reporting gap, not a routing gap. No change to the PD-first health
+model, source-aware routing, shared recovery coordination, or the same-boot
+restart budget.
+
+**Ordinary recovery closure**
+
+- A confirmed connectivity incident that ends *without* a full WAN restart now
+  reports itself. Previously `fail_count > 0 -> healthy` reset the counters
+  silently: no log line, no Discord message. Only critical incidents (those
+  that had already triggered an ONT alert) were ever closed out.
+- `notify_ordinary_recovery()` is a **separate** mechanism from
+  `notify_ipv6_recovered()`. The latter remains the critical/ONT closure, keeps
+  its `ONT_FLAG` gate, and keeps its direct webhook `curl`. The ordinary path
+  emits exactly one compact log line and relies on the existing
+  `ipv6-watchdog` -> `ipv6-discord-logger` tag forwarding; it never calls
+  `curl` itself.
+- Both recovery paths are covered: the normal healthy path and the successful
+  `fix_gateway` -> `ipv6_ok` path. The latter previously reset state with no
+  notification of any kind, so even a critical incident closed silently there.
+- Exactly one recovery notice can fire per incident. Ordinary closure is
+  suppressed whenever `ONT_FLAG` exists or a recovery hold is active, which is
+  precisely when the critical closure owns the incident.
+
+**Incident duration**
+
+- New `incident_start` state file records epoch seconds on the `fail_count`
+  `0 -> 1` transition only, and is never overwritten while the incident stays
+  open. Cleared by `reset_recovery_state()` and by `do_wan_restart()`, so an
+  escalated incident can only ever close through the critical path.
+- Duration is reported only when it is reliably derivable: the marker must
+  exist, parse as a positive integer, and yield a delta within a 24-hour sanity
+  ceiling. Otherwise the clause is omitted entirely rather than guessed.
+
+**Evidence-based failure wording**
+
+- `Connectivity failure N (prefix present, gateway broken or route dead)`
+  asserted a root cause the watchdog has not established at that point.
+  Replaced with wording limited to what the code has actually proven:
+
+  ```
+  IPv6 connectivity failure 1/3 confirmed. Delegated prefix and default route
+  are present, but PD-source Internet reachability failed after confirmation
+  and gateway recovery attempts. Current gateway: fe80::1. No WAN restart
+  performed yet.
+  ```
+
+- The gateway clause appears only when `current_default_gw()` actually returns
+  one; the restart clause only below the escalation threshold. The escalation
+  threshold is now the named `FAIL_LIMIT` so the message and the escalation
+  test cannot drift apart.
+
+**Release note**
+
+- The ordinary-recovery behavior was designed for a v3.9.10 that was never
+  committed, tagged, or pushed. v3.10.0 was branched directly from v3.9.9
+  (`6451d35`'s parent is `7e7566e` = `v3.9.9`) and therefore never contained
+  it. This was an integration omission, not a regression: the symbols appear in
+  no commit in the repository's history. The design's own safeguard was a
+  manual "Discord test D5" that never became an executable test, which is why
+  nothing failed. `tests/test-ordinary-recovery.sh` is that missing test.
+
+**Testing**
+
+- `tests/test-ordinary-recovery.sh` (new, 64 assertions) covers both recovery
+  paths, the silent `fail_count = 0` cases, marker lifecycle, duplicate
+  suppression, duration formatting and all its degenerate inputs, gateway
+  provability, single-line output, and budget preservation.
+- `tests/test-ash-compat.sh` (new, 30 assertions) parses every router-side
+  script under each POSIX shell present and statically scans for bashisms
+  absent from BusyBox ash. Runs `busybox ash -n` automatically when busybox is
+  installed.
+- `tests/test-reachability-confirmation.sh` updated for the new failure wording
+  and marker assertions.
 
 ### v3.10.0
 
