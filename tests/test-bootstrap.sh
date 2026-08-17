@@ -131,6 +131,11 @@ PREFIX_BACKOFF_FILE="$STATE_DIR/prefix_next_attempt"
 ONT_FLAG="$STATE_DIR/ont_notified"
 RECOVERY_HOLD_FILE="$STATE_DIR/recovery_hold"
 HOLD_STATUS_FILE="$STATE_DIR/hold_status"
+# v3.10.1 incident markers. Declared here so reset_recovery_state() operates on
+# real paths inside this harness rather than on empty variables, which keeps the
+# counter-preservation assertions below honest.
+INCIDENT_START_FILE="$STATE_DIR/incident_start"
+RESTART_INCIDENT_FILE="$STATE_DIR/restart_incident"
 WAN_RESTARTS=0
 NOW=$(date +%s)
 
@@ -972,6 +977,39 @@ test_R() {
     assert_eq "legacy recovery hold not created" "$(test -f "$RECOVERY_HOLD_FILE" && echo yes || echo no)" "no"
 }
 
+# R2. v3.10.1: the bootstrap MECHANISM owns no incident-closure policy.
+# try_128_bootstrap must never clear the incident markers and must never emit a
+# recovery closure itself -- both belong to its call site, which applies the
+# critical/hold > restart-assisted > ordinary precedence. This pins the
+# separation so a future change cannot quietly move closure logic into the
+# mechanism (where the no-prefix ladder could bypass it).
+test_R2() {
+    echo "--- R2: bootstrap mechanism does not close or clear incidents ---"
+    : > "$WATCHDOG_LOG"
+    echo "2" > "$FAIL_FILE"
+    echo "1" > "$RESTART_INCIDENT_FILE"
+    echo "1699999000" > "$INCIDENT_START_FILE"
+    # Full-success scenario, identical in shape to test K.
+    set_scenario "PREFIX_ADDR" "2001:db8:7e3:7700::"
+    set_scenario "WAN128_ADDR" "2001:db8::1"
+    set_scenario "PD_OK_GATEWAYS" "fe80::aaaa"
+    add_route "default via fe80::aaaa dev eth1 metric 512"
+    add_route "default from 2001:db8:7e3:7700::/56 via fe80::aaaa dev eth1 metric 512"
+    add_neigh "fe80::aaaa lladdr aa:aa:aa:aa:aa:aa dev eth1 router"
+    try_128_bootstrap
+    rc=$?
+    assert_eq "bootstrap succeeded" "$rc" "0"
+    # The mechanism leaves incident state entirely alone.
+    assert_eq "restart marker untouched by mechanism" "$(cat "$RESTART_INCIDENT_FILE" 2>/dev/null)" "1"
+    assert_eq "incident_start untouched by mechanism" "$(cat "$INCIDENT_START_FILE" 2>/dev/null)" "1699999000"
+    assert_eq "FAIL_FILE untouched by mechanism" "$(cat "$FAIL_FILE")" "2"
+    # And emits no closure of its own.
+    assert_not_contains "mechanism emits no restart-assisted closure" \
+        "recovered after full WAN restart" "$WATCHDOG_LOG"
+    assert_not_contains "mechanism emits no ordinary closure" \
+        "confirmed failed watchdog" "$WATCHDOG_LOG"
+}
+
 # S. Successful bootstrap does not modify clientid/duid
 test_S() {
     echo "--- S: no clientid/duid modification ---"
@@ -1089,7 +1127,7 @@ test_W() {
 # ================================================================
 echo "=== Phase 3: bootstrap hardening tests ==="
 
-BOOT_TESTS="${BOOT_TESTS:-A B C D E F G H I J K L M N O P Q R S T U V W}"
+BOOT_TESTS="${BOOT_TESTS:-A B C D E F G H I J K L M N O P Q R R2 S T U V W}"
 for t in $BOOT_TESTS; do
     run_test "test_$t"
 done

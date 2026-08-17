@@ -3482,6 +3482,30 @@ restart budget.
   suppressed whenever `ONT_FLAG` exists or a recovery hold is active, which is
   precisely when the critical closure owns the incident.
 
+**Restart-assisted recovery closure**
+
+- A confirmed incident that escalated to a full WAN restart and then went
+  healthy also closed silently. `do_wan_restart()` zeroes `FAIL_FILE`, so the
+  ordinary closure correctly sees `fail_count = 0`, while
+  `notify_ipv6_recovered()` stays `ONT_FLAG`-gated and a plain restart never
+  sets `ONT_FLAG`. Observed in production on 2026-08-16: failures 1-3,
+  `Full WAN restart #1 of 3`, gateway replaced, source policy switched to
+  `pd-preferred`, IPv6 healthy -- and no closure line.
+- New `restart_incident` state records the incident's restart ordinal.
+  Presence of this marker, never the cumulative shared `disruption_count`, is
+  what proves the current incident required a restart; a routine healthy tick
+  in a boot that saw an earlier restart therefore emits nothing.
+- Closure precedence across all positive-health paths is
+  critical/hold > restart-assisted > ordinary, so exactly one notice fires per
+  incident.
+- The marker is cleared only by a positive-health closure or by ownership
+  passing to the critical/hold path.
+- All three `reset_recovery_state()` call sites now emit a closure first. The
+  `try_128_bootstrap()` success path (reachable only with
+  `BOOTSTRAP_ENABLED=1`) previously cleared incident state with no
+  notification at all; the bootstrap mechanism itself is unchanged and still
+  owns no closure policy.
+
 **Incident duration**
 
 - New `incident_start` state file records epoch seconds on the `fail_count`
