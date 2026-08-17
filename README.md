@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Version](https://img.shields.io/badge/Version-v3.10.0-blue)](#)
+[![Version](https://img.shields.io/badge/Version-v3.10.1-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.0
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.1
 
 A production-grade IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode, with bounded self-healing: it recovers from transient faults on its own, and stops rather than looping when a fault is not on the router.
 
@@ -2175,8 +2175,8 @@ scripts are internal constants, not tunables.
 | `STICKY_GATEWAY` | `0` | Re-pin the last known-good gateway when RA replaces it with a dead one | Enable (`1`) only where dead gateway advertisements are a known problem |
 | `REACHABILITY_CONFIRM_DELAY` | `3` | Seconds before the second reachability check. Suppresses alerts from brief provider drops | Rarely. Non-numeric falls back to `3`; values above `30` are capped at `30`; `0` disables confirmation |
 | `CLEANUP_DEPRECATED_LAN` | `1` | Remove deprecated LAN addresses left behind after a prefix change | Rarely |
-| `CLEANUP_WAN128` | `0` | Remove the WAN `/128` after a successful bootstrap | Leave at `0`. A healthy `/128` is optional and may be kept |
-| `BOOTSTRAP_ENABLED` | `0` | Enable the experimental IA_NA-assisted prefix bootstrap stage | Leave at `0` unless you are deliberately testing it. Its effectiveness is unproven |
+| `CLEANUP_WAN128` | `0` | Remove the WAN `/128` after a successful bootstrap | Leave at `0`. A healthy `/128` is optional and may be kept. See [D](#d-experimental-bootstrap_enabled-and-cleanup_wan128) |
+| `BOOTSTRAP_ENABLED` | `0` | Enable the experimental IA_NA-assisted prefix bootstrap stage | Leave at `0` unless you are deliberately testing it. Its effectiveness is unproven. See [D](#d-experimental-bootstrap_enabled-and-cleanup_wan128) |
 
 #### B. Recovery limits
 
@@ -2206,6 +2206,159 @@ Defaults inside `wan-recovery-common`. Override them in the same file.
 | `WAN_DOWN_SLEEP` | `30` | Seconds interfaces stay down during a full-WAN cycle |
 | `WAN_UP_SLEEP` | `20` | Seconds between bringing WAN up and bringing wan6 up |
 | `WAN_RECOVERY_COMMON` | `/usr/bin/wan-recovery-common` | Path the watchdog loads the coordinator from |
+
+#### D. Experimental: BOOTSTRAP_ENABLED and CLEANUP_WAN128
+
+##### BOOTSTRAP_ENABLED
+
+**`BOOTSTRAP_ENABLED=0` is the default and the recommended production setting.**
+Leave it at `0`.
+
+`BOOTSTRAP_ENABLED=1` enables the Phase 3 NO_PD bootstrap stage
+(`try_128_bootstrap`) **for controlled testing only**. It is a hypothesis about
+prefix acquisition whose live effectiveness has not been demonstrated. It is not
+a recommended production configuration, it is not a fix for a router that is
+currently healthy, and enabling it will not make recovery faster or more
+reliable.
+
+Invalid values **fail safe to `0`**. Anything that is not exactly `1` — `yes`,
+`true`, `01`, an empty value, a typo — is treated as disabled:
+
+```sh
+BOOTSTRAP_ENABLED="${BOOTSTRAP_ENABLED:-0}"
+case "$BOOTSTRAP_ENABLED" in
+    1) ;;
+    *) BOOTSTRAP_ENABLED=0 ;;
+esac
+```
+
+The override belongs in **`/etc/ipv6-watchdog.conf`**, which the watchdog sources
+on every tick. Do **not** edit `/usr/bin/ipv6-watchdog` — an edited script is
+overwritten by the next upgrade, breaks the installation integrity check, and
+diverges from the published SHA256.
+
+**Check the effective value.** This reproduces the watchdog's own resolution
+and sanitization, so it reports what the watchdog will actually use, not just
+what the file says:
+
+```sh
+BOOTSTRAP_ENABLED=0; [ -f /etc/ipv6-watchdog.conf ] && . /etc/ipv6-watchdog.conf; case "$BOOTSTRAP_ENABLED" in 1) ;; *) BOOTSTRAP_ENABLED=0 ;; esac; echo "effective BOOTSTRAP_ENABLED=$BOOTSTRAP_ENABLED"
+```
+
+**Enable it (controlled testing only).** Removes any existing line first so the
+file cannot end up with two conflicting entries:
+
+```sh
+sed -i '/^[[:space:]]*BOOTSTRAP_ENABLED=/d' /etc/ipv6-watchdog.conf 2>/dev/null; echo 'BOOTSTRAP_ENABLED=1' >> /etc/ipv6-watchdog.conf; chmod 0600 /etc/ipv6-watchdog.conf
+```
+
+**Disable it again (return to the production default):**
+
+```sh
+sed -i '/^[[:space:]]*BOOTSTRAP_ENABLED=/d' /etc/ipv6-watchdog.conf 2>/dev/null; echo "disabled (built-in default is 0)"
+```
+
+Deleting the line is enough — the built-in default is `0`. Setting
+`BOOTSTRAP_ENABLED=0` explicitly is equally valid.
+
+**Verify.** Re-run the effective-value check above, then confirm behavior in the
+log. No service restart is needed; the next tick picks the value up:
+
+```sh
+logread | grep ipv6-watchdog | tail -50
+```
+
+When the no-prefix ladder reaches attempt 3 with the stage **disabled**, you will
+see:
+
+```
+No prefix (attempt 3), Phase 3 bootstrap disabled -- escalating to full WAN restart
+```
+
+With it **enabled** and actually running, you will see:
+
+```
+No prefix (attempt 3), attempting bounded IA_NA-assisted bootstrap, backoff 1800s
+Attempting bounded temporary IA_NA-assisted DHCPv6 recovery stage
+```
+
+##### Only meaningful when committed `reqaddress='none'`
+
+Enabling the experiment is only meaningful on a router whose **committed**
+`network.wan6.reqaddress` is `'none'`. The whole point of the stage is to probe
+whether temporarily *requesting* an IA_NA persuades the provider to grant an
+IA_PD; on a router already committed to `'try'` that is a no-op. If the
+committed value is anything other than `'none'` the bootstrap refuses without
+touching UCI at all, and logs:
+
+```
+Bootstrap refusing: production reqaddress is '<value>', expected 'none' (experimental scope)
+```
+
+Check the committed value, and confirm nothing is left staged:
+
+```sh
+uci get network.wan6.reqaddress; uci changes network
+```
+
+`uci changes network` should print nothing. If it lists a `reqaddress` change,
+you have an uncommitted edit that will confuse the check.
+
+> Read [reqaddress (PROVIDER-DEPENDENT)](#reqaddress-provider-dependent) before
+> changing this value. If your delegated prefix and LAN IPv6 are healthy, do not
+> change `reqaddress` — there is nothing to fix.
+
+##### What the bootstrap does to `reqaddress`
+
+When it runs, the stage **temporarily stages** `reqaddress='try'` and then
+**reverts** it:
+
+1. `uci set network.wan6.reqaddress='try'` — staged, never committed.
+2. One coordinated `wan6` acquisition cycle, then it waits for an IA_PD.
+3. `uci revert network.wan6.reqaddress` — restores the committed value.
+4. A post-revert health gate re-checks that IA_PD, the PD-derived LAN source,
+   coherent routes, and PD-source Internet reachability all **survive** the
+   return to production mode. A prefix that exists only while `'try'` is staged
+   is **not** treated as success.
+
+Because the value is staged and never committed, it does not persist across a
+reboot. If the watchdog is killed mid-run, its exit handler reverts the staged
+value.
+
+##### What the no-prefix ladder does when bootstrap is disabled
+
+With `BOOTSTRAP_ENABLED=0` (the default), the prefix-loss ladder is unchanged and
+the bootstrap is skipped entirely — zero UCI mutation, zero `ifdown`/`ifup`, zero
+route changes, zero counter resets:
+
+| Attempt | Action | Backoff before the next attempt |
+|---|---|---|
+| 1 | Coordinated `wan6` restart | 10 min |
+| 2 | DHCPv6 renew | 20 min |
+| 3 | Escalate to a full WAN restart via the shared coordinator | 30 min (cap) |
+
+Attempt 3 is still subject to the same-boot restart budget, the shared cooldown,
+and the recovery hold. This ladder — not the bootstrap — is the normal prefix
+recovery path.
+
+##### CLEANUP_WAN128 is a separate setting
+
+`CLEANUP_WAN128` is **not** related to `BOOTSTRAP_ENABLED` and does not enable or
+disable anything experimental on its own:
+
+| Value | Meaning |
+|---|---|
+| `0` (default) | **Retain** the WAN `/128`. A healthy IA_NA `/128` is optional and harmless, and is kept |
+| `1` | Opt-in cleanup: remove the WAN `/128` after PD health is confirmed |
+
+Under the v3.10 PD-first health model a WAN `/128` never substitutes for IA_PD
+health, and its presence is not a fault, so there is normally nothing to clean
+up. Leave it at `0`.
+
+One practical consequence worth knowing: `CLEANUP_WAN128` is only read **inside**
+the bootstrap stage. With `BOOTSTRAP_ENABLED=0` it never takes effect at all,
+whatever it is set to. Setting `CLEANUP_WAN128=1` on its own does not cause the
+watchdog to start removing `/128` addresses during normal operation.
 
 #### D. Timing and source policy
 
@@ -3456,6 +3609,106 @@ EOF
 ---
 
 ## Changelog
+
+### v3.10.1
+
+Closes a reporting gap, not a routing gap. No change to the PD-first health
+model, source-aware routing, shared recovery coordination, or the same-boot
+restart budget.
+
+**Ordinary recovery closure**
+
+- A confirmed connectivity incident that ends *without* a full WAN restart now
+  reports itself. Previously `fail_count > 0 -> healthy` reset the counters
+  silently: no log line, no Discord message. Only critical incidents (those
+  that had already triggered an ONT alert) were ever closed out.
+- `notify_ordinary_recovery()` is a **separate** mechanism from
+  `notify_ipv6_recovered()`. The latter remains the critical/ONT closure, keeps
+  its `ONT_FLAG` gate, and keeps its direct webhook `curl`. The ordinary path
+  emits exactly one compact log line and relies on the existing
+  `ipv6-watchdog` -> `ipv6-discord-logger` tag forwarding; it never calls
+  `curl` itself.
+- Both recovery paths are covered: the normal healthy path and the successful
+  `fix_gateway` -> `ipv6_ok` path. The latter previously reset state with no
+  notification of any kind, so even a critical incident closed silently there.
+- Exactly one recovery notice can fire per incident. Ordinary closure is
+  suppressed whenever `ONT_FLAG` exists or a recovery hold is active, which is
+  precisely when the critical closure owns the incident.
+
+**Restart-assisted recovery closure**
+
+- A confirmed incident that escalated to a full WAN restart and then went
+  healthy also closed silently. `do_wan_restart()` zeroes `FAIL_FILE`, so the
+  ordinary closure correctly sees `fail_count = 0`, while
+  `notify_ipv6_recovered()` stays `ONT_FLAG`-gated and a plain restart never
+  sets `ONT_FLAG`. Observed in production on 2026-08-16: failures 1-3,
+  `Full WAN restart #1 of 3`, gateway replaced, source policy switched to
+  `pd-preferred`, IPv6 healthy -- and no closure line.
+- New `restart_incident` state records the incident's restart ordinal.
+  Presence of this marker, never the cumulative shared `disruption_count`, is
+  what proves the current incident required a restart; a routine healthy tick
+  in a boot that saw an earlier restart therefore emits nothing.
+- Closure precedence across all positive-health paths is
+  critical/hold > restart-assisted > ordinary, so exactly one notice fires per
+  incident.
+- The marker is cleared only by a positive-health closure or by ownership
+  passing to the critical/hold path.
+- All three `reset_recovery_state()` call sites now emit a closure first. The
+  `try_128_bootstrap()` success path (reachable only with
+  `BOOTSTRAP_ENABLED=1`) previously cleared incident state with no
+  notification at all; the bootstrap mechanism itself is unchanged and still
+  owns no closure policy.
+
+**Incident duration**
+
+- New `incident_start` state file records epoch seconds on the `fail_count`
+  `0 -> 1` transition only, and is never overwritten while the incident stays
+  open. Cleared by `reset_recovery_state()` and by `do_wan_restart()`, so an
+  escalated incident can only ever close through the critical path.
+- Duration is reported only when it is reliably derivable: the marker must
+  exist, parse as a positive integer, and yield a delta within a 24-hour sanity
+  ceiling. Otherwise the clause is omitted entirely rather than guessed.
+
+**Evidence-based failure wording**
+
+- `Connectivity failure N (prefix present, gateway broken or route dead)`
+  asserted a root cause the watchdog has not established at that point.
+  Replaced with wording limited to what the code has actually proven:
+
+  ```
+  IPv6 connectivity failure 1/3 confirmed. Delegated prefix and default route
+  are present, but PD-source Internet reachability failed after confirmation
+  and gateway recovery attempts. Current gateway: fe80::1. No WAN restart
+  performed yet.
+  ```
+
+- The gateway clause appears only when `current_default_gw()` actually returns
+  one; the restart clause only below the escalation threshold. The escalation
+  threshold is now the named `FAIL_LIMIT` so the message and the escalation
+  test cannot drift apart.
+
+**Release note**
+
+- The ordinary-recovery behavior was designed for a v3.9.10 that was never
+  committed, tagged, or pushed. v3.10.0 was branched directly from v3.9.9
+  (`6451d35`'s parent is `7e7566e` = `v3.9.9`) and therefore never contained
+  it. This was an integration omission, not a regression: the symbols appear in
+  no commit in the repository's history. The design's own safeguard was a
+  manual "Discord test D5" that never became an executable test, which is why
+  nothing failed. `tests/test-ordinary-recovery.sh` is that missing test.
+
+**Testing**
+
+- `tests/test-ordinary-recovery.sh` (new, 64 assertions) covers both recovery
+  paths, the silent `fail_count = 0` cases, marker lifecycle, duplicate
+  suppression, duration formatting and all its degenerate inputs, gateway
+  provability, single-line output, and budget preservation.
+- `tests/test-ash-compat.sh` (new, 30 assertions) parses every router-side
+  script under each POSIX shell present and statically scans for bashisms
+  absent from BusyBox ash. Runs `busybox ash -n` automatically when busybox is
+  installed.
+- `tests/test-reachability-confirmation.sh` updated for the new failure wording
+  and marker assertions.
 
 ### v3.10.0
 

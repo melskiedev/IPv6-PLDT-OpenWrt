@@ -1,6 +1,12 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
+# v3.10.1: ordinary-recovery closure. A confirmed connectivity incident that ends
+#          without a full WAN restart now emits one compact recovery log line
+#          (fail_count > 0 -> healthy). This is a SEPARATE mechanism from
+#          notify_ipv6_recovered(), which remains the critical/ONT-alert closure.
+#          Also replaces the speculative "gateway broken or route dead" failure
+#          wording with evidence-based wording.
 # v3.10.0: PD-first source-aware health model. Full IPv6 health requires a delegated
 #          prefix and a PD-derived LAN source. A WAN IA_NA /128 is OPTIONAL; it never
 #          substitutes for IA_PD/LAN health and may be retained when present.
@@ -112,6 +118,13 @@ WAN_RESTART_COOLDOWN="${WAN_RESTART_COOLDOWN:-1200}"
 # How many full WAN restarts before stopping and requiring manual ONT powercycle.
 WAN_RESTART_LIMIT="${WAN_RESTART_LIMIT:-3}"
 
+# v3.10.1: consecutive confirmed connectivity failures that escalate to a full
+# WAN restart. Was an inline literal 3 at the escalation branch; naming it keeps
+# the "failure N/LIMIT confirmed" log and the escalation threshold from drifting
+# apart. Deliberately NOT overridable from the config file: changing it would
+# alter escalation behavior, which is out of scope for a reporting fix.
+FAIL_LIMIT=3
+
 # ===== STAGE C2: SHARED WAN-RECOVERY COORDINATOR INTEGRATION =====
 # The shared coordinator (wan-recovery-common) owns the serialization lock,
 # same-boot full-WAN disruption budget, shared disruption hold, and
@@ -205,6 +218,28 @@ RECOVERY_HOLD_FILE="$STATE_DIR/recovery_hold"
 HOLD_STATUS_FILE="$STATE_DIR/hold_status"
 GOOD_GW_FILE="$STATE_DIR/good_gateway"
 TIER0_FAIL_FILE="$STATE_DIR/tier0_fail_count"
+# v3.10.1: epoch seconds marking the start of the current ORDINARY connectivity
+# incident. Written once when FAILS transitions 0 -> 1, never overwritten while
+# the incident is open, and cleared by reset_recovery_state() and
+# do_wan_restart(). Used only to compute an approximate incident duration for
+# the ordinary-recovery log line; it is never load-bearing for any decision.
+INCIDENT_START_FILE="$STATE_DIR/incident_start"
+# v3.10.1: marks an IPv6 incident that escalated to a full WAN restart and has
+# NOT yet been positively closed. Contains this incident's restart ordinal (the
+# same-boot disruption count at the moment the restart executed), so the closure
+# can name the right restart even after later restarts move the shared counter.
+#
+# Why a dedicated marker rather than the shared disruption_count: that counter is
+# same-boot CUMULATIVE state shared across protocols. A healthy tick with
+# disruption_count=1 cannot distinguish "this incident needed a restart and is
+# still open" from "a restart happened earlier this boot for an incident that
+# already closed". Presence of this marker is the only unambiguous signal, and
+# is what keeps a routine healthy tick from emitting a false recovery notice.
+#
+# Lives in STATE_DIR, which the wan6 ifdown/ifup lifecycle never clears, so the
+# marker survives the WAN restart it describes. It dies with /tmp at reboot,
+# which correctly ends a same-boot incident.
+RESTART_INCIDENT_FILE="$STATE_DIR/restart_incident"
 WAN6_PENDING_SEEN_FILE="$STATE_DIR/wan6_pending_seen"
 # v3.10.0 Phase 1C: second small marker file recording that the current
 # pending acquisition has already had its grace expire. Prevents the watchdog
@@ -1881,6 +1916,13 @@ reset_recovery_state() {
         rm -f "$HOLD_STATUS_FILE"
     fi
     rm -f "$PREFIX_BACKOFF_FILE"
+    # v3.10.1: the incident is closed once counters are reset. Callers that want
+    # to report it MUST call the notifiers BEFORE this function, while FAILS and
+    # both markers are still readable. All three call sites of this function are
+    # positive-health closures (happy path, fix_gateway -> ipv6_ok, and a
+    # successful try_128_bootstrap), which is exactly when clearing is correct.
+    rm -f "$INCIDENT_START_FILE"
+    rm -f "$RESTART_INCIDENT_FILE"
 }
 
 # Stage C2: do_wan_restart is now a thin helper that performs the IPv6-
@@ -1900,6 +1942,15 @@ do_wan_restart() {
     echo 0 > "$FAIL_FILE"
     echo 0 > "$TIER0_FAIL_FILE"
     rm -f "$PREFIX_BACKOFF_FILE"
+    # v3.10.1: a full WAN restart escalates the incident beyond "ordinary".
+    # Clearing the start marker guarantees it can never close as class A.
+    rm -f "$INCIDENT_START_FILE"
+
+    # v3.10.1: open the restart-assisted incident. Recording the ordinal here,
+    # rather than reading the shared counter at closure time, keeps the closure
+    # accurate if another restart occurs before this incident is closed.
+    # WAN_RESTARTS was just read back from the coordinator immediately above.
+    echo "$WAN_RESTARTS" > "$RESTART_INCIDENT_FILE"
 
     # Mirror shared state -> legacy for external tools/forensics.
     sync_legacy_state
@@ -2010,6 +2061,137 @@ RECPAYLOAD
     fi
 }
 
+# ===== v3.10.1: ORDINARY RECOVERY CLOSURE =====
+# Approximate duration of the currently open ordinary incident, printed as a
+# compact human string. Prints nothing and returns 1 unless the marker exists,
+# parses as a positive integer, and yields a plausible delta. /tmp state does
+# not survive reboot, so a missing marker is normal and never an error.
+ORDINARY_MAX_INCIDENT_SECS=86400
+ordinary_incident_duration() {
+    local start delta
+
+    [ -f "$INCIDENT_START_FILE" ] || return 1
+    start=$(sanitize_int "$(cat "$INCIDENT_START_FILE" 2>/dev/null | tr -d '[:space:]')")
+    [ "$start" -gt 0 ] || return 1
+
+    # NOW is captured once in the runtime-state block; fall back if unset.
+    delta=$(sanitize_int "$NOW")
+    [ "$delta" -gt 0 ] || delta=$(date +%s)
+    delta=$((delta - start))
+
+    [ "$delta" -gt 0 ] || return 1
+    [ "$delta" -le "$ORDINARY_MAX_INCIDENT_SECS" ] || return 1
+
+    if [ "$delta" -lt 90 ]; then
+        printf '%ds' "$delta"
+    elif [ "$delta" -lt 5400 ]; then
+        printf '%dm' "$((delta / 60))"
+    else
+        printf '%dh %dm' "$((delta / 3600))" "$(( (delta % 3600) / 60 ))"
+    fi
+    return 0
+}
+
+# Ordinary recovery notice: a confirmed connectivity incident ended WITHOUT a
+# full WAN restart and WITHOUT a critical/ONT alert. Emits exactly one compact
+# log line, which the existing ipv6-watchdog -> ipv6-discord-logger tag match
+# forwards to Discord. Deliberately performs NO curl of its own: the critical
+# path (notify_ipv6_recovered) owns direct webhook delivery.
+#
+# Silent (returns 0, logs nothing) when:
+#   - fails is 0 or unparseable   -> nothing was ever confirmed broken;
+#   - ONT_FLAG exists             -> critical closure owns this incident, so
+#                                    emitting here would duplicate it;
+#   - a recovery hold is active   -> the hold branch owns its own state-change
+#                                    logging and exits before the ordinary paths;
+#   - a restart marker exists     -> this incident escalated to a full WAN
+#                                    restart, so the restart-assisted closure
+#                                    owns it. Closure precedence is
+#                                    critical/hold > restart-assisted > ordinary.
+notify_ordinary_recovery() {
+    local fails="$1"
+    local msg gw dur cycles
+
+    fails=$(sanitize_int "$fails")
+    [ "$fails" -gt 0 ] || return 0
+
+    # --- Duplicate suppression (see notify_ipv6_recovered) ---
+    [ -f "$ONT_FLAG" ] && return 0
+    recovery_hold_active && return 0
+    [ -f "$RESTART_INCIDENT_FILE" ] && return 0
+
+    if [ "$fails" -eq 1 ]; then
+        cycles="cycle"
+    else
+        cycles="cycles"
+    fi
+    msg="IPv6 connectivity recovered after $fails confirmed failed watchdog $cycles."
+
+    # Gateway is reported ONLY when the kernel actually yields one.
+    gw=$(current_default_gw)
+    [ -n "$gw" ] && msg="$msg Current gateway: $gw."
+
+    # The watchdog never establishes a root cause on this path. Say so.
+    msg="$msg Cause was not determined."
+
+    # Unconditional and provable: reaching this line means the restart marker is
+    # absent, so THIS incident triggered no full WAN restart. Previously this was
+    # gated on the cumulative same-boot WAN_RESTARTS, which wrongly suppressed a
+    # true statement whenever any earlier, unrelated incident had restarted the
+    # WAN this boot.
+    msg="$msg No WAN restart was required."
+
+    if dur=$(ordinary_incident_duration); then
+        [ -n "$dur" ] && msg="$msg Approximate incident duration: $dur."
+    fi
+
+    log "$msg"
+}
+
+# Restart-assisted recovery notice (class B): a confirmed incident escalated to
+# a full WAN restart and IPv6 is now positively healthy under the normal
+# PD-first model. Without this, class B closed silently: do_wan_restart() zeroes
+# FAIL_FILE, so the ordinary closure correctly sees FAILS=0, while
+# notify_ipv6_recovered() stays ONT_FLAG-gated and a plain restart never sets
+# ONT_FLAG.
+#
+# Emits one compact log line via the logger path; no direct curl. Callers MUST
+# invoke this BEFORE reset_recovery_state(), which clears the marker.
+#
+# Silent (returns 0, logs nothing) when:
+#   - no restart marker        -> this incident required no restart, or there is
+#                                 no open incident at all. A cumulative
+#                                 disruption_count is NEVER treated as proof;
+#   - ONT_FLAG / hold active   -> critical closure owns the incident.
+notify_restart_recovery() {
+    local restart_no msg gw
+
+    [ -f "$RESTART_INCIDENT_FILE" ] || return 0
+
+    # --- Closure precedence: critical/hold outranks restart-assisted ---
+    [ -f "$ONT_FLAG" ] && return 0
+    recovery_hold_active && return 0
+
+    restart_no=$(sanitize_int "$(cat "$RESTART_INCIDENT_FILE" 2>/dev/null | tr -d '[:space:]')")
+    # Corrupt or empty marker: fall back to the shared counter rather than
+    # printing "#0". The marker's PRESENCE is the decision; its value is display.
+    [ "$restart_no" -gt 0 ] || restart_no=$(sanitize_int "$WAN_RESTARTS")
+
+    msg="IPv6 connectivity recovered after full WAN restart #$restart_no of $WAN_RESTART_LIMIT."
+
+    gw=$(current_default_gw)
+    [ -n "$gw" ] && msg="$msg Current gateway: $gw."
+
+    # Provable: every caller reaches this only past an ipv6_ok() gate, whose
+    # Layer 5 is pd_internet_ok -- PD-source-bound, never WAN128 or unbound ping.
+    msg="$msg PD-source Internet connectivity verified."
+
+    # The restart is what the watchdog DID, not why the fault occurred.
+    msg="$msg Cause was not determined."
+
+    log "$msg"
+}
+
 # Stage C2: Centralized WAN restart escalation via the shared coordinator.
 # The coordinator owns the serialization lock, same-boot disruption budget,
 # shared hold, accounting-before-ifdown, and the actual ifdown/ifup lifecycle.
@@ -2023,6 +2205,9 @@ maybe_wan_restart() {
         if [ ! -f "$ONT_FLAG" ]; then
             notify_ont_powercycle "$WAN_RESTARTS"
             touch "$ONT_FLAG"
+            # v3.10.1: incident escalated into critical/ONT ownership; only the
+            # critical path may close it from here.
+            rm -f "$RESTART_INCIDENT_FILE"
         else
             log "$reason: restart limit reached, awaiting manual ONT powercycle"
         fi
@@ -2368,12 +2553,19 @@ if recovery_hold_active; then
         log "Recovery hold: IPv6 spontaneously recovered; preserving WAN restart budget until reboot"
         notify_ipv6_recovered "IPv6 recovered after critical failure. Recovery hold remains active: $WAN_RESTARTS/$WAN_RESTART_LIMIT full WAN restarts used this boot. Disruptive recovery remains disabled until router reboot." 1
         cleanup_deprecated_v6
+        # v3.10.1: the critical closure has now taken ownership of, and closed,
+        # any restart-assisted incident that was still open. Retire the marker
+        # so it can never produce a second closure for the same incident.
+        rm -f "$RESTART_INCIDENT_FILE"
     fi
 
     # --- ONT critical alert (one-shot, independent of state logging) ---
     if [ "$hold_state" != "recovered" ] && [ ! -f "$ONT_FLAG" ]; then
         notify_ont_powercycle "$WAN_RESTARTS"
         touch "$ONT_FLAG"
+        # v3.10.1: the incident has escalated into critical/ONT ownership. From
+        # here only the critical path may close it.
+        rm -f "$RESTART_INCIDENT_FILE"
     fi
 
     exit 0
@@ -2512,6 +2704,14 @@ ensure_router_source_policy
 if ipv6_ok; then
     notify_ipv6_recovered "IPv6 connectivity restored. Non-budget recovery state reset; same-boot WAN restart budget preserved."
 
+    # v3.10.1: incident closure, in precedence order. Exactly one of these three
+    # can emit: notify_ipv6_recovered above is ONT_FLAG-gated (critical/hold),
+    # notify_restart_recovery requires the restart marker, and
+    # notify_ordinary_recovery is suppressed by both. All MUST run before
+    # reset_recovery_state, which clears the counters and both markers.
+    notify_restart_recovery
+    notify_ordinary_recovery "$FAILS"
+
     reset_recovery_state
     cleanup_deprecated_v6
     exit 0
@@ -2525,6 +2725,9 @@ if ! has_prefix; then
         if [ ! -f "$ONT_FLAG" ]; then
             notify_ont_powercycle "$WAN_RESTARTS"
             touch "$ONT_FLAG"
+            # v3.10.1: incident escalated into critical/ONT ownership; only the
+            # critical path may close it from here.
+            rm -f "$RESTART_INCIDENT_FILE"
         else
             log "Awaiting manual ONT powercycle (restart limit reached), no action taken"
         fi
@@ -2586,6 +2789,20 @@ if ! has_prefix; then
         if [ "$BOOTSTRAP_ENABLED" = "1" ]; then
             log "No prefix (attempt $PREFIX_FAILS), attempting bounded IA_NA-assisted bootstrap, backoff ${BACKOFF_SECS}s"
             if try_128_bootstrap; then
+                # v3.10.1: this is a positive-health closure -- try_128_bootstrap
+                # returns 0 only past its B9 pd_internet_ok gate -- so an incident
+                # that is still open MUST be closed here before
+                # reset_recovery_state() erases FAILS and both markers. Previously
+                # this site cleared state with no notification at all, silently
+                # swallowing a restart-assisted or ordinary incident.
+                #
+                # Same three notifiers, same precedence, as the other two
+                # positive-health paths: critical/hold > restart-assisted >
+                # ordinary. Each self-gates, so no decision logic is duplicated
+                # here and at most one line is emitted.
+                notify_ipv6_recovered "IPv6 connectivity restored after IA_NA-assisted bootstrap. Non-budget recovery state reset; same-boot WAN restart budget preserved."
+                notify_restart_recovery
+                notify_ordinary_recovery "$FAILS"
                 reset_recovery_state
                 cleanup_deprecated_v6
             fi
@@ -2611,6 +2828,16 @@ if fix_gateway; then
     # post-fix ipv6_ok validation so the ping reflects the corrected source.
     ensure_router_source_policy
     if ipv6_ok; then
+        # v3.10.1: this path previously reset state with no notification at all,
+        # so a repaired incident closed silently even after a critical alert.
+        # All three notifiers now run here, mirroring the happy path exactly:
+        # notify_ipv6_recovered is ONT_FLAG-gated (critical/hold),
+        # notify_restart_recovery requires the restart marker, and
+        # notify_ordinary_recovery is suppressed by both. Precedence is
+        # critical/hold > restart-assisted > ordinary, so exactly one can fire.
+        notify_ipv6_recovered "IPv6 connectivity restored after gateway repair. Non-budget recovery state reset; same-boot WAN restart budget preserved."
+        notify_restart_recovery
+        notify_ordinary_recovery "$FAILS"
         reset_recovery_state
         cleanup_deprecated_v6
         exit 0
@@ -2627,11 +2854,31 @@ if has_prefix && ip -6 route show default dev "$WAN_DEV" | grep -q default; then
     log "Validation failed after confirmation: prefix and route exist but internet unreachable"
 fi
 
+# v3.10.1: open the ordinary incident on the 0 -> 1 transition only. Never
+# overwritten while the incident stays open, so the recorded start time is the
+# FIRST confirmed failure, not the most recent one.
+if [ "$FAILS" -eq 0 ] && [ ! -f "$INCIDENT_START_FILE" ]; then
+    date +%s > "$INCIDENT_START_FILE"
+fi
+
 FAILS=$((FAILS + 1))
 echo "$FAILS" > "$FAIL_FILE"
-log "Connectivity failure $FAILS (prefix present, gateway broken or route dead)"
 
-if [ "$FAILS" -ge 3 ]; then
+# v3.10.1: evidence-based failure wording. Every clause below corresponds to
+# something this code path has actually proven: has_prefix and the default
+# route were re-verified immediately above, pd_internet_ok failed both before
+# and after REACHABILITY_CONFIRM_DELAY, and fix_gateway either returned
+# non-zero or its post-repair ipv6_ok check failed. The previous wording
+# ("gateway broken or route dead") asserted a root cause that is precisely
+# what remains undetermined at this point.
+FAIL_MSG="IPv6 connectivity failure $FAILS/$FAIL_LIMIT confirmed."
+FAIL_MSG="$FAIL_MSG Delegated prefix and default route are present, but PD-source Internet reachability failed after confirmation and gateway recovery attempts."
+FAIL_GW=$(current_default_gw)
+[ -n "$FAIL_GW" ] && FAIL_MSG="$FAIL_MSG Current gateway: $FAIL_GW."
+[ "$FAILS" -lt "$FAIL_LIMIT" ] && FAIL_MSG="$FAIL_MSG No WAN restart performed yet."
+log "$FAIL_MSG"
+
+if [ "$FAILS" -ge "$FAIL_LIMIT" ]; then
     maybe_wan_restart "3 consecutive connectivity failures"
     exit 0
 fi

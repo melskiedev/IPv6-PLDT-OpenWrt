@@ -395,6 +395,15 @@ assert_file_not_exists() {
     fi
 }
 
+assert_file_exists() {
+    if [ -f "$1" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: expected file $(basename "$1") to exist"
+    fi
+}
+
 reset_state() {
     rm -rf "$STATE_DIR"/* 2>/dev/null
     rm -f "$CTRL_DIR"/* 2>/dev/null
@@ -485,8 +494,15 @@ seed_healthy_layer12
 set_ping_seq fail fail fail fail fail fail fail fail fail fail
 run_watchdog
 assert_contains "Validation failed after confirmation: prefix and route exist but internet unreachable"
-assert_contains "Connectivity failure 1"
+# v3.10.1: evidence-based failure wording replaced the speculative
+# "Connectivity failure N (prefix present, gateway broken or route dead)".
+assert_contains "IPv6 connectivity failure 1/3 confirmed."
+assert_contains "PD-source Internet reachability failed after confirmation and gateway recovery attempts"
+assert_contains "No WAN restart performed yet."
+assert_not_contains "gateway broken or route dead"
 assert_file_eq "$STATE_DIR/fail_count" "1"
+# v3.10.1: the incident marker opens on the 0 -> 1 transition.
+assert_file_exists "$STATE_DIR/incident_start"
 echo "  done (pass=$PASS fail=$FAIL)"
 
 echo "=== Test 5: Three persistent failures preserve existing escalation ==="
@@ -498,7 +514,9 @@ echo "2" > "$STATE_DIR/fail_count"
 set_ping_seq fail fail fail fail fail fail fail fail fail fail
 run_watchdog
 assert_contains "Validation failed after confirmation: prefix and route exist but internet unreachable"
-assert_contains "Connectivity failure 3"
+assert_contains "IPv6 connectivity failure 3/3 confirmed."
+# At the escalation threshold the "no restart yet" clause must NOT appear.
+assert_not_contains "No WAN restart performed yet."
 assert_contains "3 consecutive connectivity failures"
 # do_wan_restart increments WAN_RESTARTS and logs. The escalation log
 # confirms the existing three-failure path still fires.

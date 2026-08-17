@@ -131,6 +131,11 @@ PREFIX_BACKOFF_FILE="$STATE_DIR/prefix_next_attempt"
 ONT_FLAG="$STATE_DIR/ont_notified"
 RECOVERY_HOLD_FILE="$STATE_DIR/recovery_hold"
 HOLD_STATUS_FILE="$STATE_DIR/hold_status"
+# v3.10.1 incident markers. Declared here so reset_recovery_state() operates on
+# real paths inside this harness rather than on empty variables, which keeps the
+# counter-preservation assertions below honest.
+INCIDENT_START_FILE="$STATE_DIR/incident_start"
+RESTART_INCIDENT_FILE="$STATE_DIR/restart_incident"
 WAN_RESTARTS=0
 NOW=$(date +%s)
 
@@ -598,6 +603,15 @@ chmod +x "$MOCK_DIR/logger"
 
 build_mocks
 
+# --- Mock isolation guard ---------------------------------------------------
+# All mocks are created in one block by build_mocks() above, and every test
+# runs after this point, so a single enforcement call covers the whole suite.
+# jsonfilter and logger are named alongside the applets even though they are
+# not applets today, so a future BusyBox cannot start shadowing them silently.
+# See tests/lib/mock-isolation.sh for why this is needed at all.
+. "$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+mock_isolation_enforce MOCK_DIR "uci ubus ip ping6 ifdown ifup sleep jsonfilter logger"
+
 # ================================================================
 # Per-test setup
 # ================================================================
@@ -972,6 +986,78 @@ test_R() {
     assert_eq "legacy recovery hold not created" "$(test -f "$RECOVERY_HOLD_FILE" && echo yes || echo no)" "no"
 }
 
+# R2. v3.10.1: the bootstrap MECHANISM owns no incident-closure policy.
+# try_128_bootstrap must never clear the incident markers and must never emit a
+# recovery closure itself -- both belong to its call site, which applies the
+# critical/hold > restart-assisted > ordinary precedence. This pins the
+# separation so a future change cannot quietly move closure logic into the
+# mechanism (where the no-prefix ladder could bypass it).
+test_R2() {
+    echo "--- R2: bootstrap mechanism does not close or clear incidents ---"
+    : > "$WATCHDOG_LOG"
+    echo "2" > "$FAIL_FILE"
+    echo "1" > "$RESTART_INCIDENT_FILE"
+    echo "1699999000" > "$INCIDENT_START_FILE"
+    # Full-success scenario, identical in shape to test K.
+    set_scenario "PREFIX_ADDR" "2001:db8:7e3:7700::"
+    set_scenario "WAN128_ADDR" "2001:db8::1"
+    set_scenario "PD_OK_GATEWAYS" "fe80::aaaa"
+    add_route "default via fe80::aaaa dev eth1 metric 512"
+    add_route "default from 2001:db8:7e3:7700::/56 via fe80::aaaa dev eth1 metric 512"
+    add_neigh "fe80::aaaa lladdr aa:aa:aa:aa:aa:aa dev eth1 router"
+    try_128_bootstrap
+    rc=$?
+    assert_eq "bootstrap succeeded" "$rc" "0"
+    # The mechanism leaves incident state entirely alone.
+    assert_eq "restart marker untouched by mechanism" "$(cat "$RESTART_INCIDENT_FILE" 2>/dev/null)" "1"
+    assert_eq "incident_start untouched by mechanism" "$(cat "$INCIDENT_START_FILE" 2>/dev/null)" "1699999000"
+    assert_eq "FAIL_FILE untouched by mechanism" "$(cat "$FAIL_FILE")" "2"
+    # And emits no closure of its own.
+    assert_not_contains "mechanism emits no restart-assisted closure" \
+        "recovered after full WAN restart" "$WATCHDOG_LOG"
+    assert_not_contains "mechanism emits no ordinary closure" \
+        "confirmed failed watchdog" "$WATCHDOG_LOG"
+}
+
+# R3. Mock isolation guard: a deliberately broken mock setup must abort BEFORE
+# any test runs, and must never let real host ifdown/ifup execute.
+#
+# Runs this same suite as a subprocess with MOCK_ISOLATION_BREAK=1, which
+# removes the function shims and empties MOCK_DIR -- reproducing the exact
+# pre-fix condition under `busybox ash`, where bare ifdown/ifup fell through to
+# BusyBox applets and hit the real host ("can't open '/etc/network/interfaces'").
+# The guard must exit 2 with no test having executed and no real ifdown/ifup
+# invocation. Repeated for every shell available here, so the protection is
+# proven for dash and BusyBox ash, not just the one running this file.
+test_R3() {
+    echo "--- R3: broken mock setup aborts before real ifdown/ifup ---"
+    guard_out="$TEST_ROOT/guard_probe.out"
+
+    shells="sh"
+    command -v dash >/dev/null 2>&1 && shells="$shells dash"
+    command -v busybox >/dev/null 2>&1 && shells="$shells busybox-ash"
+
+    for s in $shells; do
+        case "$s" in
+            busybox-ash) MOCK_ISOLATION_BREAK=1 busybox ash "$SCRIPT_DIR/tests/test-bootstrap.sh" >"$guard_out" 2>&1 ;;
+            *)           MOCK_ISOLATION_BREAK=1 "$s" "$SCRIPT_DIR/tests/test-bootstrap.sh" >"$guard_out" 2>&1 ;;
+        esac
+        rc=$?
+        assert_eq "[$s] guard aborts with exit 2" "$rc" "2"
+        assert_contains "[$s] guard explains the failure" \
+            "mock isolation check failed" "$guard_out"
+        assert_contains "[$s] guard refuses to run tests" \
+            "refusing to run tests" "$guard_out"
+        # The decisive assertion: the real host ifdown/ifup never ran.
+        assert_not_contains "[$s] real ifdown/ifup never invoked" \
+            "/etc/network/interfaces" "$guard_out"
+        # And no bootstrap test produced output before the abort.
+        assert_not_contains "[$s] no test executed before abort" \
+            "bootstrap hardening tests" "$guard_out"
+    done
+    rm -f "$guard_out"
+}
+
 # S. Successful bootstrap does not modify clientid/duid
 test_S() {
     echo "--- S: no clientid/duid modification ---"
@@ -1089,7 +1175,7 @@ test_W() {
 # ================================================================
 echo "=== Phase 3: bootstrap hardening tests ==="
 
-BOOT_TESTS="${BOOT_TESTS:-A B C D E F G H I J K L M N O P Q R S T U V W}"
+BOOT_TESTS="${BOOT_TESTS:-A B C D E F G H I J K L M N O P Q R R2 R3 S T U V W}"
 for t in $BOOT_TESTS; do
     run_test "test_$t"
 done

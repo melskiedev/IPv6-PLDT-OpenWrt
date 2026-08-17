@@ -195,6 +195,19 @@ fi
 EOF
     chmod +x "$STUB_DIR/date"
 
+    # --- Mock isolation guard -----------------------------------------------
+    # This suite rebuilds STUB_DIR for EVERY test
+    # (STUB_DIR="$TEST_ROOT/stubs-$$-$TEST_ID"), so the guard lives inside
+    # build_env, after the last stub is written and before the library is
+    # sourced. Enforcing by variable NAME means the shims re-resolve STUB_DIR
+    # on each call, so they always reach the current test's stubs -- pinning
+    # the value here would silently run every test against the first test's
+    # stubs. date, ifdown, ifup and sleep are BusyBox applets. See
+    # tests/lib/mock-isolation.sh.
+    command -v mock_isolation_enforce >/dev/null 2>&1 || \
+        . "$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+    mock_isolation_enforce STUB_DIR "date flock ifdown ifup sleep"
+
     # log files for ifdown/ifup/sleep
     IFDOWN_LOG="$STATE_DIR/ifdown.log"
     IFUP_LOG="$STATE_DIR/ifup.log"
@@ -253,6 +266,24 @@ count_ifup() {
     n=$(grep -c "^$1$" "$IFUP_LOG" 2>/dev/null)
     echo "${n:-0}"
 }
+
+# --- Mock isolation preflight -----------------------------------------------
+# build_env() enforces the guard per test, but it is called from inside each
+# test, AFTER that test has already printed its header. With isolation broken
+# that means a scenario would appear to start before the abort. Run one
+# enforcement here, before any test, against a throwaway stub directory so the
+# failure surfaces first. The per-test call in build_env still re-verifies each
+# freshly rebuilt STUB_DIR; because the shims resolve STUB_DIR by NAME, they
+# follow the reassignment automatically.
+STUB_DIR="$TEST_ROOT/stubs-preflight"
+mkdir -p "$STUB_DIR"
+for _pf in date flock ifdown ifup sleep; do
+    printf '#!/bin/sh\nexit 0\n' > "$STUB_DIR/$_pf"
+    chmod +x "$STUB_DIR/$_pf"
+done
+unset _pf
+. "$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+mock_isolation_enforce STUB_DIR "date flock ifdown ifup sleep"
 
 # ================================================================
 # Tests
