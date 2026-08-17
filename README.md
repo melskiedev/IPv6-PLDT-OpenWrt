@@ -2175,8 +2175,8 @@ scripts are internal constants, not tunables.
 | `STICKY_GATEWAY` | `0` | Re-pin the last known-good gateway when RA replaces it with a dead one | Enable (`1`) only where dead gateway advertisements are a known problem |
 | `REACHABILITY_CONFIRM_DELAY` | `3` | Seconds before the second reachability check. Suppresses alerts from brief provider drops | Rarely. Non-numeric falls back to `3`; values above `30` are capped at `30`; `0` disables confirmation |
 | `CLEANUP_DEPRECATED_LAN` | `1` | Remove deprecated LAN addresses left behind after a prefix change | Rarely |
-| `CLEANUP_WAN128` | `0` | Remove the WAN `/128` after a successful bootstrap | Leave at `0`. A healthy `/128` is optional and may be kept |
-| `BOOTSTRAP_ENABLED` | `0` | Enable the experimental IA_NA-assisted prefix bootstrap stage | Leave at `0` unless you are deliberately testing it. Its effectiveness is unproven |
+| `CLEANUP_WAN128` | `0` | Remove the WAN `/128` after a successful bootstrap | Leave at `0`. A healthy `/128` is optional and may be kept. See [D](#d-experimental-bootstrap_enabled-and-cleanup_wan128) |
+| `BOOTSTRAP_ENABLED` | `0` | Enable the experimental IA_NA-assisted prefix bootstrap stage | Leave at `0` unless you are deliberately testing it. Its effectiveness is unproven. See [D](#d-experimental-bootstrap_enabled-and-cleanup_wan128) |
 
 #### B. Recovery limits
 
@@ -2206,6 +2206,159 @@ Defaults inside `wan-recovery-common`. Override them in the same file.
 | `WAN_DOWN_SLEEP` | `30` | Seconds interfaces stay down during a full-WAN cycle |
 | `WAN_UP_SLEEP` | `20` | Seconds between bringing WAN up and bringing wan6 up |
 | `WAN_RECOVERY_COMMON` | `/usr/bin/wan-recovery-common` | Path the watchdog loads the coordinator from |
+
+#### D. Experimental: BOOTSTRAP_ENABLED and CLEANUP_WAN128
+
+##### BOOTSTRAP_ENABLED
+
+**`BOOTSTRAP_ENABLED=0` is the default and the recommended production setting.**
+Leave it at `0`.
+
+`BOOTSTRAP_ENABLED=1` enables the Phase 3 NO_PD bootstrap stage
+(`try_128_bootstrap`) **for controlled testing only**. It is a hypothesis about
+prefix acquisition whose live effectiveness has not been demonstrated. It is not
+a recommended production configuration, it is not a fix for a router that is
+currently healthy, and enabling it will not make recovery faster or more
+reliable.
+
+Invalid values **fail safe to `0`**. Anything that is not exactly `1` — `yes`,
+`true`, `01`, an empty value, a typo — is treated as disabled:
+
+```sh
+BOOTSTRAP_ENABLED="${BOOTSTRAP_ENABLED:-0}"
+case "$BOOTSTRAP_ENABLED" in
+    1) ;;
+    *) BOOTSTRAP_ENABLED=0 ;;
+esac
+```
+
+The override belongs in **`/etc/ipv6-watchdog.conf`**, which the watchdog sources
+on every tick. Do **not** edit `/usr/bin/ipv6-watchdog` — an edited script is
+overwritten by the next upgrade, breaks the installation integrity check, and
+diverges from the published SHA256.
+
+**Check the effective value.** This reproduces the watchdog's own resolution
+and sanitization, so it reports what the watchdog will actually use, not just
+what the file says:
+
+```sh
+BOOTSTRAP_ENABLED=0; [ -f /etc/ipv6-watchdog.conf ] && . /etc/ipv6-watchdog.conf; case "$BOOTSTRAP_ENABLED" in 1) ;; *) BOOTSTRAP_ENABLED=0 ;; esac; echo "effective BOOTSTRAP_ENABLED=$BOOTSTRAP_ENABLED"
+```
+
+**Enable it (controlled testing only).** Removes any existing line first so the
+file cannot end up with two conflicting entries:
+
+```sh
+sed -i '/^[[:space:]]*BOOTSTRAP_ENABLED=/d' /etc/ipv6-watchdog.conf 2>/dev/null; echo 'BOOTSTRAP_ENABLED=1' >> /etc/ipv6-watchdog.conf; chmod 0600 /etc/ipv6-watchdog.conf
+```
+
+**Disable it again (return to the production default):**
+
+```sh
+sed -i '/^[[:space:]]*BOOTSTRAP_ENABLED=/d' /etc/ipv6-watchdog.conf 2>/dev/null; echo "disabled (built-in default is 0)"
+```
+
+Deleting the line is enough — the built-in default is `0`. Setting
+`BOOTSTRAP_ENABLED=0` explicitly is equally valid.
+
+**Verify.** Re-run the effective-value check above, then confirm behavior in the
+log. No service restart is needed; the next tick picks the value up:
+
+```sh
+logread | grep ipv6-watchdog | tail -50
+```
+
+When the no-prefix ladder reaches attempt 3 with the stage **disabled**, you will
+see:
+
+```
+No prefix (attempt 3), Phase 3 bootstrap disabled -- escalating to full WAN restart
+```
+
+With it **enabled** and actually running, you will see:
+
+```
+No prefix (attempt 3), attempting bounded IA_NA-assisted bootstrap, backoff 1800s
+Attempting bounded temporary IA_NA-assisted DHCPv6 recovery stage
+```
+
+##### Only meaningful when committed `reqaddress='none'`
+
+Enabling the experiment is only meaningful on a router whose **committed**
+`network.wan6.reqaddress` is `'none'`. The whole point of the stage is to probe
+whether temporarily *requesting* an IA_NA persuades the provider to grant an
+IA_PD; on a router already committed to `'try'` that is a no-op. If the
+committed value is anything other than `'none'` the bootstrap refuses without
+touching UCI at all, and logs:
+
+```
+Bootstrap refusing: production reqaddress is '<value>', expected 'none' (experimental scope)
+```
+
+Check the committed value, and confirm nothing is left staged:
+
+```sh
+uci get network.wan6.reqaddress; uci changes network
+```
+
+`uci changes network` should print nothing. If it lists a `reqaddress` change,
+you have an uncommitted edit that will confuse the check.
+
+> Read [reqaddress (PROVIDER-DEPENDENT)](#reqaddress-provider-dependent) before
+> changing this value. If your delegated prefix and LAN IPv6 are healthy, do not
+> change `reqaddress` — there is nothing to fix.
+
+##### What the bootstrap does to `reqaddress`
+
+When it runs, the stage **temporarily stages** `reqaddress='try'` and then
+**reverts** it:
+
+1. `uci set network.wan6.reqaddress='try'` — staged, never committed.
+2. One coordinated `wan6` acquisition cycle, then it waits for an IA_PD.
+3. `uci revert network.wan6.reqaddress` — restores the committed value.
+4. A post-revert health gate re-checks that IA_PD, the PD-derived LAN source,
+   coherent routes, and PD-source Internet reachability all **survive** the
+   return to production mode. A prefix that exists only while `'try'` is staged
+   is **not** treated as success.
+
+Because the value is staged and never committed, it does not persist across a
+reboot. If the watchdog is killed mid-run, its exit handler reverts the staged
+value.
+
+##### What the no-prefix ladder does when bootstrap is disabled
+
+With `BOOTSTRAP_ENABLED=0` (the default), the prefix-loss ladder is unchanged and
+the bootstrap is skipped entirely — zero UCI mutation, zero `ifdown`/`ifup`, zero
+route changes, zero counter resets:
+
+| Attempt | Action | Backoff before the next attempt |
+|---|---|---|
+| 1 | Coordinated `wan6` restart | 10 min |
+| 2 | DHCPv6 renew | 20 min |
+| 3 | Escalate to a full WAN restart via the shared coordinator | 30 min (cap) |
+
+Attempt 3 is still subject to the same-boot restart budget, the shared cooldown,
+and the recovery hold. This ladder — not the bootstrap — is the normal prefix
+recovery path.
+
+##### CLEANUP_WAN128 is a separate setting
+
+`CLEANUP_WAN128` is **not** related to `BOOTSTRAP_ENABLED` and does not enable or
+disable anything experimental on its own:
+
+| Value | Meaning |
+|---|---|
+| `0` (default) | **Retain** the WAN `/128`. A healthy IA_NA `/128` is optional and harmless, and is kept |
+| `1` | Opt-in cleanup: remove the WAN `/128` after PD health is confirmed |
+
+Under the v3.10 PD-first health model a WAN `/128` never substitutes for IA_PD
+health, and its presence is not a fault, so there is normally nothing to clean
+up. Leave it at `0`.
+
+One practical consequence worth knowing: `CLEANUP_WAN128` is only read **inside**
+the bootstrap stage. With `BOOTSTRAP_ENABLED=0` it never takes effect at all,
+whatever it is set to. Setting `CLEANUP_WAN128=1` on its own does not cause the
+watchdog to start removing `/128` addresses during normal operation.
 
 #### D. Timing and source policy
 
