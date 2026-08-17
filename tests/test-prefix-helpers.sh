@@ -134,6 +134,23 @@ assert_lan_pd_src_eq() {
     fi
 }
 
+# --- Mock isolation guard, stage 1 of 2 -------------------------------------
+# This suite creates its mocks in TWO stages, so it needs two enforcement
+# calls. Stage 1 covers `ip` only: the get_lan_pd_src assertions below rewrite
+# $STUB_DIR/ip on every call from inside the assert helpers, and `ping6` does
+# not exist yet. Naming ping6 here would (correctly) fail closed.
+#
+# The stub directory and a placeholder `ip` are created here so the guard can
+# prove routing BEFORE the first assertion runs; the helpers then only rewrite
+# the stub's contents at the same path, which the shims still reach.
+# ip and ping6 are both BusyBox applets. See tests/lib/mock-isolation.sh.
+STUB_DIR="$TEST_ROOT/stubs_$$"
+mkdir -p "$STUB_DIR"
+printf '#!/bin/sh\nexit 0\n' > "$STUB_DIR/ip"
+chmod +x "$STUB_DIR/ip"
+. "$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+mock_isolation_enforce STUB_DIR "ip"
+
 # ================================================================
 # A. Existing prefix-membership tests (remain passing)
 # ================================================================
@@ -389,6 +406,13 @@ echo "\$@" >> "$PING6_LOG"
 exit 0
 EOF
 chmod +x "$STUB_DIR/ping6"
+
+# --- Mock isolation guard, stage 2 of 2 -------------------------------------
+# STUB_DIR was reassigned above to the ping-stage directory, which now holds
+# BOTH ip and ping6. Extend the guard to cover ping6 now that it exists.
+# Re-enforcing is idempotent: sentinel injection skips mocks that already have
+# one, and the shims are simply redefined against the current STUB_DIR.
+mock_isolation_enforce STUB_DIR "ip ping6"
 
 LAN_DEV="br-lan"
 PD_ADDR="2001:db8:7e3:7700::"

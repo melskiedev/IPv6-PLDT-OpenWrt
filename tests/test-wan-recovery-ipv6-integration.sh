@@ -154,6 +154,15 @@ exit 1
 EOF
 chmod +x "$MOCK_DIR/jsonfilter"
 
+# --- Mock isolation guard ---------------------------------------------------
+# Every mock is created at top level into a MOCK_DIR that never changes, and
+# build_env plus all tests run after this point, so one enforcement call covers
+# the whole suite. date, ifdown, ifup and sleep are BusyBox applets; without
+# this guard `busybox ash` resolved them ahead of PATH and this suite invoked
+# the REAL host ifdown/ifup. See tests/lib/mock-isolation.sh.
+. "$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+mock_isolation_enforce MOCK_DIR "date flock ifdown ifup sleep ubus jsonfilter"
+
 echo "---" >> "$TEST_ROOT/noop_marker" 2>/dev/null || :
 
 # ================================================================

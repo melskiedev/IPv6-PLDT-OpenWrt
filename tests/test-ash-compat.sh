@@ -177,6 +177,159 @@ assert_grep "duration ceiling uses POSIX test" \
 echo "  done (pass=$PASS fail=$FAIL)"
 
 # ================================================================
+# ================================================================
+# 4. Mock-isolation safety
+# ================================================================
+#
+# Scope note: this is deliberately NARROW. It proves the mock-isolation
+# mechanism itself is sound and fails closed; it does NOT re-run the behavioural
+# suites. Full BusyBox behavioural validation stays a separate sweep
+# (`for t in tests/*.sh; do busybox ash "$t"; done`), because duplicating it
+# here would double CI time and give two places to keep in sync.
+#
+# What is checked:
+#   a. the shared helper parses under every POSIX shell available here;
+#   b. every suite that uses the helper can reach its guard/self-test path;
+#   c. deliberately breaking isolation makes each such suite exit 2;
+#   d. that abort happens BEFORE any real host networking command can run.
+
+echo "=== Mock-isolation safety ==="
+
+MOCK_HELPER="$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+
+# --- a. helper parses under every available POSIX shell ---
+if [ -f "$MOCK_HELPER" ]; then
+    pass
+    for sh_name in $SHELLS; do
+        case "$sh_name" in
+            busybox-ash) busybox ash -n "$MOCK_HELPER" 2>/tmp/mi.err ;;
+            *)           "$sh_name" -n "$MOCK_HELPER" 2>/tmp/mi.err ;;
+        esac
+        if [ $? -eq 0 ]; then
+            pass
+        else
+            fail "tests/lib/mock-isolation.sh does not parse under $sh_name"
+            sed 's/^/      /' /tmp/mi.err
+        fi
+    done
+    rm -f /tmp/mi.err
+else
+    fail "tests/lib/mock-isolation.sh is missing"
+fi
+
+# --- suites that opt into the shared guard ---
+# This file is excluded from its own list: it mentions mock_isolation_enforce
+# in the checks below, and without the exclusion it would re-invoke itself
+# under MOCK_ISOLATION_BREAK=1 and recurse forever.
+GUARDED_SUITES=$(grep -l 'mock_isolation_enforce' "$SCRIPT_DIR"/tests/*.sh 2>/dev/null \
+    | grep -v '/test-ash-compat\.sh$')
+
+if [ -z "$GUARDED_SUITES" ]; then
+    fail "no suite uses mock_isolation_enforce -- the guard is not wired up"
+else
+    pass
+fi
+
+for suite in $GUARDED_SUITES; do
+    sname=$(basename "$suite")
+
+    # --- b. the suite reaches its guard path at all ---
+    # Sourcing the helper and calling enforce must appear together; a suite that
+    # calls enforce without sourcing would die at run time in a confusing way.
+    if grep -q 'tests/lib/mock-isolation.sh' "$suite"; then
+        pass
+    else
+        fail "$sname calls mock_isolation_enforce but never sources the helper"
+    fi
+
+    # --- c + d. break isolation deliberately and require a fail-closed abort ---
+    # MOCK_ISOLATION_BREAK=1 removes the shims and empties the mock directory,
+    # reproducing the pre-fix condition in which bare ifdown/ifup fell through
+    # to BusyBox applets and reached the real host.
+    MOCK_ISOLATION_BREAK=1 sh "$suite" >/tmp/mi_break.out 2>&1
+    rc=$?
+
+    if [ "$rc" -eq 2 ]; then
+        pass
+    else
+        fail "$sname did not fail closed with broken isolation (exit=$rc)"
+        tail -5 /tmp/mi_break.out | sed 's/^/      /'
+    fi
+
+    if grep -q 'mock isolation check failed' /tmp/mi_break.out 2>/dev/null; then
+        pass
+    else
+        fail "$sname aborted without the mock-isolation diagnostic"
+    fi
+
+    # Safety assertion 1: no real host networking command ran.
+    if grep -qE "can't open '/etc/network/interfaces'|RTNETLINK answers" /tmp/mi_break.out 2>/dev/null; then
+        fail "$sname reached a REAL host networking command before aborting"
+        grep -E "interfaces|RTNETLINK" /tmp/mi_break.out | head -3 | sed 's/^/      /'
+    else
+        pass
+    fi
+
+    # Safety assertion 2, the stronger one: NO test scenario started at all.
+    # Absence of a specific error string only proves that one command did not
+    # leak. Proving that not a single assertion ran, and not a single scenario
+    # header printed, proves nothing downstream of the guard executed -- so
+    # real ip/date/sleep/ifdown/ifup cannot have been reached by any path,
+    # including ones that fail silently.
+    if grep -qE '^ *(PASS|FAIL):' /tmp/mi_break.out 2>/dev/null; then
+        fail "$sname executed assertions before the isolation guard aborted"
+        grep -E '^ *(PASS|FAIL):' /tmp/mi_break.out | head -3 | sed 's/^/      /'
+    else
+        pass
+    fi
+
+    if grep -qE '^(=== |--- )' /tmp/mi_break.out 2>/dev/null; then
+        fail "$sname started a test scenario before the isolation guard aborted"
+        grep -E '^(=== |--- )' /tmp/mi_break.out | head -3 | sed 's/^/      /'
+    else
+        pass
+    fi
+done
+rm -f /tmp/mi_break.out
+
+# --- guarded-suite inventory -------------------------------------------------
+# The discovery above must find exactly the suites we expect: no self-match
+# (infinite recursion), and no attempt to execute the helper library itself.
+inventory_count=$(printf '%s\n' $GUARDED_SUITES | grep -c .)
+if [ "$inventory_count" = "6" ]; then
+    pass
+else
+    fail "expected 6 guarded suites, discovered $inventory_count"
+    printf '%s\n' $GUARDED_SUITES | sed 's/^/      /'
+fi
+
+# Each guarded suite must appear exactly once in the discovery list.
+dupes=$(printf '%s\n' $GUARDED_SUITES | sort | uniq -d)
+if [ -z "$dupes" ]; then
+    pass
+else
+    fail "guarded-suite discovery returned duplicates"
+    printf '%s\n' "$dupes" | sed 's/^/      /'
+fi
+
+# The helper library must never be discovered as a runnable suite. It lives in
+# tests/lib/, outside the tests/*.sh glob, but assert it rather than rely on
+# the glob staying that shape.
+if printf '%s\n' $GUARDED_SUITES | grep -q 'mock-isolation\.sh'; then
+    fail "tests/lib/mock-isolation.sh was discovered as a runnable suite"
+else
+    pass
+fi
+
+# And this file must never discover itself.
+if printf '%s\n' $GUARDED_SUITES | grep -q 'test-ash-compat\.sh'; then
+    fail "test-ash-compat.sh discovered itself (would recurse forever)"
+else
+    pass
+fi
+
+echo "  done (pass=$PASS fail=$FAIL)"
+
 echo ""
 echo "=== SUMMARY ==="
 echo "PASS: $PASS"

@@ -603,109 +603,14 @@ chmod +x "$MOCK_DIR/logger"
 
 build_mocks
 
-# ================================================================
-# Mock isolation guard
-# ================================================================
-# Ubuntu builds BusyBox as a STANDALONE SHELL: `busybox ash` resolves BusyBox
-# APPLETS before it ever consults PATH. Of the commands this harness mocks,
-# ip, ping6, ifdown, ifup and sleep ARE applets; uci, ubus and jsonfilter are
-# not. So under `busybox ash tests/test-bootstrap.sh` the applet mocks were
-# silently bypassed and the REAL host ifdown/ifup ran
-# ("can't open '/etc/network/interfaces'"), while the non-applet mocks still
-# worked -- which is exactly why the failure looked partial rather than total.
-# dash has no applet concept and always honours PATH, so the identical suite
-# passed there and the defect stayed invisible.
-#
-# Shell FUNCTIONS outrank both applets and PATH in dash AND BusyBox ash
-# (verified in both), so a thin function per command forces every invocation
-# into MOCK_DIR regardless of which shell runs the suite. The guard below then
-# PROVES that routing and aborts before a single test runs if any command is
-# not the mock.
-#
-# This is a harness-isolation fix only. Production is unaffected: on the router
-# the watchdog is SUPPOSED to call the real ip/ifdown/ifup.
-
-MOCK_SENTINEL="__mock_selftest__"
-
-# Commands that must be proven to resolve inside MOCK_DIR before any test runs.
-REQUIRED_MOCKS="uci ubus ip ping6 ifdown ifup sleep"
-# Also shimmed (not applets today, but shimmed so a future BusyBox cannot
-# silently start shadowing them either).
-EXTRA_MOCKS="jsonfilter logger"
-
-# Give every mock a sentinel response as its first action, before any logging
-# or side effect. Injected here rather than duplicated into each mock body.
-inject_mock_sentinels() {
-    for f in "$MOCK_DIR"/*; do
-        [ -f "$f" ] || continue
-        {
-            echo '#!/bin/sh'
-            echo '[ "$1" = "__mock_selftest__" ] && { echo "MOCK_OK"; exit 0; }'
-            tail -n +2 "$f"
-        } > "$f.sentinel" && mv "$f.sentinel" "$f" && chmod +x "$f"
-    done
-}
-inject_mock_sentinels
-
-# A canary that exists ONLY as a mock. It is not an applet and not a host
-# binary, so if the bare name answers, function-shim dispatch demonstrably
-# works in this shell.
-cat > "$MOCK_DIR/__mock_canary__" <<'EOF'
-#!/bin/sh
-echo "MOCK_OK"
-exit 0
-EOF
-chmod +x "$MOCK_DIR/__mock_canary__"
-
-define_mock_shims() {
-    for _c in $REQUIRED_MOCKS $EXTRA_MOCKS __mock_canary__; do
-        eval "$_c() { \"\$MOCK_DIR\"/$_c \"\$@\"; }"
-    done
-    unset _c
-}
-define_mock_shims
-
-# Deliberate-breakage hook used by the mock-isolation regression test. It
-# simulates the exact pre-fix condition: shims gone, so bare names would fall
-# through to BusyBox applets / real host binaries.
-if [ "${BOOTSTRAP_BREAK_MOCKS:-0}" = "1" ]; then
-    for _c in $REQUIRED_MOCKS $EXTRA_MOCKS __mock_canary__; do
-        unset -f "$_c" 2>/dev/null || true
-    done
-    unset _c
-    rm -f "$MOCK_DIR"/* 2>/dev/null
-fi
-
-mock_guard_abort() {
-    echo "FATAL: mock isolation check failed -- $1" >&2
-    echo "FATAL: refusing to run bootstrap tests; real host commands could be invoked." >&2
-    echo "FATAL: shell=$(readlink -f "/proc/$$/exe" 2>/dev/null || echo unknown) MOCK_DIR=$MOCK_DIR" >&2
-    exit 2
-}
-
-# 1. Prove function-shim dispatch works at all. This uses a name that has no
-#    host binary and no applet, so it can never touch a real command.
-canary_out=$(__mock_canary__ "$MOCK_SENTINEL" 2>/dev/null)
-[ "$canary_out" = "MOCK_OK" ] || \
-    mock_guard_abort "function-shim dispatch is not working (canary returned '$canary_out')"
-
-# 2. Every required mock file must exist and be executable. Checked WITHOUT
-#    invoking anything, so a broken setup cannot reach real ifdown/ifup here.
-for _c in $REQUIRED_MOCKS; do
-    [ -f "$MOCK_DIR/$_c" ] && [ -x "$MOCK_DIR/$_c" ] || \
-        mock_guard_abort "missing or non-executable mock: $MOCK_DIR/$_c"
-done
-unset _c
-
-# 3. Only now, with dispatch proven (1) and every mock present (2), invoke each
-#    bare command name -- the same way the watchdog does -- and require the
-#    mock's sentinel. Steps 1 and 2 guarantee this cannot reach a real binary.
-for _c in $REQUIRED_MOCKS; do
-    _out=$($_c "$MOCK_SENTINEL" 2>/dev/null)
-    [ "$_out" = "MOCK_OK" ] || \
-        mock_guard_abort "'$_c' does not resolve to MOCK_DIR (got '$_out')"
-done
-unset _c _out
+# --- Mock isolation guard ---------------------------------------------------
+# All mocks are created in one block by build_mocks() above, and every test
+# runs after this point, so a single enforcement call covers the whole suite.
+# jsonfilter and logger are named alongside the applets even though they are
+# not applets today, so a future BusyBox cannot start shadowing them silently.
+# See tests/lib/mock-isolation.sh for why this is needed at all.
+. "$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+mock_isolation_enforce MOCK_DIR "uci ubus ip ping6 ifdown ifup sleep jsonfilter logger"
 
 # ================================================================
 # Per-test setup
@@ -1117,7 +1022,7 @@ test_R2() {
 # R3. Mock isolation guard: a deliberately broken mock setup must abort BEFORE
 # any test runs, and must never let real host ifdown/ifup execute.
 #
-# Runs this same suite as a subprocess with BOOTSTRAP_BREAK_MOCKS=1, which
+# Runs this same suite as a subprocess with MOCK_ISOLATION_BREAK=1, which
 # removes the function shims and empties MOCK_DIR -- reproducing the exact
 # pre-fix condition under `busybox ash`, where bare ifdown/ifup fell through to
 # BusyBox applets and hit the real host ("can't open '/etc/network/interfaces'").
@@ -1134,15 +1039,15 @@ test_R3() {
 
     for s in $shells; do
         case "$s" in
-            busybox-ash) BOOTSTRAP_BREAK_MOCKS=1 busybox ash "$SCRIPT_DIR/tests/test-bootstrap.sh" >"$guard_out" 2>&1 ;;
-            *)           BOOTSTRAP_BREAK_MOCKS=1 "$s" "$SCRIPT_DIR/tests/test-bootstrap.sh" >"$guard_out" 2>&1 ;;
+            busybox-ash) MOCK_ISOLATION_BREAK=1 busybox ash "$SCRIPT_DIR/tests/test-bootstrap.sh" >"$guard_out" 2>&1 ;;
+            *)           MOCK_ISOLATION_BREAK=1 "$s" "$SCRIPT_DIR/tests/test-bootstrap.sh" >"$guard_out" 2>&1 ;;
         esac
         rc=$?
         assert_eq "[$s] guard aborts with exit 2" "$rc" "2"
         assert_contains "[$s] guard explains the failure" \
             "mock isolation check failed" "$guard_out"
         assert_contains "[$s] guard refuses to run tests" \
-            "refusing to run bootstrap tests" "$guard_out"
+            "refusing to run tests" "$guard_out"
         # The decisive assertion: the real host ifdown/ifup never ran.
         assert_not_contains "[$s] real ifdown/ifup never invoked" \
             "/etc/network/interfaces" "$guard_out"
