@@ -428,6 +428,14 @@ chmod +x "$MOCK_DIR/sleep"
 
 build_mocks
 
+# --- Mock isolation guard ---------------------------------------------------
+# build_mocks() creates every mock up front into a MOCK_DIR that never changes,
+# and every test runs after this point, so one enforcement call covers the whole
+# suite. ip, ping6 and sleep are BusyBox applets and would otherwise be resolved
+# ahead of PATH under `busybox ash`. See tests/lib/mock-isolation.sh.
+. "$SCRIPT_DIR/tests/lib/mock-isolation.sh"
+mock_isolation_enforce MOCK_DIR "ip ping6 sleep ubus jsonfilter"
+
 # Per-test setup: prepare a fresh route table and neigh table files, and
 # run a test body with PATH pointing at the mocks.
 # Usage: run_test <name> <body-fn>
