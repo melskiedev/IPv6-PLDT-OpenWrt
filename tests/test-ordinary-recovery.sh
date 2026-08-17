@@ -717,9 +717,26 @@ run_watchdog
 assert_ordinary_count 1
 # An ordinary closure must never consume or reset same-boot budget.
 assert_file_eq "$SHARED_DIR/disruption_count" "1"
-# With a restart already used this boot, the "no restart required" clause
-# must NOT be asserted.
-assert_not_contains "No WAN restart was required."
+# The "no restart required" clause describes THIS incident, not the boot. An
+# earlier unrelated incident having spent budget does not make the statement
+# false, so it must still appear. Ownership of a restart-assisted incident is
+# decided by the restart marker (absent here), never by the cumulative
+# same-boot disruption_count -- see tests/test-restart-recovery.sh.
+assert_contains "No WAN restart was required."
+assert_file_not_exists "$STATE_DIR/restart_incident"
+echo "  done (pass=$PASS fail=$FAIL)"
+
+echo "=== Test X: cumulative disruption_count alone never triggers a restart-assisted closure ==="
+reset_state
+seed_healthy_layer12
+seed_fail_count 1
+seed_incident_start 1699999640
+# Budget spent earlier this boot, but no open restart incident.
+echo "2" > "$SHARED_DIR/disruption_count"
+set_ping_seq pass
+run_watchdog
+assert_ordinary_count 1
+assert_not_contains "recovered after full WAN restart"
 echo "  done (pass=$PASS fail=$FAIL)"
 
 # ================================================================
