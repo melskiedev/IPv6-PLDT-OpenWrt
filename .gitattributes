@@ -1,6 +1,5 @@
 # Shell scripts deploy via raw GitHub wget to OpenWrt (LF required).
 ipv6-watchdog text eol=lf
-98-wan6-delay text eol=lf
 99-ipv6-setup text eol=lf
 97-garp text eol=lf
 ipv6-discord-logger text eol=lf

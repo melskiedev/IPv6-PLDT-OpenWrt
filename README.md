@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Version](https://img.shields.io/badge/Version-v3.10.1-blue)](#)
+[![Version](https://img.shields.io/badge/Version-v3.10.2-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.1
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.2
 
 A production-grade IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode, with bounded self-healing: it recovers from transient faults on its own, and stops rather than looping when a fault is not on the router.
 
@@ -852,27 +852,6 @@ Enable and start:
 Use `restart` rather than a manual `kill` followed by `start`. The service is
 procd-managed and manual process handling can produce duplicate instances.
 
-### 98-wan6-delay (LEGACY / OPTIONAL)
-
-**Not part of the core v3.10 stack, and deliberately absent from Quick Deploy.**
-
-It runs on WAN ifup and performs its own `wan6` restart with a fixed delay, to
-work around a startup race where `wan6` begins before the WAN link-local
-address is ready.
-
-It is retained in the repository and still functions. It is excluded from the
-core stack because that `wan6` cycle happens outside the coordination layer, so
-it is not serialized against, or recorded by, the recovery coordinator.
-
-Guidance:
-
-- **Existing deployments:** if your router depends on it today, keep it. There
-  is no automatic removal step and none is recommended here.
-- **New core v3.10 deployments:** do not install it by default. Deploy the core
-  stack first and see whether your hardware needs it at all.
-
-Its future is undecided and no removal is planned in this document.
-
 ---
 
 ## Upgrading an Existing Installation
@@ -891,7 +870,6 @@ for f in /usr/bin/wan-recovery-common \
          /usr/bin/ipv6-watchdog \
          /etc/hotplug.d/iface/99-ipv6-setup \
          /etc/hotplug.d/iface/97-garp \
-         /etc/hotplug.d/iface/98-wan6-delay \
          /usr/bin/ipv6-prefix-tracker \
          /usr/bin/ipv6-discord-logger \
          /etc/init.d/ipv6-discord-logger; do
@@ -1260,12 +1238,6 @@ never participates in disruption at all.
 | `ipv6-discord-logger` | OPTIONAL | Forwards tagged syslog lines to a webhook |
 | `init.d-ipv6-discord-logger` | OPTIONAL | procd service wrapper for the logger |
 | `ipv6-prefix-tracker` | SUPPORTING | Observational prefix logging, refreshes odhcpd on change |
-| `98-wan6-delay` | LEGACY / OPTIONAL | Boot-time wan6 restart delay, retained but not part of core v3.10 |
-
-`98-wan6-delay` is kept in the repository and still works. It is not part of
-the core v3.10 architecture because it performs its own `wan6` restart outside
-the coordination layer described below. Whether it is retired or brought under
-coordination is a separate decision.
 
 ---
 
@@ -2125,29 +2097,6 @@ full `wan` and `wan6` lifecycle. See
 [Recovery Coordination](#recovery-coordination) for the full model and the
 coordinated sequence.
 
-### 98-wan6-delay (LEGACY / OPTIONAL)
-
-**File:** [`98-wan6-delay`](98-wan6-delay) installed at
-`/etc/hotplug.d/iface/98-wan6-delay`
-
-**Not part of the core v3.10 stack and not installed by Quick Deploy.**
-
-On WAN ifup it forces `ifdown wan6`, waits 15 seconds, then `ifup wan6`, to work
-around a startup race where `wan6` begins before the WAN link-local address is
-ready.
-
-It is retained because it still works and some deployments may still depend on
-it. It sits outside the core stack because that `wan6` cycle happens outside the
-coordination layer, so it is neither serialized against nor recorded by the
-recovery coordinator.
-
-- **Existing deployments:** keep it if your router depends on it. No automatic
-  removal is recommended.
-- **New core deployments:** do not install it by default. Deploy the core stack
-  first and see whether your hardware needs it at all.
-
-Its future is undecided and no removal is planned here.
-### Watchdog configuration (`/etc/ipv6-watchdog.conf`)
 
 This file is **optional**. The defaults below are the tested baseline and most
 deployments never need to change any of them. The watchdog sources the file on
@@ -3214,12 +3163,7 @@ EOF
 # If you customized sysctl
 echo '/etc/sysctl.conf' >> /etc/sysupgrade.conf
 
-# Legacy only: if your deployment still relies on 98-wan6-delay
-echo '/etc/hotplug.d/iface/98-wan6-delay' >> /etc/sysupgrade.conf
 ```
-
-`98-wan6-delay` is not part of the core v3.10 stack. Preserve it only if you
-are deliberately keeping it.
 
 ### Configuration file
 
@@ -3609,6 +3553,59 @@ EOF
 ---
 
 ## Changelog
+
+### v3.10.2 — 2026-08-19
+
+Maintenance release. Retires the legacy `98-wan6-delay` helper and cleans up the
+documentation, test inventory, and Git attributes that referenced it. **No
+retained/core router-side script changed**: `ipv6-watchdog`,
+`wan-recovery-common`, `99-ipv6-setup`, and every other retained deployed
+component are byte-identical to v3.10.1. The only router-side artifact removed is
+the retired `98-wan6-delay` helper itself.
+
+**98-wan6-delay retired**
+
+- `98-wan6-delay` has been REMOVED from the repository and from the current
+  installation, backup, component, and sysupgrade-preservation instructions.
+- It ran on WAN ifup and performed its own `wan6` restart with a fixed delay,
+  outside the recovery coordination layer — so that cycle was never serialized
+  against, nor recorded by, the coordinator. Since v3.10.0 it had already been
+  reclassified as legacy and excluded from the core stack and Quick Deploy.
+- Retirement was **production-validated on the two project Flint2 deployments**
+  before removal. One had already run healthily without it, including through a
+  genuine restart-assisted WAN/IPv6 recovery. The other was validated across a
+  full reboot: `wan6` came up normally, `IA_PD` was acquired and delegated to
+  LAN, the initial upstream gateway was unusable and `99-ipv6-setup` discovered
+  the alternate gateway and verified PD-source reachability, `ipv6-watchdog`
+  observed its boot grace and then established the sticky-gateway baseline and
+  source policy, and both IPv4 and IPv6 reachability passed. No full WAN restart
+  occurred and no recovery state was set.
+- **This is not a claim that a boot-timing helper is unnecessary on every
+  OpenWrt deployment.** It was validated as unnecessary on these two Flint2
+  routers, on this firmware, with this stack. Other hardware or firmware may
+  still race on boot.
+
+**Cleanup**
+
+- Removed the `98-wan6-delay` install, backup, component-table, component
+  reference, and `sysupgrade.conf` preserve instructions from the README.
+- Removed its `.gitattributes` LF entry.
+- Removed it from the `ROUTER_SCRIPTS` inventory in
+  `tests/test-ash-compat.sh`.
+- All historical changelog entries referencing `98-wan6-delay` are preserved
+  unchanged as release history.
+
+**Existing deployments**
+
+This release does not modify anything already installed on your router. If a
+copy of `98-wan6-delay` exists on your device it stays there until you remove it
+yourself. Removal is optional. If your hardware genuinely needs the delay, keep it
+— retrieve it from Git history with `git show v3.10.1:98-wan6-delay` and back it
+up before changing anything. If you do retire it, also remove its
+`/etc/sysupgrade.conf` preserve entry, or the entry will outlive the file it
+names.
+
+The active stack is `99-ipv6-setup`, `ipv6-watchdog`, and `wan-recovery-common`.
 
 ### v3.10.1
 

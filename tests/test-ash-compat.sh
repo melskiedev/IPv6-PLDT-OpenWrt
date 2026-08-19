@@ -32,7 +32,7 @@ FAIL=0
 SKIP=0
 
 # Files deployed to the router. Anything here must be BusyBox ash clean.
-ROUTER_SCRIPTS="ipv6-watchdog wan-recovery-common 99-ipv6-setup ipv6-discord-logger init.d-ipv6-discord-logger ipv6-prefix-tracker 97-garp 98-wan6-delay"
+ROUTER_SCRIPTS="ipv6-watchdog wan-recovery-common 99-ipv6-setup ipv6-discord-logger init.d-ipv6-discord-logger ipv6-prefix-tracker 97-garp"
 
 pass() { PASS=$((PASS + 1)); }
 fail() {
