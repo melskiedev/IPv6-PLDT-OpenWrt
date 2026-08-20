@@ -3,9 +3,9 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.x-blue)](#)
 [![ISP](https://img.shields.io/badge/ISP-PLDT%20Fiber-informational)](#)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-success)](#)
-[![Version](https://img.shields.io/badge/Version-v3.10.2-blue)](#)
+[![Version](https://img.shields.io/badge/Version-v3.11.0-blue)](#)
 
-**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.10.2
+**Device:** GL.iNet GL-MT6000 (Flint 2) | **Firmware:** OpenWrt 25.12.5 (vanilla OpenWrt) | **ISP:** PLDT Fiber (Bridge mode) | **WAN:** `eth1` | **Mode:** DHCPv6 + Prefix Delegation | **Version:** v3.11.0
 
 A production-grade IPv6 setup for PLDT Fiber subscribers running OpenWrt in bridge mode, with bounded self-healing: it recovers from transient faults on its own, and stops rather than looping when a fault is not on the router.
 
@@ -3667,7 +3667,7 @@ EOF
 
 ## Changelog
 
-### v3.11.0 — unreleased
+### v3.11.0 — 2026-08-21
 
 Adds one new opt-in runtime policy. **Default off**, so nothing changes for an
 existing deployment that does not enable it. No other behaviour is modified.
@@ -3679,10 +3679,10 @@ existing deployment that does not enable it. No other behaviour is modified.
   Internet reachability while the delegated-prefix path stays healthy.
 - **Not a recovery feature.** It runs only from a tick that has already proven
   full PD-first health, never attempts to restore connectivity, never consumes
-  the shared WAN disruption budget, never modifies hold or cooldown state, and
-  performs no UCI, `wan6`, network, or DHCPv6 change. Recovery ownership always
-  wins: health and the recovery state machine first, then source-policy
-  protection, then this cleanup.
+  or refunds the shared WAN disruption budget, does not directly write hold or
+  cooldown accounting state, and performs no UCI, `wan6`, network, or DHCPv6
+  change. Recovery ownership always wins: health and the recovery state machine
+  first, then source-policy protection, then this cleanup.
 - **Does not replace `pd-preferred`.** The existing source policy is unchanged
   and still installs a PD-derived preferred source. This feature builds on that
   classification rather than duplicating it, and additionally re-probes the
@@ -3699,6 +3699,18 @@ existing deployment that does not enable it. No other behaviour is modified.
   Afterwards PD connectivity is revalidated; success is reported only if PD is
   still healthy. On any failure the condition is logged and the feature stops
   without re-adding the address or attempting repair.
+- **Not a permanent removal.** The deletion affects runtime kernel state only.
+  `odhcp6c` may assign the WAN `/128` again on a later renew, rebind, or new
+  lease. A reappeared address is not covered by the earlier decision: it must
+  pass every eligibility gate again and earn fresh repeated confirmation before
+  another removal can occur.
+- **Shared-coordinator interaction.** Cleanup writes no disruption accounting
+  and neither consumes nor refunds the shared budget. It does ask the shared
+  coordinator for exclusion immediately before the irreversible delete, and
+  `wan_recovery_full_begin` may reconcile coordinator-owned state while
+  answering — recreating a missing `disruption_hold` latch when
+  `disruption_count` is already at the limit. In that case exclusion is refused
+  and no `/128` is deleted.
 - **`CLEANUP_WAN128` is unchanged.** It keeps its existing bootstrap-only
   meaning and is not reused, renamed, or reinterpreted.
 - Enabling it on a router whose `/128` works is unnecessary and unwanted: a
