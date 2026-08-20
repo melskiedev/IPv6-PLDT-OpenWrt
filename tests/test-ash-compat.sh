@@ -295,11 +295,12 @@ rm -f /tmp/mi_break.out
 # --- guarded-suite inventory -------------------------------------------------
 # The discovery above must find exactly the suites we expect: no self-match
 # (infinite recursion), and no attempt to execute the helper library itself.
+# 7 since tests/test-wan-recovery-lock.sh joined the guard.
 inventory_count=$(printf '%s\n' $GUARDED_SUITES | grep -c .)
-if [ "$inventory_count" = "6" ]; then
+if [ "$inventory_count" = "7" ]; then
     pass
 else
-    fail "expected 6 guarded suites, discovered $inventory_count"
+    fail "expected 7 guarded suites, discovered $inventory_count"
     printf '%s\n' $GUARDED_SUITES | sed 's/^/      /'
 fi
 

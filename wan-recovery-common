@@ -189,38 +189,81 @@ _wan_recovery_now() {
 # Stale fallback handling: if the fallback lock dir exists and its age exceeds
 # WAN_RECOVERY_STALE_LOCK_AGE, it is removed (only the exact expected dir) and
 # acquisition is retried. A fresh fallback dir is NEVER removed.
+# Return 0 if /proc file-descriptor introspection is usable. Without it we
+# cannot prove an fd is free before opening it, nor prove that the fd we
+# opened really refers to the lock file, so the flock path is skipped entirely
+# and the mkdir fallback is used instead. Fail safe, never fail dangerous.
+# /proc/self, never /proc/$$: `$$` keeps the ORIGINAL shell's pid inside a
+# subshell, so it would inspect the parent's descriptor table while the fd was
+# opened in the child. `[` is a shell builtin, so /proc/self is this shell.
+# readlink is external, but shell-opened descriptors are not close-on-exec, so
+# it inherits them and resolves the same entries.
+_wan_recovery_procfd_ok() {
+    [ -d "/proc/self/fd" ]
+}
+
+# Return 0 if fd $1 is ALREADY open in this shell. The coordinator must never
+# clobber a descriptor its caller owns: ipv6-watchdog holds fd 9 for its own
+# watchdog.lock, and reusing it would both destroy that lock and make the
+# coordinator believe it had locked disruption.lock.
+_wan_recovery_fd_in_use() {
+    [ -e "/proc/self/fd/$1" ]
+}
+
+# Return 0 if fd $1 genuinely refers to DISRUPTION_LOCK_FILE. This is the
+# proof required before reporting lock ownership: holding a lock on some other
+# file is not ownership of the shared disruption lock.
+_wan_recovery_fd_is_lockfile() {
+    local _t _want
+    _t=$(readlink "/proc/self/fd/$1" 2>/dev/null)
+    [ -n "$_t" ] || return 1
+    [ "$_t" = "$DISRUPTION_LOCK_FILE" ] && return 0
+    _want=$(readlink -f "$DISRUPTION_LOCK_FILE" 2>/dev/null)
+    [ -n "$_want" ] || return 1
+    [ "$_t" = "$_want" ]
+}
+
 _wan_recovery_lock_acquire() {
     mkdir -p "$WAN_RECOVERY_STATE_DIR" 2>/dev/null || return 3
 
-    # Try flock first. Use an fd >= 9 to avoid clashing with caller fds.
+    # ---- flock path ----
+    # The fd MUST be opened in the CURRENT shell. The previous implementation
+    # opened it inside a subshell -- `(eval "exec $_fd>...")` -- so the
+    # descriptor vanished when that subshell exited and the subsequent
+    # `flock -n "$_fd"` operated on whatever the PARENT had on that number.
+    # With ipv6-watchdog holding fd 9 for its own watchdog.lock, that could
+    # succeed against the WRONG file and be recorded as shared-lock ownership.
     _flock_unavailable=0
-    if command -v flock >/dev/null 2>&1; then
-        # exec opens the fd; flock locks it. Keep the fd open until release.
-        for _fd in 9 10 11 12; do
-            if (eval "exec $_fd>'$DISRUPTION_LOCK_FILE'") 2>/dev/null; then
-                flock -n "$_fd" 2>/dev/null
-                _flock_rc=$?
-                if [ "$_flock_rc" -eq 0 ]; then
-                    _WAN_RECOVERY_LOCK_FD="$_fd"
-                    _WAN_RECOVERY_LOCK_HELD=1
-                    _WAN_RECOVERY_OWN_FALLBACK=0
-                    return 0
-                fi
-                # Close the fd before deciding what to do next.
+    if command -v flock >/dev/null 2>&1 && _wan_recovery_procfd_ok; then
+        # 9 is deliberately absent: ipv6-watchdog owns it. Every candidate is
+        # still checked for prior use, so this list is a preference, not an
+        # assumption.
+        for _fd in 8 10 11 12 13 14; do
+            _wan_recovery_fd_in_use "$_fd" && continue
+            eval "exec $_fd>>'$DISRUPTION_LOCK_FILE'" 2>/dev/null || continue
+            if ! _wan_recovery_fd_is_lockfile "$_fd"; then
                 eval "exec $_fd>&-" 2>/dev/null
-                # 127 = command not found / a broken flock on PATH. Do NOT
-                # treat this as "busy"; fall back to the mkdir lock instead.
-                # Other non-zero (e.g. 1 = lock held by another process) means
-                # genuinely busy; try the next fd.
-                if [ "$_flock_rc" -eq 127 ]; then
-                    _flock_unavailable=1
-                    break
-                fi
+                continue
             fi
+            flock -n "$_fd" 2>/dev/null
+            _flock_rc=$?
+            if [ "$_flock_rc" -eq 0 ]; then
+                _WAN_RECOVERY_LOCK_FD="$_fd"
+                _WAN_RECOVERY_LOCK_HELD=1
+                _WAN_RECOVERY_OWN_FALLBACK=0
+                return 0
+            fi
+            eval "exec $_fd>&-" 2>/dev/null
+            # 127 = flock present but unusable. Fall back to the mkdir lock.
+            # Any other non-zero means another process genuinely holds the
+            # lock; retrying on a different fd would conflict identically.
+            if [ "$_flock_rc" -eq 127 ]; then
+                _flock_unavailable=1
+            fi
+            break
         done
-        # If flock was available and genuinely held on all tried fds, busy.
-        # If flock was broken (127), fall through to the mkdir fallback.
         if [ "$_flock_unavailable" -ne 1 ]; then
+            # Busy, or no usable descriptor could be obtained. Both fail closed.
             return 3
         fi
     fi
@@ -291,6 +334,13 @@ _wan_recovery_lock_acquire() {
 }
 
 # Release the shared lock. Only acts if THIS process holds it. Idempotent.
+#
+# Only the COORDINATOR-OWNED descriptor recorded in _WAN_RECOVERY_LOCK_FD is
+# unlocked and closed. That variable is set exclusively by
+# _wan_recovery_lock_acquire, and only for an fd that was (a) proven unused
+# beforehand and (b) proven to refer to DISRUPTION_LOCK_FILE. A descriptor the
+# caller owns -- notably ipv6-watchdog's fd 9 watchdog.lock -- can therefore
+# never be unlocked or closed here.
 _wan_recovery_lock_release() {
     [ "$_WAN_RECOVERY_LOCK_HELD" = 1 ] || return 0
     if [ -n "$_WAN_RECOVERY_LOCK_FD" ]; then
