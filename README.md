@@ -2126,6 +2126,7 @@ scripts are internal constants, not tunables.
 | `CLEANUP_DEPRECATED_LAN` | `1` | Remove deprecated LAN addresses left behind after a prefix change | Rarely |
 | `CLEANUP_WAN128` | `0` | Remove the WAN `/128` after a successful bootstrap | Leave at `0`. A healthy `/128` is optional and may be kept. See [D](#d-experimental-bootstrap_enabled-and-cleanup_wan128) |
 | `BOOTSTRAP_ENABLED` | `0` | Enable the experimental IA_NA-assisted prefix bootstrap stage | Leave at `0` unless you are deliberately testing it. Its effectiveness is unproven. See [D](#d-experimental-bootstrap_enabled-and-cleanup_wan128) |
+| `AUTO_CLEANUP_UNUSABLE_WAN128` | `0` | Remove a WAN IA_NA `/128` that is confirmed unusable while the PD path stays healthy | Leave at `0` unless your `/128` has been independently observed to fail. Per-router. See [Normal-runtime cleanup](#normal-runtime-cleanup-auto_cleanup_unusable_wan128) |
 
 #### B. Recovery limits
 
@@ -2308,6 +2309,118 @@ One practical consequence worth knowing: `CLEANUP_WAN128` is only read **inside*
 the bootstrap stage. With `BOOTSTRAP_ENABLED=0` it never takes effect at all,
 whatever it is set to. Setting `CLEANUP_WAN128=1` on its own does not cause the
 watchdog to start removing `/128` addresses during normal operation.
+
+##### Normal-runtime cleanup: AUTO_CLEANUP_UNUSABLE_WAN128
+
+If you want the watchdog to remove an unusable `/128` during **normal
+operation**, that is a different setting with a different meaning:
+`AUTO_CLEANUP_UNUSABLE_WAN128`. It does not reuse, replace, or reinterpret
+`CLEANUP_WAN128`, which keeps its bootstrap-only meaning described above.
+
+| Value | Meaning |
+|---|---|
+| `0` (default) | Never remove a `/128` during normal operation. Current behaviour, unchanged |
+| `1` | Allow removal, and only after every safety gate below has passed twice |
+
+**This is opt-in per router, and off by default for a reason.** Some providers
+hand out a perfectly usable IA_NA `/128`. On this project's own two routers,
+one has repeatedly received a `/128` that cannot reach the Internet while the
+delegated-prefix path works normally, and the other has a `/128` that works
+fine. Do **not** assume every IA_NA `/128` is bad, and do not enable this on a
+router where you have not independently confirmed the failure yourself.
+
+**What it is for.** When the WAN `/128` is present but cannot reach the
+Internet, anything that picks it as a source address breaks, even though the
+router itself is healthy through the delegated prefix. Source policy already
+protects traffic the *router* originates by installing a PD-derived preferred
+source (see [source policy](#d-timing-and-source-policy)). It cannot help
+traffic that is masqueraded onto the WAN address by another subsystem, because
+that source selection happens outside the routing table the watchdog manages.
+Removing the unusable address is what fixes those cases.
+
+**What it is not.** It is not a recovery mechanism. It never runs while
+anything is wrong, never tries to restore connectivity, and never touches your
+DHCPv6 configuration. It runs only on a tick where full IPv6 health has already
+been proven.
+
+It also never writes disruption accounting of its own — no restart count, no
+cooldown timestamp, no reason record — and neither consumes nor refunds the
+shared WAN restart budget. The one nuance worth stating precisely: to make the
+removal safe it asks the shared recovery coordinator for exclusive ownership
+first, and that coordinator may repair *its own* state while answering, for
+instance re-creating a missing hold latch when the restart budget is already
+spent. That is coordinator-owned bookkeeping, it only happens in states where
+cleanup is refused anyway, and it is not this feature spending your budget.
+
+Every one of these must hold before an address is even considered:
+
+- the feature is explicitly enabled
+- a WAN `/128` exists, and **fails** an Internet check bound to it
+- the check is re-run fresh on every eligible tick, never taken from cache
+- IA_PD exists, and a current PD-derived LAN source exists within that prefix
+- PD-source Internet connectivity **passes**
+- the current gateway passes effective-route and PD-source verification
+- the IPv6 failure count is `0`
+- no incident is open, and no restart-assisted or critical incident owns recovery
+- no shared WAN recovery is in progress, in either lock mode
+- the shared disruption hold is not active
+- the router is not inside post-restart cooldown
+- source policy has already classified this exact context as PD-preferred
+
+The first qualifying observation only records a candidate and logs:
+
+```
+WAN128 cleanup candidate: IA_NA Internet failed while PD Internet passed; awaiting stable confirmation
+```
+
+Nothing is removed. A **second** independent watchdog run must observe the same
+condition with an identical context before removal happens. The confirmation
+count is a fixed constant and cannot be lowered from the config file.
+
+The candidate is discarded immediately if the `/128` changes or disappears, the
+`/128` becomes healthy again, the delegated prefix changes, the LAN source
+changes or leaves the prefix, the gateway changes or loses verification, PD
+connectivity fails, the failure count becomes non-zero, any incident or
+recovery begins, cooldown or hold becomes active, or a shared recovery starts.
+A candidate never carries across a change of prefix, lease, or gateway.
+
+The two confirmations must also be **consecutive healthy checks**. Any tick on
+which the watchdog does not find IPv6 fully healthy — `wan6` down, no prefix, a
+gateway repair, a recovery hold, or a confirmed connectivity failure — discards
+the candidate, so an unhealthy period can never join two observations made on
+either side of it. Turning the setting back off discards it as well, so
+re-enabling always starts counting from the beginning.
+
+Removal deletes **only** the exact address that was tested:
+
+```sh
+ip -6 addr del "<the tested address>/128" dev "<wan device>"
+```
+
+It does not flush addresses, does not touch LAN addresses or routes, and does
+not restart anything. If a second `/128` happens to exist, it is left alone and
+may be evaluated separately on a later tick. Afterwards the removal is verified
+against that exact address, and PD connectivity is re-checked. Success is only
+reported if PD is still healthy:
+
+```
+Removed unusable WAN IA_NA /128 after stable confirmed failures; PD-source Internet remains healthy: <address>
+```
+
+If the deletion fails, or the address is somehow still present, or PD stops
+working afterwards, the condition is logged and the feature stops. It will not
+re-add the address or attempt any repair of its own; the normal recovery state
+machine owns whatever happens next.
+
+Note that this is a kernel-level removal only. Your provider will hand the
+address back on the next DHCPv6 renew, and the same confirmation cycle will
+run again. That is expected.
+
+To enable it, add to `/etc/ipv6-watchdog.conf`:
+
+```sh
+AUTO_CLEANUP_UNUSABLE_WAN128=1
+```
 
 #### D. Timing and source policy
 
@@ -3553,6 +3666,78 @@ EOF
 ---
 
 ## Changelog
+
+### v3.11.0 — unreleased
+
+Adds one new opt-in runtime policy. **Default off**, so nothing changes for an
+existing deployment that does not enable it. No other behaviour is modified.
+
+**Optional removal of an unusable WAN IA_NA `/128`**
+
+- New setting `AUTO_CLEANUP_UNUSABLE_WAN128` (default `0`, per-router). When
+  enabled, the watchdog may remove a WAN IA_NA `/128` that independently fails
+  Internet reachability while the delegated-prefix path stays healthy.
+- **Not a recovery feature.** It runs only from a tick that has already proven
+  full PD-first health, never attempts to restore connectivity, never consumes
+  the shared WAN disruption budget, never modifies hold or cooldown state, and
+  performs no UCI, `wan6`, network, or DHCPv6 change. Recovery ownership always
+  wins: health and the recovery state machine first, then source-policy
+  protection, then this cleanup.
+- **Does not replace `pd-preferred`.** The existing source policy is unchanged
+  and still installs a PD-derived preferred source. This feature builds on that
+  classification rather than duplicating it, and additionally re-probes the
+  `/128` freshly on every eligible observation so an irreversible removal is
+  never authorised from a cached verdict.
+- **Confirmation across ticks.** The first qualifying observation only records
+  a candidate; a second independent run must observe an identical context
+  before anything is removed. The confirmation count is a fixed constant and is
+  deliberately not settable from the config file. Any change of `/128`,
+  prefix, LAN source, or gateway discards the candidate and restarts it.
+- **Exact-address removal.** Only the specific `/128` that was tested is
+  deleted, and its absence is then verified by exact match, so a second global
+  `/128` is neither removed nor able to make the operation look failed.
+  Afterwards PD connectivity is revalidated; success is reported only if PD is
+  still healthy. On any failure the condition is logged and the feature stops
+  without re-adding the address or attempting repair.
+- **`CLEANUP_WAN128` is unchanged.** It keeps its existing bootstrap-only
+  meaning and is not reused, renamed, or reinterpreted.
+- Enabling it on a router whose `/128` works is unnecessary and unwanted: a
+  healthy IA_NA `/128` is always retained. Do not assume every provider's
+  `/128` is bad.
+
+**Also in this release: a shared-coordinator lock ownership fix**
+
+`wan-recovery-common` contained a pre-existing defect in how it acquired the
+shared recovery lock. It opened its candidate file descriptor inside a
+subshell, so the descriptor was already closed by the time the lock was taken
+in the parent shell. Because `ipv6-watchdog` keeps its own watchdog lock on
+descriptor 9, and the coordinator's preferred descriptor list began at 9, the
+lock could be taken against the **wrong file** and recorded as ownership of the
+shared lock — after which releasing it would have unlocked and closed the
+watchdog's own lock.
+
+The descriptor is now opened in the current shell, descriptors already in use
+by the caller are skipped, and the one that is chosen is verified to refer to
+the shared lock file before ownership is reported. The `mkdir` fallback used on
+builds without a usable `flock` is unchanged, and no accounting, budget,
+cooldown, hold or lifecycle behaviour changed. New suite
+`tests/test-wan-recovery-lock.sh` reproduces the real descriptor layout instead
+of mocking it away.
+
+This fix is what makes the WAN128 cleanup above safe: its exclusion guard is
+only meaningful if the coordinator's lock ownership is trustworthy.
+
+**Scope**
+
+- `ipv6-watchdog` (new feature) and `wan-recovery-common` (lock ownership fix).
+  `99-ipv6-setup`, `97-garp`, both loggers and `ipv6-prefix-tracker` are
+  byte-identical to v3.10.2. Cleanup is deliberately kept out of
+  `99-ipv6-setup`: at hotplug time IA_PD can exist before a PD-derived LAN
+  source is ready, so removal there would be unsafe.
+- New test suites `tests/test-wan128-cleanup.sh` (300 assertions) and
+  `tests/test-wan-recovery-lock.sh` (44 assertions), plus guarded-suite
+  inventory updates in `tests/test-ash-compat.sh`.
+- Tests: bash 1373/0, dash 1373/0, BusyBox ash 1381/0.
 
 ### v3.10.2 — 2026-08-19
 

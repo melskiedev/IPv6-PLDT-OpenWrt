@@ -1,6 +1,16 @@
 #!/bin/sh
 # /usr/bin/ipv6-watchdog
 # IPv6 watchdog with escalating recovery, backoff, cooldown, and ONT notification.
+# v3.11.0: opt-in normal-runtime removal of an UNUSABLE WAN IA_NA /128
+#          (AUTO_CLEANUP_UNUSABLE_WAN128, default 0, per-router). Removes only
+#          an IA_NA /128 independently confirmed to fail Internet reachability
+#          while the PD-derived path stays healthy, and only from a tick that
+#          already proved full PD-first health outside every recovery and
+#          transitional state. Opportunistic maintenance: never restores
+#          connectivity, never consumes the shared disruption budget, never
+#          touches UCI/wan6/network, and does not replace pd-preferred.
+#          Unrelated to CLEANUP_WAN128, whose Phase-3 bootstrap meaning is
+#          unchanged. A healthy /128 is always retained.
 # v3.10.1: ordinary-recovery closure. A confirmed connectivity incident that ends
 #          without a full WAN restart now emits one compact recovery log line
 #          (fail_count > 0 -> healthy). This is a SEPARATE mechanism from
@@ -88,6 +98,31 @@ case "$BOOTSTRAP_ENABLED" in
     1) ;;
     *) BOOTSTRAP_ENABLED=0 ;;
 esac
+
+# v3.11.0 normal-runtime removal of an UNUSABLE WAN IA_NA /128. Opt-in,
+# default 0, per-router. Set to 1 ONLY on a router whose IA_NA /128 has been
+# independently observed to fail Internet reachability while PD-derived
+# traffic stays healthy. Invalid values fail safe to 0.
+#
+# This is DELIBERATELY SEPARATE from CLEANUP_WAN128, which belongs to the
+# experimental Phase 3 bootstrap path (try_128_bootstrap step B8) and is not
+# reused or reinterpreted here.
+#
+# It is NOT a recovery mechanism. It runs only on a tick where full PD-first
+# health has already been proven, never restores connectivity, never consumes
+# the shared disruption budget, and never touches UCI, wan6, or the network.
+# Do NOT assume every IA_NA /128 is bad: a healthy /128 is retained.
+AUTO_CLEANUP_UNUSABLE_WAN128="${AUTO_CLEANUP_UNUSABLE_WAN128:-0}"
+case "$AUTO_CLEANUP_UNUSABLE_WAN128" in
+    1) ;;
+    *) AUTO_CLEANUP_UNUSABLE_WAN128=0 ;;
+esac
+
+# Independent eligible observations required before an unusable WAN128 may be
+# removed. Deliberately NOT overridable from the config file: lowering it to 1
+# would defeat the confirmation property that separates a genuinely stuck
+# IA_NA from a transient failure seen during a recovery transition.
+WAN128_CLEANUP_CONFIRMATIONS=2
 
 # wan6 pending grace period (seconds). On OpenWrt 25.12.5, wan6 may report
 # up=false pending=true while odhcp6c is still performing native DHCPv6
@@ -268,6 +303,15 @@ WAN6_PENDING_SEEN_FILE="$STATE_DIR/wan6_pending_seen"
  case "$SRC_POLICY_REFRESH" in
      ''|*[!0-9]*) SRC_POLICY_REFRESH=600 ;;
  esac
+
+ # v3.11.0 unusable-WAN128 cleanup candidate state. Same-boot scoped (dies
+ # with /tmp at reboot). The key is the SAME identity 4-tuple the source
+ # policy uses (WAN128|PD_CIDR|LAN_PD_SRC|gateway), built by _src_policy_key,
+ # so a change to WAN128, the delegated prefix, the PD-derived LAN source, or
+ # the gateway invalidates a pending candidate by construction. The count file
+ # holds consecutive eligible observations for that exact key.
+ WAN128_CLEANUP_KEY_FILE="$STATE_DIR/wan128_cleanup_key"
+ WAN128_CLEANUP_COUNT_FILE="$STATE_DIR/wan128_cleanup_count"
 
  # --- Functions (all defined before any recovery branch calls them) ---
 # BusyBox ash registers functions when their definition line is executed.
@@ -1712,6 +1756,328 @@ ensure_router_source_policy() {
     esac
 }
 
+# ===== v3.11.0: UNUSABLE WAN IA_NA /128 CLEANUP (OPT-IN) =====
+# Opportunistic maintenance ONLY. Removes a WAN IA_NA /128 that has been
+# independently confirmed unusable for Internet reachability while the
+# PD-derived path stays healthy. It builds on the source-policy layer's
+# existing WAN128-vs-PD classification rather than duplicating it.
+#
+# Ownership order, strictly:
+#     IPv6 health / gateway / recovery state machine
+#         > router source-policy protection (pd-preferred)
+#             > this cleanup
+#
+# This feature NEVER attempts to restore IPv6 connectivity. It is reachable
+# only from the happy path, after ipv6_ok() has proven all five health layers
+# on this tick. It does not consume the shared disruption budget, does not
+# modify hold or cooldown state, and performs no UCI/wan6/network/odhcpd
+# mutation of any kind. It does not replace or weaken pd-preferred.
+#
+# Defined AFTER ensure_router_source_policy() deliberately: the source-policy
+# and prefix-helper suites extract source by scanning from a section-header
+# marker earlier in this file down to a named function's closing brace, and
+# this code must stay outside those ranges so neither suite is affected.
+#
+# Do NOT repeat any section-header marker string verbatim in prose anywhere in
+# this file. tests/test-prefix-helpers.sh re-arms its extraction on every line
+# matching its start marker and has no exit guard, so a comment quoting a
+# marker silently extends that extract to end-of-file.
+
+# Exact-address membership test on WAN_DEV. get_wan128() intentionally returns
+# only the FIRST global /128, so it cannot prove that one specific address is
+# gone when a second global /128 exists. This matches the full "addr/128"
+# token exactly, so an unrelated second /128 neither masks a successful
+# deletion nor makes it look like a failure.
+_wan_dev_has_addr128() {
+    local a="$1"
+    [ -n "$a" ] || return 1
+    [ -n "$WAN_DEV" ] || return 1
+    ip -6 addr show dev "$WAN_DEV" 2>/dev/null \
+        | awk -v want="$a/128" '$1 == "inet6" && $2 == want { found = 1 } END { exit !found }'
+}
+
+# Read-only test for an active shared WAN-recovery owner.
+#
+# wan-recovery-common exposes no passive ownership predicate: the public
+# begin functions ACQUIRE the lock and make accounting decisions, and
+# _wan_recovery_hold_active_locked requires the lock already held and WRITES
+# the hold latch as reconciliation. None may be called from an opportunistic
+# maintenance path, so ownership is inspected directly here, covering both
+# supported locking modes.
+#
+#   mkdir fallback: the lock DIRECTORY exists while an owner holds it.
+#   flock mode:     probe with a short-lived non-blocking flock in a SUBSHELL,
+#                   which closes the fd (and releases) on subshell exit. The
+#                   file is only opened when it already exists, so this never
+#                   creates coordinator state. fd 8 avoids the script's own
+#                   fd 9 and the coordinator's fds 9-12.
+#
+# Returns 0 when a shared recovery owner appears active (cleanup must defer).
+_wan128_shared_recovery_active() {
+    local _wsr_rc
+    [ -d "$DISRUPTION_LOCK_DIR" ] && return 0
+    command -v flock >/dev/null 2>&1 || return 1
+    [ -e "$DISRUPTION_LOCK_FILE" ] || return 1
+    ( exec 8>>"$DISRUPTION_LOCK_FILE"; flock -n 8 ) 2>/dev/null
+    _wsr_rc=$?
+    case "$_wsr_rc" in
+        # 0: the lock was free, so nobody owns it.
+        # 127: flock exists but is unusable (the coordinator treats this the
+        #      same way and falls back to the mkdir lock, which the directory
+        #      test above already covered). Reporting "active" here would make
+        #      the feature permanently inert on such a build, and it is not
+        #      needed for safety: wan_recovery_full_begin is the authoritative
+        #      guard immediately before the irreversible delete.
+        0|127) return 1 ;;
+    esac
+    return 0
+}
+
+# Clear any pending cleanup candidate. Idempotent.
+_wan128_cleanup_clear() {
+    rm -f "$WAN128_CLEANUP_KEY_FILE" 2>/dev/null
+    rm -f "$WAN128_CLEANUP_COUNT_FILE" 2>/dev/null
+}
+
+# Read the current confirmation count (0 when absent or corrupt).
+_wan128_cleanup_count() {
+    sanitize_int "$(cat "$WAN128_CLEANUP_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')"
+}
+
+# Clear a candidate and explain why, but only log when a candidate actually
+# existed. A router that never had a candidate stays silent.
+_wan128_cleanup_abandon() {
+    local reason="$1"
+    if [ "$(_wan128_cleanup_count)" -gt 0 ]; then
+        log "WAN128 cleanup candidate cleared: $reason"
+    fi
+    _wan128_cleanup_clear
+}
+
+maybe_cleanup_unusable_wan128() {
+    # Disabled: discard any candidate left over from an earlier enabled period
+    # in this same boot. Without this, disabling and re-enabling the feature
+    # could let a pre-disable observation count toward confirmation, allowing a
+    # deletion after only ONE fresh post-enable observation. Removing our own
+    # stale state files is not a behavioural change: no probe, no log, no
+    # network mutation happens while disabled.
+    if [ "$AUTO_CLEANUP_UNUSABLE_WAN128" != "1" ]; then
+        _wan128_cleanup_clear
+        return 0
+    fi
+
+    # Refresh context: ensure_router_source_policy may have mutated the
+    # generic default route earlier in this tick.
+    populate_pd_context
+
+    # --- Case A: no WAN128 -> no-op, clear any stale candidate ---
+    if [ -z "$WAN128" ]; then
+        _wan128_cleanup_abandon "WAN128 no longer present"
+        return 0
+    fi
+
+    [ -n "$WAN_DEV" ] || return 0
+
+    # --- PD context must be complete and current ---
+    # get_lan_pd_src() only returns an address that belongs to the CURRENT
+    # delegated prefix, so a non-empty LAN_PD_SRC already proves membership.
+    if [ -z "$PD_CIDR" ] || [ -z "$LAN_PD_SRC" ]; then
+        _wan128_cleanup_abandon "PD context incomplete"
+        return 0
+    fi
+
+    # --- Gateway must exist and be PD-source verified ---
+    local gw
+    gw=$(current_default_gw)
+    if [ -z "$gw" ]; then
+        _wan128_cleanup_abandon "no current default gateway"
+        return 0
+    fi
+    if ! pd_routes_ok "$gw"; then
+        _wan128_cleanup_abandon "gateway $gw lost PD-source verification"
+        return 0
+    fi
+
+    # --- Recovery-state gates: any ownership or transitional state defers ---
+    # FAILS is the tick-start value, read before reset_recovery_state runs.
+    if [ "$FAILS" -ne 0 ]; then
+        _wan128_cleanup_abandon "IPv6 failure count is $FAILS"
+        return 0
+    fi
+    if [ -f "$INCIDENT_START_FILE" ]; then
+        _wan128_cleanup_abandon "an ordinary incident is still open"
+        return 0
+    fi
+    if [ -f "$RESTART_INCIDENT_FILE" ]; then
+        _wan128_cleanup_abandon "a restart-assisted incident owns recovery"
+        return 0
+    fi
+    if [ -f "$ONT_FLAG" ]; then
+        _wan128_cleanup_abandon "a critical/ONT incident owns recovery"
+        return 0
+    fi
+    if recovery_hold_active; then
+        _wan128_cleanup_abandon "shared disruption hold is active"
+        return 0
+    fi
+    if in_cooldown; then
+        _wan128_cleanup_abandon "post-restart cooldown is active"
+        return 0
+    fi
+    if _wan128_shared_recovery_active; then
+        _wan128_cleanup_abandon "a shared WAN recovery operation is in progress"
+        return 0
+    fi
+
+    # --- PD Internet must be independently healthy ---
+    if ! pd_internet_ok; then
+        _wan128_cleanup_abandon "PD-source Internet validation failed"
+        return 0
+    fi
+
+    # --- The source-policy layer must already agree, for THIS exact context ---
+    # _src_policy_key reads _SP_CURRENT_GW from the caller's scope; declaring
+    # it local here keeps it out of the global environment.
+    local _SP_CURRENT_GW key
+    _SP_CURRENT_GW="$gw"
+    key=$(_src_policy_key)
+    if [ "$(_src_policy_cached_mode)" != "pd-preferred" ] || \
+       [ "$(_src_policy_cached_key)" != "$key" ]; then
+        _wan128_cleanup_abandon "source policy is not pd-preferred for the current context"
+        return 0
+    fi
+
+    # --- Gate 15: WAN128 must fail a FRESH probe on every eligible tick ---
+    # The cached pd-preferred mode is not re-probed in steady state and may be
+    # up to SRC_POLICY_REFRESH seconds old. Deletion is irreversible, so it is
+    # never authorized on a stale classification alone.
+    if wan128_internet_ok; then
+        _wan128_cleanup_abandon "WAN128 Internet reachability recovered"
+        return 0
+    fi
+
+    # --- Stateful confirmation across independent watchdog executions ---
+    local prev_key count
+    prev_key=$(cat "$WAN128_CLEANUP_KEY_FILE" 2>/dev/null)
+    if [ "$prev_key" != "$key" ]; then
+        count=0
+    else
+        count=$(_wan128_cleanup_count)
+    fi
+    count=$((count + 1))
+    echo "$key" > "$WAN128_CLEANUP_KEY_FILE"
+    echo "$count" > "$WAN128_CLEANUP_COUNT_FILE"
+
+    if [ "$count" -lt "$WAN128_CLEANUP_CONFIRMATIONS" ]; then
+        if [ "$count" -eq 1 ]; then
+            log "WAN128 cleanup candidate: IA_NA Internet failed while PD Internet passed; awaiting stable confirmation"
+        fi
+        return 0
+    fi
+
+    # --- Confirmed. The irreversible step runs under the SHARED COORDINATOR
+    # LOCK, not merely after a passive ownership probe.
+    #
+    # _wan128_shared_recovery_active() above is only a cheap pre-filter: it
+    # releases its probe lock immediately, and the fresh wan128_internet_ok
+    # probe between it and here can take seconds. That is a real check/use
+    # window in which another protocol's watchdog could take ownership and
+    # begin a WAN restart. The ownership invariant is strict, so the deletion
+    # itself is performed while genuinely holding the coordinator lock.
+    #
+    # wan_recovery_full_begin is the coordinator's own acquire-then-recheck
+    # entry point, and wan_recovery_end is its documented "recovered while
+    # waiting" release. rc 1 (cooldown/spacing), rc 2 (hold) and rc 3 (another
+    # owner) all forbid cleanup.
+    #
+    # Precisely what this does and does not write:
+    #   - cleanup itself writes NO disruption accounting: not
+    #     disruption_count, last_full_wan_disruption, last_full_wan_reason,
+    #     last_wan6_action nor last_wan6_reason;
+    #   - cleanup never calls wan_recovery_full_execute_locked, which is where
+    #     every accounting write lives;
+    #   - cleanup neither consumes nor refunds the shared disruption budget;
+    #   - but wan_recovery_full_begin IS allowed to mutate coordinator-owned
+    #     artifacts: it creates the state directory and the lock file/dir, and
+    #     when disruption_count has already reached WAN_DISRUPTION_LIMIT with
+    #     the latch missing it RECONCILES by creating disruption_hold and
+    #     returning 2. That is the coordinator repairing its own state, it can
+    #     only happen in a state where cleanup is forbidden anyway, and it is
+    #     not this feature writing accounting.
+    #
+    # The expensive WAN128 probe is deliberately kept OUTSIDE the lock: holding
+    # the coordinator for ~12s of ping6 would delay real recovery, which would
+    # violate the same ownership invariant this guard exists to protect. The
+    # critical section is therefore only cheap revalidation plus the delete.
+    local target _wc_rc gw2 key2 still
+    target="$WAN128"
+
+    if ! wan_recovery_ready; then
+        log "WAN128 cleanup: shared coordinator unavailable, cannot prove exclusive ownership; $target/128 retained"
+        _wan128_cleanup_clear
+        return 1
+    fi
+
+    wan_recovery_full_begin
+    _wc_rc=$?
+    if [ "$_wc_rc" -ne 0 ]; then
+        _wan128_cleanup_abandon "shared coordinator declined exclusion (rc=$_wc_rc)"
+        return 1
+    fi
+
+    # ---- critical section: coordinator lock HELD, keep it short ----
+    # Revalidate everything another owner could have changed while the fresh
+    # WAN128 probe was running.
+    populate_pd_context
+    gw2=$(current_default_gw)
+    _SP_CURRENT_GW="$gw2"
+    key2=$(_src_policy_key)
+    if [ "$WAN128" != "$target" ] || [ "$key2" != "$key" ] || \
+       [ -z "$PD_CIDR" ] || [ -z "$LAN_PD_SRC" ] || [ -z "$gw2" ]; then
+        wan_recovery_end
+        _wan128_cleanup_abandon "context changed while acquiring the shared lock"
+        return 1
+    fi
+
+    if ! _wan_dev_has_addr128 "$target"; then
+        wan_recovery_end
+        _wan128_cleanup_abandon "$target/128 disappeared before removal"
+        return 1
+    fi
+
+    if ! ip -6 addr del "${target}/128" dev "$WAN_DEV" 2>/dev/null; then
+        wan_recovery_end
+        log "WAN128 cleanup: removal of $target/128 on $WAN_DEV failed; no state changed"
+        _wan128_cleanup_clear
+        return 1
+    fi
+
+    # Exact verification: a different second /128 must neither hide a real
+    # failure nor be mistaken for one.
+    still=0
+    _wan_dev_has_addr128 "$target" && still=1
+    wan_recovery_end
+    # ---- end critical section ----
+
+    if [ "$still" = "1" ]; then
+        log "WAN128 cleanup: $target/128 still present on $WAN_DEV after removal; not treating as success"
+        _wan128_cleanup_clear
+        return 1
+    fi
+
+    # --- Post-delete validation. PD must still be healthy to claim success. ---
+    populate_pd_context
+    if [ -z "$LAN_PD_SRC" ] || ! pd_internet_ok; then
+        log "WAN128 cleanup: removed $target/128 but PD-source Internet validation failed afterwards; leaving recovery to the watchdog state machine"
+        _wan128_cleanup_clear
+        return 1
+    fi
+
+    log "Removed unusable WAN IA_NA /128 after stable confirmed failures; PD-source Internet remains healthy: $target"
+    _wan128_cleanup_clear
+    return 0
+}
+
 # ===== STAGE C2: SHARED COORDINATOR HELPERS =====
 # These helpers bridge ipv6-watchdog's health/notifications to the shared
 # wan-recovery-common coordinator. They are defined BEFORE in_cooldown /
@@ -2494,6 +2860,13 @@ if recovery_hold_active; then
     # Explicit same-boot latch. Persists until router reboot clears /tmp.
     [ -f "$RECOVERY_HOLD_FILE" ] || touch "$RECOVERY_HOLD_FILE"
 
+    # v3.11.0 defense in depth. Cleanup is already unreachable under hold: this
+    # branch exits before the happy path, and the hold itself only ends when a
+    # reboot clears /tmp (which removes the candidate anyway). Clearing here as
+    # well means the invalidation proof does not depend on either of those
+    # facts remaining true after a future refactor.
+    _wan128_cleanup_clear
+
     # --- Passive PD-first state detection (no noisy ipv6_ok calls) ---
     hold_state=""
     if ! ubus call network.interface.wan6 status 2>/dev/null \
@@ -2598,6 +2971,13 @@ sleep $((RANDOM % 5 + 5))
 if ! ubus call network.interface.wan6 status 2>/dev/null \
         | jsonfilter -e '@["up"]' | grep -q true; then
 
+    # v3.11.0: wan6 is DOWN, so this tick is not healthy. Discard any pending
+    # WAN128 cleanup candidate before any Tier 0 exit path. Tier 0 tracks its
+    # own TIER0_FAIL counter and never touches FAILS, so without this a wan6
+    # flap that returned the same lease, prefix, source and gateway would leave
+    # FAILS at 0 and let the next healthy tick count as confirmation #2.
+    _wan128_cleanup_clear
+
     # Determine whether wan6 is pending (odhcp6c still acquiring).
     _pending=false
     if ubus call network.interface.wan6 status 2>/dev/null \
@@ -2680,7 +3060,9 @@ pending_state_reset
 
 WAN_DEV=$(ubus call network.interface.wan6 status 2>/dev/null \
     | jsonfilter -e '@["l3_device"]')
-[ -z "$WAN_DEV" ] && { log "ERROR: WAN_DEV not found, wan6 may be down"; exit 1; }
+# v3.11.0: the WAN_DEV lookup failing is an unhealthy tick that increments no
+# counter at all, so the cleanup candidate is discarded here too.
+[ -z "$WAN_DEV" ] && { _wan128_cleanup_clear; log "ERROR: WAN_DEV not found, wan6 may be down"; exit 1; }
 
 # --- Main logic ---
 
@@ -2702,6 +3084,16 @@ ensure_router_source_policy
 
 # Happy path: reset non-budget recovery state.
 if ipv6_ok; then
+    # v3.11.0 opt-in unusable-WAN128 cleanup (default OFF, no-op unless
+    # AUTO_CLEANUP_UNUSABLE_WAN128=1). Runs here because this is the only
+    # point where all five health layers have just been proven on this tick,
+    # and it MUST run before reset_recovery_state below, which deletes
+    # INCIDENT_START_FILE and RESTART_INCIDENT_FILE -- the very markers that
+    # prove an incident just closed and that cleanup must therefore defer.
+    # Opportunistic maintenance only: it never restores connectivity and its
+    # return value deliberately does not affect the closure path below.
+    maybe_cleanup_unusable_wan128
+
     notify_ipv6_recovered "IPv6 connectivity restored. Non-budget recovery state reset; same-boot WAN restart budget preserved."
 
     # v3.10.1: incident closure, in precedence order. Exactly one of these three
@@ -2716,6 +3108,20 @@ if ipv6_ok; then
     cleanup_deprecated_v6
     exit 0
 fi
+
+# ===== v3.11.0: WAN128 CLEANUP CANDIDATE INVALIDATION (UNHEALTHY TICK) =====
+# Reaching this line means ipv6_ok() FAILED on this tick. Any pending WAN128
+# cleanup candidate describes an observation made on an earlier HEALTHY tick,
+# and confirmation must count only CONSECUTIVE healthy observations. Not
+# calling maybe_cleanup_unusable_wan128 on an unhealthy tick is not enough on
+# its own: the candidate files would simply survive the gap and the next
+# healthy tick would count as confirmation #2.
+#
+# This one clear covers every unhealthy path below it: the no-prefix ladder,
+# the fix_gateway repair path (which calls reset_recovery_state and therefore
+# leaves FAILS at 0 for the next tick), and the confirmed-failure path.
+# Clearing is idempotent and touches only cleanup-owned state.
+_wan128_cleanup_clear
 
 # No prefix: escalating recovery path.
 if ! has_prefix; then
